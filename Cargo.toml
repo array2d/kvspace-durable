@@ -1,0 +1,12 @@
+[package]
+name = "kvspace-durable"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "可嵌入的 KVSpace（Rust），严格翻译 kvspace-go；后端 redis/fs/s3"
+
+[lib]
+name = "kvspace_durable"
+path = "src/lib.rs"
+
+[dependencies]

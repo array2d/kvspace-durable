@@ -1,0 +1,552 @@
+// backend.rs — 对齐 redis/kvspace.go 的 KVSpace 实现逻辑，参数化于 KVStore 原语。
+// redis 与 fs 后端共用这份逻辑，只替换底层 store。
+
+use std::time::Duration;
+
+use crate::r#const::*;
+use crate::kvspace::{KVSpace, KVPair};
+use crate::kvspace_common::{
+    dir_exists, get_one, join_path, mk_index_recursive, sep_path, split_index, validate_ptr, watch_value,
+};
+use crate::store::KVStore;
+use crate::xvalue::{decode_xvalue, decode_xvalue_head, is_none, is_ptr, ptr_target, XValue};
+use crate::xvalue_index::{new_dict_index, new_ext_index, new_index};
+
+pub struct Backend<S: KVStore> {
+    store: S,
+}
+
+impl<S: KVStore> Backend<S> {
+    pub fn new(store: S) -> Self {
+        Backend { store }
+    }
+
+    // ── 目录与路径工具 ──────────────────────────────────────────────
+
+    fn is_dir(path: &str) -> bool {
+        path.ends_with(DIR_INDEX_SUF) || path.ends_with(DICT_SEP)
+    }
+
+    fn assert_dir(path: &str) {
+        if path != PATH_SEP && !Self::is_dir(path) {
+            panic!("{}: {}", ERR_DIR_MUST_END_WITH_SLASH, path);
+        }
+    }
+
+    fn parent_name(path: &str) -> (String, String) {
+        let mut path = path.to_string();
+        if Self::is_dir(&path) && path != PATH_SEP {
+            if path.ends_with(DIR_INDEX_SUF) {
+                path.pop();
+            } else if path.ends_with(DICT_SEP) {
+                path.pop();
+            }
+        }
+        let (mut parent, last) = sep_path(&path);
+        if parent != PATH_SEP {
+            parent.push_str(DIR_INDEX_SUF);
+        }
+        (parent, last)
+    }
+
+    fn suffix_for(path: &str) -> &'static str {
+        if path.ends_with(DICT_SEP) && !path.ends_with(DIR_INDEX_SUF) {
+            DICT_SEP
+        } else {
+            DIR_INDEX_SUF
+        }
+    }
+
+    // ── link 解析 ───────────────────────────────────────────────────
+
+    fn resolve_path(&self, path: &str) -> String {
+        let mut path = path.to_string();
+        loop {
+            let (resolved, changed) = self.resolve_one(&path);
+            if !changed {
+                return resolved;
+            }
+            path = resolved;
+        }
+    }
+
+    fn resolve_parent(&self, path: &str) -> String {
+        let dir_suf = Self::is_dir(path) && path != PATH_SEP;
+        let clean = if dir_suf { &path[..path.len() - 1] } else { path };
+        let (parent, last) = sep_path(clean);
+        if parent == clean {
+            return path.to_string();
+        }
+        let resolved = self.resolve_path(&parent);
+        let mut result = join_path(&resolved, &last);
+        if dir_suf {
+            result.push_str(DIR_INDEX_SUF);
+        }
+        result
+    }
+
+    fn resolve_one(&self, path: &str) -> (String, bool) {
+        if path == PATH_SEP {
+            return (path.to_string(), false);
+        }
+        let trimmed = path.trim_matches('/');
+        let parts: Vec<&str> = if trimmed.is_empty() {
+            Vec::new()
+        } else {
+            trimmed.split('/').collect()
+        };
+        let mut cur = PATH_SEP.to_string();
+        for (i, p) in parts.iter().enumerate() {
+            cur = join_path(&cur, p);
+            if let Some(data) = self.store.get(&cur) {
+                let v = decode_xvalue(&data);
+                if is_ptr(&v) {
+                    let target = ptr_target(&v);
+                    if i + 1 < parts.len() {
+                        return (join_path(&target, &parts[i + 1..].join("/")), true);
+                    }
+                    return (target, true);
+                }
+            }
+        }
+        (path.to_string(), false)
+    }
+
+    // ── 目录 index 读写 ─────────────────────────────────────────────
+
+    fn read_dir_index(&self, dir: &str) -> Vec<String> {
+        match self.store.get(dir) {
+            None => Vec::new(),
+            Some(data) => {
+                let v = decode_xvalue(&data);
+                if is_none(&v) {
+                    return Vec::new();
+                }
+                match v {
+                    XValue::Index(c) => normalize_children(c),
+                    XValue::Dict(c) => normalize_children(c),
+                    XValue::ExtIndex(e) => e.childs,
+                    other => panic!("read_dir_index: unexpected kind {}", other.kind()),
+                }
+            }
+        }
+    }
+
+    fn add_child(&self, parent: &str, name: &str) {
+        match self.store.get(parent) {
+            None => {
+                if parent.ends_with(DICT_SEP) {
+                    let v = new_dict_index(&[name.to_string()]);
+                    self.store.set(parent, &v.encode());
+                } else {
+                    let v = new_index(&[name.to_string()]);
+                    self.store.set(parent, &v.encode());
+                }
+            }
+            Some(data) => {
+                let v = decode_xvalue(&data);
+                match v {
+                    XValue::Index(nodes) => {
+                        let mut nodes = normalize_children(nodes);
+                        if nodes.iter().any(|n| n == name) {
+                            return;
+                        }
+                        nodes.push(name.to_string());
+                        let v = new_index(&nodes);
+                        self.store.set(parent, &v.encode());
+                    }
+                    XValue::Dict(nodes) => {
+                        let mut nodes = normalize_children(nodes);
+                        if nodes.iter().any(|n| n == name) {
+                            return;
+                        }
+                        nodes.push(name.to_string());
+                        let v = new_dict_index(&nodes);
+                        self.store.set(parent, &v.encode());
+                    }
+                    XValue::ExtIndex(e) => {
+                        if e.childs.iter().any(|c| c == name) {
+                            return;
+                        }
+                        let mut childs = e.childs.clone();
+                        childs.push(name.to_string());
+                        let v = new_ext_index(&childs, &e.ext_path);
+                        self.store.set(parent, &v.encode());
+                    }
+                    other => panic!("add_child: unexpected kind {}", other.kind()),
+                }
+            }
+        }
+    }
+
+    fn remove_child(&self, parent: &str, names: &[String]) {
+        let is_removed = |n: &str| {
+            names.iter().any(|name| n == name || n == format!("{}{}", name, DIR_INDEX_SUF))
+        };
+        match self.store.get(parent) {
+            None => {}
+            Some(data) => {
+                let v = decode_xvalue(&data);
+                match v {
+                    XValue::Index(nodes) => {
+                        let nodes = normalize_children(nodes);
+                        let filtered: Vec<String> = nodes.into_iter().filter(|n| !is_removed(n)).collect();
+                        let v = new_index(&filtered);
+                        self.store.set(parent, &v.encode());
+                    }
+                    XValue::Dict(nodes) => {
+                        let nodes = normalize_children(nodes);
+                        let filtered: Vec<String> = nodes.into_iter().filter(|n| !is_removed(n)).collect();
+                        let v = new_dict_index(&filtered);
+                        self.store.set(parent, &v.encode());
+                    }
+                    XValue::ExtIndex(e) => {
+                        let filtered: Vec<String> = e.childs.into_iter().filter(|n| !is_removed(n)).collect();
+                        let v = new_ext_index(&filtered, &e.ext_path);
+                        self.store.set(parent, &v.encode());
+                    }
+                    other => panic!("remove_child: unexpected kind {}", other.kind()),
+                }
+            }
+        }
+    }
+
+    // ── Get 内部 ────────────────────────────────────────────────────
+
+    fn get_dir(&self, dir: &str) -> XValue {
+        match self.store.get(dir) {
+            None => XValue::None,
+            Some(data) => decode_xvalue(&data),
+        }
+    }
+
+    fn prefix_ext(&self, prefix: &str) -> String {
+        if let Some(data) = self.store.get(prefix) {
+            let head = decode_xvalue_head(&data);
+            if head.kind == KIND_EXT_INDEX {
+                let body = head.body(&data);
+                return crate::xvalue_index::decode_ext_index(body).ext_path;
+            }
+        }
+        String::new()
+    }
+}
+
+fn normalize_children(children: Vec<String>) -> Vec<String> {
+    if children.len() == 1 && children[0].is_empty() {
+        Vec::new()
+    } else {
+        children
+    }
+}
+
+impl<S: KVStore> KVSpace for Backend<S> {
+    fn get(&mut self, prefix: &str, keys: &[String], resolve: bool) -> Vec<XValue> {
+        Self::assert_dir(prefix);
+        let prefix = if resolve { self.resolve_path(prefix) } else { prefix.to_string() };
+        let ext_t = self.prefix_ext(&prefix);
+
+        let mut results = Vec::with_capacity(keys.len());
+        for k in keys {
+            let full = join_path(&prefix, k);
+            if Self::is_dir(&full) {
+                results.push(self.get_dir(&full));
+                continue;
+            }
+            if let Some(data) = self.store.get(&full) {
+                results.push(decode_xvalue(&data));
+                continue;
+            }
+            if !ext_t.is_empty() {
+                let target_key = join_path(&ext_t, k);
+                if let Some(data) = self.store.get(&target_key) {
+                    results.push(decode_xvalue(&data));
+                    continue;
+                }
+            }
+            results.push(XValue::None);
+        }
+        results
+    }
+
+    fn set(&mut self, pairs: &[KVPair]) -> Result<(), String> {
+        let mut children: Vec<(String, String)> = Vec::new();
+
+        for p in pairs {
+            let resolved = self.resolve_path(&p.key);
+            if resolved.contains("//") {
+                panic!("Set: double-slash in key {:?}", resolved);
+            }
+            match &p.val {
+                XValue::Index(_) | XValue::ExtIndex(_) => {
+                    if !Self::is_dir(&resolved) {
+                        panic!("Set: index/extindex value at non-directory key {:?}", resolved);
+                    }
+                }
+                _ => {}
+            }
+            if let XValue::Ptr(ptr) = &p.val {
+                validate_ptr(self, &ptr.target, &ptr.kind, ptr.array_len)?;
+            }
+
+            if Self::is_dir(&resolved) {
+                let (parent, name) = Self::parent_name(&resolved);
+                mk_index_recursive(self, &parent);
+                self.store.set(&resolved, &p.val.encode());
+                children.push((parent, format!("{}{}", name, Self::suffix_for(&resolved))));
+                continue;
+            }
+
+            let (parent, name, _) = split_index(&resolved);
+            if parent.ends_with(DICT_SEP) {
+                if self.store.get(&parent).is_none() {
+                    let v = new_dict_index(&[]);
+                    self.store.set(&parent, &v.encode());
+                }
+                let (dp, dn) = Self::parent_name(&parent);
+                mk_index_recursive(self, &dp);
+                children.push((dp, format!("{}{}", dn, DICT_SEP)));
+            } else {
+                mk_index_recursive(self, &parent);
+            }
+
+            // extindex 写保护：只读扩展层上的同名节点禁止写入。
+            if let Some(data) = self.store.get(&parent) {
+                let head = decode_xvalue_head(&data);
+                if head.kind == KIND_EXT_INDEX {
+                    let body = head.body(&data);
+                    let ext_t = crate::xvalue_index::decode_ext_index(body).ext_path;
+                    let local_nodes = self.read_dir_index(&parent);
+                    let local_exists = local_nodes.iter().any(|n| n == &name);
+                    if !local_exists {
+                        let ext_nodes = self.read_dir_index(&ext_t);
+                        if ext_nodes.iter().any(|n| n == &name) {
+                            panic!("{}: {}", ERR_EXT_WRITE, resolved);
+                        }
+                    }
+                }
+            }
+
+            self.store.set(&resolved, &p.val.encode());
+            children.push((parent, name));
+        }
+
+        // 按 parent 分组，去重合并 children 进父目录 index。
+        let mut parent_children: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+        for (parent, name) in children {
+            parent_children.entry(parent).or_default().push(name);
+        }
+        for (parent, names) in parent_children {
+            let mut nodes: Vec<String> = Vec::new();
+            let mut ext_path = String::new();
+            let mut is_ext = false;
+            let mut is_dict = parent.ends_with(DICT_SEP);
+
+            if let Some(data) = self.store.get(&parent) {
+                let v = decode_xvalue(&data);
+                match v {
+                    XValue::Index(c) => nodes = normalize_children(c),
+                    XValue::Dict(c) => {
+                        nodes = normalize_children(c);
+                        is_dict = true;
+                    }
+                    XValue::ExtIndex(e) => {
+                        nodes = e.childs;
+                        ext_path = e.ext_path;
+                        is_ext = true;
+                    }
+                    other => panic!("Set parentChildren: unexpected kind {}", other.kind()),
+                }
+            }
+
+            let mut seen = std::collections::HashSet::new();
+            for n in &nodes {
+                seen.insert(n.clone());
+            }
+            for n in &names {
+                if !seen.contains(n) {
+                    nodes.push(n.clone());
+                    seen.insert(n.clone());
+                }
+            }
+
+            let v = if is_ext {
+                new_ext_index(&nodes, &ext_path)
+            } else if is_dict {
+                new_dict_index(&nodes)
+            } else {
+                new_index(&nodes)
+            };
+            self.store.set(&parent, &v.encode());
+        }
+
+        Ok(())
+    }
+
+    fn list(&mut self, prefix: &str, expand_ext: bool, resolve: bool) -> Vec<String> {
+        Self::assert_dir(prefix);
+        let resolved = if resolve { self.resolve_path(prefix) } else { prefix.to_string() };
+        if !Self::is_dir(&resolved) {
+            return Vec::new();
+        }
+
+        let members = self.read_dir_index(&resolved);
+
+        let mut ext_members: Vec<String> = Vec::new();
+        if expand_ext {
+            let ext_t = self.prefix_ext(&resolved);
+            if !ext_t.is_empty() {
+                ext_members = self.read_dir_index(&ext_t);
+            }
+        }
+
+        let mut local_set = std::collections::HashSet::new();
+        let mut result = Vec::new();
+        for m in members {
+            local_set.insert(m.clone());
+            result.push(m);
+        }
+        for m in ext_members {
+            if local_set.contains(&m) {
+                continue;
+            }
+            result.push(m);
+        }
+        result
+    }
+
+    fn del(&mut self, keys: &[String]) -> Result<(), String> {
+        for key in keys {
+            let resolved = self.resolve_parent(key);
+            let (parent, name) = Self::parent_name(&resolved);
+
+            // extindex 删除保护：只读扩展层上的同名节点禁止删除。
+            if let Some(data) = self.store.get(&parent) {
+                let head = decode_xvalue_head(&data);
+                if head.kind == KIND_EXT_INDEX {
+                    let body = head.body(&data);
+                    let ext_t = crate::xvalue_index::decode_ext_index(body).ext_path;
+                    let local_nodes = self.read_dir_index(&parent);
+                    let local_exists = local_nodes.iter().any(|n| n == &name);
+                    if !local_exists {
+                        let ext_nodes = self.read_dir_index(&ext_t);
+                        if ext_nodes.iter().any(|n| n == &name) {
+                            panic!("{}: {}", ERR_EXT_DEL, resolved);
+                        }
+                    }
+                }
+            }
+
+            if Self::is_dir(&resolved) {
+                let link_key = &resolved[..resolved.len() - 1];
+                self.store.del(&[link_key, &resolved]);
+            } else {
+                self.store.del(&[&resolved]);
+            }
+            self.remove_child(&parent, &[name]);
+        }
+        Ok(())
+    }
+
+    fn del_tree(&mut self, prefix: &str) -> Result<(), String> {
+        let mut link_key = prefix;
+        if Self::is_dir(link_key) && link_key != PATH_SEP {
+            link_key = &prefix[..prefix.len() - 1];
+        }
+        if let Some(data) = self.store.get(link_key) {
+            let head = decode_xvalue_head(&data);
+            if head.is_ptr {
+                return self.del(&[prefix.to_string()]);
+            }
+        }
+
+        let resolved = self.resolve_path(prefix);
+        let keys = self.store.scan_keys(&resolved);
+
+        self.store.del(&[&resolved]);
+        for k in &keys {
+            self.store.del(&[k]);
+        }
+
+        let (parent, name) = Self::parent_name(&resolved);
+        let names = vec![name.clone(), format!("{}{}", name, DICT_SEP)];
+        self.remove_child(&parent, &names);
+        Ok(())
+    }
+
+    fn watch(&mut self, key: &str, target_value: &XValue, tick_duration: Duration) -> XValue {
+        watch_value(self, key, target_value, tick_duration)
+    }
+
+    fn mkindex(&mut self, path: &str) -> Result<(), String> {
+        if !Self::is_dir(path) {
+            return Err(format!("{}: Mkindex {}", ERR_DIR_MUST_END_WITH_SLASH, path));
+        }
+        let resolved = self.resolve_path(path);
+
+        let trimmed = resolved.trim_matches('/');
+        let parts: Vec<&str> = if trimmed.is_empty() { Vec::new() } else { trimmed.split('/').collect() };
+        let mut cur = PATH_SEP.to_string();
+        for p in parts {
+            cur = format!("{}{}", join_path(&cur, p), DIR_INDEX_SUF);
+            if self.read_dir_index(&cur).is_empty() {
+                let (parent, name) = Self::parent_name(&cur);
+                self.add_child(&parent, &format!("{}{}", name, DIR_INDEX_SUF));
+            }
+        }
+        Ok(())
+    }
+
+    fn ext_index(&mut self, path: &str, ext_path: &str) -> Result<(), String> {
+        if !Self::is_dir(path) || !Self::is_dir(ext_path) {
+            return Err(format!("{}: ExtIndex path={} extpath={}", ERR_DIR_MUST_END_WITH_SLASH, path, ext_path));
+        }
+        if let Some(data) = self.store.get(ext_path) {
+            let head = decode_xvalue_head(&data);
+            if head.kind == KIND_EXT_INDEX {
+                return Err(format!("{}: {}", ERR_EXT_CASCADE, ext_path));
+            }
+        }
+
+        let resolved = self.resolve_parent(path);
+        let (parent, name) = Self::parent_name(&resolved);
+        mk_index_recursive(self, &parent);
+
+        let v = new_ext_index(&[], ext_path);
+        self.store.set(&resolved, &v.encode());
+        self.add_child(&parent, &format!("{}{}", name, DIR_INDEX_SUF));
+        Ok(())
+    }
+
+    fn del_ext_index(&mut self, path: &str) -> Result<(), String> {
+        let resolved = self.resolve_parent(path);
+
+        let mut link_key = resolved.as_str();
+        if Self::is_dir(link_key) {
+            link_key = &resolved[..resolved.len() - 1];
+        }
+        if let Some(data) = self.store.get(link_key) {
+            let head = decode_xvalue_head(&data);
+            if head.is_ptr {
+                self.store.del(&[link_key]);
+                let (parent, name) = Self::parent_name(&resolved);
+                self.remove_child(&parent, &[name]);
+                return Ok(());
+            }
+        }
+
+        self.store.del(&[&resolved]);
+        let (parent, name) = Self::parent_name(&resolved);
+        self.remove_child(&parent, &[name]);
+        Ok(())
+    }
+
+    fn clear(&mut self) -> Result<(), String> {
+        self.store.flush();
+        Ok(())
+    }
+
+    fn dis_conn(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+}
