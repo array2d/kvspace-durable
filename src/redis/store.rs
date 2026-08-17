@@ -106,6 +106,26 @@ impl KVStore for RedisStore {
         }
     }
 
+    fn get_many(&self, keys: &[&str]) -> Vec<Option<Vec<u8>>> {
+        if keys.is_empty() {
+            return Vec::new();
+        }
+        let mut args: Vec<&[u8]> = vec![b"MGET"];
+        for k in keys {
+            args.push(k.as_bytes());
+        }
+        match self.cmd(&args) {
+            Resp::Array(items) => items
+                .into_iter()
+                .map(|it| match it {
+                    Resp::Bulk(b) => b,
+                    _ => None,
+                })
+                .collect(),
+            _ => vec![None; keys.len()],
+        }
+    }
+
     fn set(&self, key: &str, val: &[u8]) {
         let _ = self.cmd(&[b"SET", key.as_bytes(), val]);
     }
@@ -137,7 +157,10 @@ impl KVStore for RedisStore {
                         for it in items {
                             if let Resp::Bulk(Some(b)) = it {
                                 let k = String::from_utf8_lossy(b).into_owned();
-                                if k.starts_with(prefix) {
+                                if k == prefix || (k.len() > prefix.len() && k.starts_with(prefix) && {
+                                    let c = k.as_bytes()[prefix.len()];
+                                    c == b'/' || c == b'.'
+                                }) {
                                     keys.push(k);
                                 }
                             }

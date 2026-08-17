@@ -4,6 +4,10 @@
 pub trait KVStore {
     /// 读 key 的原始字节；None = 不存在。
     fn get(&self, key: &str) -> Option<Vec<u8>>;
+    /// 批量读，与 get 顺序对应；None = 不存在。默认逐条 get，后端可覆盖为 MGET。
+    fn get_many(&self, keys: &[&str]) -> Vec<Option<Vec<u8>>> {
+        keys.iter().map(|k| self.get(k)).collect()
+    }
     fn set(&self, key: &str, val: &[u8]);
     fn del(&self, keys: &[&str]);
     /// 返回所有以 prefix 开头的 key（含 prefix 自身，若存在）。

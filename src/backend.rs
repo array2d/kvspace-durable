@@ -246,27 +246,34 @@ impl<S: KVStore> KVSpace for Backend<S> {
         let prefix = if resolve { self.resolve_path(prefix) } else { prefix.to_string() };
         let ext_t = self.prefix_ext(&prefix);
 
-        let mut results = Vec::with_capacity(keys.len());
-        for k in keys {
+        let mut results: Vec<Option<XValue>> = vec![None; keys.len()];
+        let mut full_keys: Vec<(usize, String)> = Vec::new();
+        for (i, k) in keys.iter().enumerate() {
             let full = join_path(&prefix, k);
             if Self::is_dir(&full) {
-                results.push(self.get_dir(&full));
-                continue;
+                results[i] = Some(self.get_dir(&full));
+            } else {
+                full_keys.push((i, full));
             }
-            if let Some(data) = self.store.get(&full) {
-                results.push(decode_xvalue(&data));
-                continue;
-            }
-            if !ext_t.is_empty() {
-                let target_key = join_path(&ext_t, k);
-                if let Some(data) = self.store.get(&target_key) {
-                    results.push(decode_xvalue(&data));
-                    continue;
-                }
-            }
-            results.push(XValue::None);
         }
-        results
+        let full_refs: Vec<&str> = full_keys.iter().map(|(_, f)| f.as_str()).collect();
+        let full_vals = self.store.get_many(&full_refs);
+        let mut ext_keys: Vec<(usize, String)> = Vec::new();
+        for (idx, (i, _)) in full_keys.iter().enumerate() {
+            if let Some(data) = &full_vals[idx] {
+                results[*i] = Some(decode_xvalue(data));
+            } else if !ext_t.is_empty() {
+                ext_keys.push((*i, join_path(&ext_t, &keys[*i])));
+            }
+        }
+        if !ext_keys.is_empty() {
+            let ext_refs: Vec<&str> = ext_keys.iter().map(|(_, t)| t.as_str()).collect();
+            let ext_vals = self.store.get_many(&ext_refs);
+            for (idx, (i, _)) in ext_keys.iter().enumerate() {
+                results[*i] = Some(if let Some(data) = &ext_vals[idx] { decode_xvalue(data) } else { XValue::None });
+            }
+        }
+        results.into_iter().map(|r| r.unwrap_or(XValue::None)).collect()
     }
 
     fn set(&mut self, pairs: &[KVPair]) -> Result<(), String> {

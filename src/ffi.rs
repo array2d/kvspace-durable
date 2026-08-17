@@ -163,6 +163,34 @@ pub extern "C" fn kvspace_get_one(
     alloc(v.encode(), out, out_len)
 }
 
+/// 批量读：prefix 下 names 一次 MGET，返回每个值的 [4B len LE][TLV] 拼接。
+/// None 编码为 len=0。names 数量须与 C 侧一致，按序对应。
+#[no_mangle]
+pub extern "C" fn kvspace_get_batch(
+    h: *mut Handle,
+    prefix: *const c_char,
+    names: *const *const c_char,
+    nnames: u32,
+    out: *mut *mut u8,
+    out_len: *mut u32,
+) -> c_int {
+    if h.is_null() {
+        return 1;
+    }
+    let kv: &mut dyn KVSpace = unsafe { &mut **h };
+    let names: Vec<String> = (0..nnames as usize)
+        .map(|i| unsafe { cstr(*names.add(i)) }.to_string())
+        .collect();
+    let vals = kv.get(unsafe { cstr(prefix) }, &names, true);
+    let mut result = Vec::new();
+    for v in vals {
+        let bytes = v.encode();
+        result.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        result.extend_from_slice(&bytes);
+    }
+    alloc(result, out, out_len)
+}
+
 /// 列目录：子项以 \n 连接返回（子名不含 \n）。空目录返回 out_len==0。
 #[no_mangle]
 pub extern "C" fn kvspace_list(

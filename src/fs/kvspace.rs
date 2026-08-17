@@ -31,9 +31,18 @@ impl FsKVSpace {
         FsKVSpace { root: PathBuf::from(root) }
     }
 
-    /// kvspace key → fs 路径：'.' → './'
+    /// kvspace key → fs 路径：'.'（成员分隔）→ './'；段首 '.'（如 .todo<vid>）是字面量不替换。
     fn fs_path(&self, key: &str) -> PathBuf {
-        let rel = key.replace('.', "./");
+        let mut rel = String::with_capacity(key.len());
+        let mut prev = '/';
+        for c in key.chars() {
+            if c == '.' && prev != '/' {
+                rel.push_str("./");
+            } else {
+                rel.push(c);
+            }
+            prev = c;
+        }
         self.root.join(rel.trim_start_matches('/'))
     }
 
@@ -308,6 +317,11 @@ impl KVSpace for FsKVSpace {
                 if let Some(data) = self.read_leaf(&full) {
                     return decode_xvalue(&data);
                 }
+                // dict 形式回落：读 seen 回落 seen.
+                let dict_key = format!("{}{}", full, DICT_SEP);
+                if self.fs_path(&dict_key).is_dir() {
+                    return self.dir_value(&dict_key);
+                }
                 if !ext_t.is_empty() {
                     let target = join_path(&ext_t, k);
                     if let Some(data) = self.read_leaf(&target) {
@@ -347,17 +361,23 @@ impl KVSpace for FsKVSpace {
                 self.add_order(&parent, &format!("{}{}", name, Self::suffix_for(&resolved)));
                 continue;
             }
-            if let XValue::Index(_) | XValue::Dict(_) = &p.val {
+            if let XValue::Dict(_) = &p.val {
+                let (parent, name) = Self::parent_name(&resolved);
+                let dict_key = format!("{}{}", resolved, DICT_SEP);
+                self.ensure_dir(&dict_key);
+                self.add_order(&parent, &format!("{}{}", name, DICT_SEP));
+                continue;
+            }
+            if let XValue::Index(_) = &p.val {
                 let (parent, name) = Self::parent_name(&resolved);
                 self.ensure_dir(&resolved);
-                self.add_order(&parent, &format!("{}{}", name, Self::suffix_for(&resolved)));
+                self.add_order(&parent, &format!("{}{}", name, DIR_INDEX_SUF));
                 continue;
             }
 
-            // 叶值：确保父目录存在，写文件。
+            // 叶值：确保父是目录（父可能是同名叶文件，如 /lib/println），写文件。
             let (parent, name, _) = split_index(&resolved);
-            let parent_dir = self.fs_path(&parent);
-            let _ = fs::create_dir_all(&parent_dir);
+            self.ensure_dir(&parent);
             self.write_leaf(&resolved, &p.val.encode());
             self.add_order(&parent, &name);
         }
