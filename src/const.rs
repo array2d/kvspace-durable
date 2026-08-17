@@ -56,7 +56,3 @@ pub const KIND_FLOAT64: &str = "float64"; // → byte, 8B
 pub const KIND_DICT: &str = "dict";
 pub const KIND_INDEX: &str = "index";
 pub const KIND_EXT_INDEX: &str = "extindex"; // 扩展索引，写留在上层
-
-pub const KIND_RWIR: &str = "rwir"; // 原子读写指令槽
-pub const KIND_RWFUNC: &str = "rwfunc"; // 函数定义（复合 rwir）
-pub const KIND_SCOPE: &str = "scope"; // 函数内 {} 作用域（lower 产物）

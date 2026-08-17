@@ -1,5 +1,5 @@
-// fs/mod.rs — 文件系统后端（KVStore 原语），root 目录通常指向 /tmp tmpfs。
+// fs/mod.rs — 文件系统后端（结构感知），root 目录通常指向 /tmp tmpfs。
 
-pub mod store;
+pub mod kvspace;
 
-pub use store::{connect, FsStore};
+pub use kvspace::{connect, FsKVSpace};

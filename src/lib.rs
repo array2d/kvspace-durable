@@ -14,9 +14,6 @@ pub mod xvalue_bool;
 pub mod xvalue_byte;
 pub mod xvalue_dict;
 pub mod xvalue_index;
-pub mod xvalue_rwir;
-pub mod xvalue_time;
-pub mod xvalue_duration;
 
 pub mod kvspace;
 pub mod kvspace_common;
@@ -35,11 +32,9 @@ pub use xvalue_bool::*;
 pub use xvalue_byte::*;
 pub use xvalue_dict::*;
 pub use xvalue_index::*;
-pub use xvalue_rwir::*;
-pub use xvalue_time::*;
-pub use xvalue_duration::*;
 
 pub use backend::Backend;
 pub use conn::conn;
 pub use kvspace::{KVSpace, KVPair};
+pub use kvspace_common::*;
 pub use store::KVStore;

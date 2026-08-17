@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use crate::r#const::*;
 use crate::kvspace::{KVSpace, KVPair};
-use crate::xvalue::{body_bytes, is_none, XValue};
+use crate::xvalue::{body_bytes, is_none, plain, XValue};
 use crate::xvalue_index::new_index;
 
 /// JoinPath 拼接父子路径。
@@ -155,4 +155,111 @@ pub fn equal_xvalue(a: &XValue, b: &XValue) -> bool {
         return false;
     }
     body_bytes(a) == body_bytes(b)
+}
+
+// ── 展示（对齐 FprintList / FprintTree / GetAt / ReadPrefixExt / StripExtChildren） ──
+
+pub fn get_at(kv: &mut dyn KVSpace, dir: &str, name: &str) -> XValue {
+    kv.get(dir, &[name.to_string()], true).remove(0)
+}
+
+pub fn read_prefix_ext(kv: &mut dyn KVSpace, prefix: &str) -> String {
+    if let XValue::ExtIndex(e) = get_one(kv, prefix) {
+        return e.ext_path;
+    }
+    String::new()
+}
+
+pub fn strip_ext_children(kv: &mut dyn KVSpace, prefix: &str, children: Vec<String>) -> Vec<String> {
+    let ext_target = read_prefix_ext(kv, prefix);
+    if ext_target.is_empty() {
+        return children;
+    }
+    let ext_children = kv.list(&ext_target, false, true);
+    let n = children.len().saturating_sub(ext_children.len());
+    children[..n].to_vec()
+}
+
+pub fn fprint_list(kv: &mut dyn KVSpace, prefix: &str, show_ext: bool, show_kind: bool) {
+    let mut children = kv.list(prefix, true, true);
+    if !show_ext {
+        children = strip_ext_children(kv, prefix, children);
+    }
+    for c in children {
+        let mut v = get_at(kv, prefix, &c);
+        let child_dir = format!("{}{}", join_path(prefix, &c), DIR_INDEX_SUF);
+        let mut has_dir = !kv.list(&child_dir, false, true).is_empty();
+        if !has_dir {
+            has_dir = !is_none(&get_at(kv, prefix, &format!("{}{}", c, DIR_INDEX_SUF)));
+        }
+        let mut key = c.clone();
+        if has_dir {
+            key.push_str(DIR_INDEX_SUF);
+            v = XValue::None;
+        }
+        if is_none(&v) {
+            println!("{}", key);
+        } else if show_kind {
+            println!("{}\t{}\t{}", key, v.kind(), plain(&v));
+        } else {
+            println!("{}\t{}", key, plain(&v));
+        }
+    }
+    if !show_ext {
+        let ext = read_prefix_ext(kv, prefix);
+        if !ext.is_empty() {
+            println!("{}{}", EXT_INDEX_HEAD, ext);
+            for c in kv.list(&ext, false, true) {
+                println!("  {}", c);
+            }
+        }
+    }
+}
+
+pub fn fprint_tree(kv: &mut dyn KVSpace, prefix: &str, indent: &str, show_ext: bool, show_kind: bool) {
+    let mut children = kv.list(prefix, true, true);
+    if !show_ext {
+        children = strip_ext_children(kv, prefix, children);
+    }
+    children.sort_by(|a, b| {
+        let (a_, b_) = (a.trim_end_matches('/'), b.trim_end_matches('/'));
+        if a_ == b_ {
+            a.ends_with('/').cmp(&b.ends_with('/'))
+        } else {
+            a_.cmp(b_)
+        }
+    });
+
+    let n = children.len();
+    for (i, c) in children.iter().enumerate() {
+        let v = get_at(kv, prefix, c);
+        let base = c.trim_end_matches('/');
+        let child_dir = format!("{}{}", join_path(prefix, base), DIR_INDEX_SUF);
+        let mut has_child = !kv.list(&child_dir, false, true).is_empty();
+        if !has_child {
+            has_child = !is_none(&get_at(kv, prefix, &format!("{}{}", base, DIR_INDEX_SUF)));
+        }
+
+        let last = i == n - 1;
+        let branch = if last { "└── " } else { "├── " };
+        let next_indent = format!("{}{}", indent, if last { "    " } else { "│   " });
+
+        if has_child && c.ends_with(DIR_INDEX_SUF) {
+            println!("{}{}{}", indent, branch, c);
+            fprint_tree(kv, &child_dir, &next_indent, show_ext, show_kind);
+        } else if is_none(&v) {
+            println!("{}{}{}", indent, branch, c);
+        } else if show_kind {
+            println!("{}{}{}\t{}\t{}", indent, branch, c, v.kind(), plain(&v));
+        } else {
+            println!("{}{}{}\t{}", indent, branch, c, plain(&v));
+        }
+    }
+
+    if !show_ext {
+        let ext = read_prefix_ext(kv, prefix);
+        if !ext.is_empty() {
+            println!("{}└── {}{}", indent, EXT_INDEX_HEAD, ext);
+        }
+    }
 }

@@ -13,7 +13,7 @@ pub fn conn(dsn: &str) -> Box<dyn KVSpace> {
     };
     match scheme {
         "redis" => Box::new(Backend::new(crate::redis::connect(addr))),
-        "fs" => Box::new(Backend::new(crate::fs::connect(addr))),
+        "fs" => Box::new(crate::fs::connect(addr)),
         _ => panic!("kvspace: unknown scheme {:?} in dsn {:?}", scheme, dsn),
     }
 }

@@ -3,7 +3,6 @@
 // XValueHead + TLV 编解码（head + body）。
 
 use crate::r#const::*;
-use crate::xvalue_rwir::{Rwir, Rwfunc};
 
 // ── XValueHead ─────────────────────────────────────────────────────────────
 // XValueHead = [1B kind_len][kind][1B ref][1B arr_flag][1B ndim][ndim×4B dims][4B raw_len]
@@ -58,8 +57,6 @@ impl XValueHead {
             KIND_CHAR_UTF8 => XValue::CharByte(crate::xvalue_byte::decode_char_byte(body)),
             KIND_CHAR_ASCII => XValue::CharAscii(crate::xvalue_byte::decode_char_ascii(body)),
             KIND_CHAR => XValue::Char32(crate::xvalue_byte::decode_char32(body)),
-            "time" => XValue::Time(crate::xvalue_time::decode_time(body)),
-            "duration" => XValue::Duration(crate::xvalue_duration::decode_duration(body)),
             KIND_DICT => {
                 if body.is_empty() {
                     XValue::Dict(Vec::new())
@@ -69,8 +66,6 @@ impl XValueHead {
             }
             KIND_INDEX => XValue::Index(crate::xvalue_index::decode_index(body)),
             KIND_EXT_INDEX => XValue::ExtIndex(crate::xvalue_index::decode_ext_index(body)),
-            KIND_RWIR => XValue::Rwir(crate::xvalue_rwir::decode_rwir(body)),
-            KIND_RWFUNC => XValue::Rwfunc(crate::xvalue_rwir::decode_rwfunc(body, self.array_len)),
             _ => XValue::None,
         }
     }
@@ -99,10 +94,6 @@ pub enum XValue {
     Dict(Vec<String>), // dict（空 = Dict{}，非空 = DictIndex）
     Index(Vec<String>), // index
     ExtIndex(ExtIndex), // extindex
-    Rwir(Rwir), // rwir
-    Rwfunc(Rwfunc), // rwfunc
-    Time(Vec<i64>), // time（ns）
-    Duration(Vec<i64>), // duration（ns）
 }
 
 impl XValue {
@@ -127,10 +118,6 @@ impl XValue {
             XValue::Dict(_) => KIND_DICT,
             XValue::Index(_) => KIND_INDEX,
             XValue::ExtIndex(_) => KIND_EXT_INDEX,
-            XValue::Rwir(_) => KIND_RWIR,
-            XValue::Rwfunc(_) => KIND_RWFUNC,
-            XValue::Time(_) => "time",
-            XValue::Duration(_) => "duration",
         }
     }
 
@@ -159,10 +146,6 @@ impl XValue {
             XValue::Dict(d) => d.join(INDEX_VALUE_SEP).len() as i32,
             XValue::Index(d) => d.join(INDEX_VALUE_SEP).len() as i32,
             XValue::ExtIndex(e) => crate::xvalue_index::encode_ext_index_raw(&e.ext_path, &e.childs).len() as i32,
-            XValue::Rwir(r) => r.body.len() as i32,
-            XValue::Rwfunc(r) => r.body.len() as i32,
-            XValue::Time(d) => (d.len() * 8) as i32,
-            XValue::Duration(d) => (d.len() * 8) as i32,
         }
     }
 
@@ -187,10 +170,6 @@ impl XValue {
             XValue::Dict(_) => 1,
             XValue::Index(_) => 1,
             XValue::ExtIndex(_) => 1,
-            XValue::Rwir(_) => 1,
-            XValue::Rwfunc(r) => r.al,
-            XValue::Time(d) => d.len() as i32,
-            XValue::Duration(d) => d.len() as i32,
         }
     }
 
@@ -224,10 +203,6 @@ impl XValue {
                 let raw = crate::xvalue_index::encode_ext_index_raw(&e.ext_path, &e.childs);
                 tlv_encode(KIND_EXT_INDEX, &raw, 1)
             }
-            XValue::Rwir(r) => r.encode(),
-            XValue::Rwfunc(r) => r.encode(),
-            XValue::Time(d) => crate::xvalue_time::encode_time(d),
-            XValue::Duration(d) => crate::xvalue_duration::encode_duration(d),
         }
     }
 
@@ -252,10 +227,6 @@ impl XValue {
             XValue::Dict(d) => dict_value_string(d),
             XValue::Index(d) => index_value_string(d),
             XValue::ExtIndex(e) => e.value_string(),
-            XValue::Rwir(r) => r.sig(),
-            XValue::Rwfunc(r) => format!("r{}/w{}", r.num_reads(), r.num_writes()),
-            XValue::Time(d) => crate::xvalue_time::format_time(d[0]),
-            XValue::Duration(d) => crate::xvalue_duration::duration_string(d[0]),
         }
     }
 
@@ -263,7 +234,7 @@ impl XValue {
         match self {
             XValue::None => KIND_NONE.to_string(),
             XValue::Ptr(p) => format!("→{}:{}", p.target, p.kind),
-            _ => format!("{}:{}", self.value_string(), self.kind()),
+            _ => format!("{}:{}", self.kind(), self.value_string()),
         }
     }
 }
