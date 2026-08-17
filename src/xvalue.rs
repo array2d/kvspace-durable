@@ -66,7 +66,11 @@ impl XValueHead {
             }
             KIND_INDEX => XValue::Index(crate::xvalue_index::decode_index(body)),
             KIND_EXT_INDEX => XValue::ExtIndex(crate::xvalue_index::decode_ext_index(body)),
-            _ => XValue::None,
+            _ => XValue::Opaque(Opaque {
+                kind: self.kind.clone(),
+                body: body.to_vec(),
+                array_len: self.array_len,
+            }),
         }
     }
 }
@@ -94,6 +98,7 @@ pub enum XValue {
     Dict(Vec<String>), // dict（空 = Dict{}，非空 = DictIndex）
     Index(Vec<String>), // index
     ExtIndex(ExtIndex), // extindex
+    Opaque(Opaque), // 未知 kind（如 kvlang 的 rwir/rwfunc/scope），原样存取
 }
 
 impl XValue {
@@ -118,6 +123,7 @@ impl XValue {
             XValue::Dict(_) => KIND_DICT,
             XValue::Index(_) => KIND_INDEX,
             XValue::ExtIndex(_) => KIND_EXT_INDEX,
+            XValue::Opaque(o) => o.kind.as_str(),
         }
     }
 
@@ -146,6 +152,7 @@ impl XValue {
             XValue::Dict(d) => d.join(INDEX_VALUE_SEP).len() as i32,
             XValue::Index(d) => d.join(INDEX_VALUE_SEP).len() as i32,
             XValue::ExtIndex(e) => crate::xvalue_index::encode_ext_index_raw(&e.ext_path, &e.childs).len() as i32,
+            XValue::Opaque(o) => o.body.len() as i32,
         }
     }
 
@@ -170,6 +177,7 @@ impl XValue {
             XValue::Dict(_) => 1,
             XValue::Index(_) => 1,
             XValue::ExtIndex(_) => 1,
+            XValue::Opaque(o) => o.array_len,
         }
     }
 
@@ -203,6 +211,7 @@ impl XValue {
                 let raw = crate::xvalue_index::encode_ext_index_raw(&e.ext_path, &e.childs);
                 tlv_encode(KIND_EXT_INDEX, &raw, 1)
             }
+            XValue::Opaque(o) => tlv_encode(&o.kind, &o.body, o.array_len),
         }
     }
 
@@ -227,6 +236,7 @@ impl XValue {
             XValue::Dict(d) => dict_value_string(d),
             XValue::Index(d) => index_value_string(d),
             XValue::ExtIndex(e) => e.value_string(),
+            XValue::Opaque(o) => String::from_utf8_lossy(&o.body).into_owned(),
         }
     }
 
@@ -288,6 +298,14 @@ impl ExtIndex {
             format!("({})", self.childs.len())
         }
     }
+}
+
+/// 未知 kind（非标准 XValue）的原样字节，供上层自定义 kind（如 kvlang 的 rwir/rwfunc）存取值。
+#[derive(Clone, Debug, PartialEq)]
+pub struct Opaque {
+    pub kind: String,
+    pub body: Vec<u8>,
+    pub array_len: i32,
 }
 
 fn dict_value_string(childs: &[String]) -> String {

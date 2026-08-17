@@ -13,6 +13,8 @@ use crate::xvalue::*;
 use crate::xvalue_index::{new_dict_index, new_ext_index, new_index};
 
 const EXTINDEX_MARKER: &str = "__extindex__";
+const SELF_MARKER: &str = "__self__";
+const ORDER_MARKER: &str = "__order__";
 
 pub struct FsKVSpace {
     root: PathBuf,
@@ -51,19 +53,117 @@ impl FsKVSpace {
     }
 
     fn read_leaf(&self, key: &str) -> Option<Vec<u8>> {
-        fs::read(self.fs_path(key)).ok()
+        if key.contains("//") {
+            return None;
+        }
+        let p = self.fs_path(key);
+        // 目录带值：值落在目录内的保留文件 __self__，readdir 派生的 index 之外。
+        if p.is_dir() {
+            fs::read(p.join(SELF_MARKER)).ok()
+        } else {
+            fs::read(p).ok()
+        }
     }
 
     fn write_leaf(&self, key: &str, val: &[u8]) {
         let p = self.fs_path(key);
-        if let Some(parent) = p.parent() {
-            let _ = fs::create_dir_all(parent);
+        if p.is_dir() {
+            fs::write(p.join(SELF_MARKER), val)
+                .unwrap_or_else(|e| panic!("kvspace-fs: set {}: {}", key, e));
+        } else {
+            if let Some(parent) = p.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            fs::write(p, val).unwrap_or_else(|e| panic!("kvspace-fs: set {}: {}", key, e));
         }
-        fs::write(p, val).unwrap_or_else(|e| panic!("kvspace-fs: set {}: {}", key, e));
     }
 
     fn remove_leaf(&self, key: &str) {
-        let _ = fs::remove_file(self.fs_path(key));
+        let p = self.fs_path(key);
+        if p.is_dir() {
+            let _ = fs::remove_file(p.join(SELF_MARKER));
+        } else {
+            let _ = fs::remove_file(p);
+        }
+    }
+
+    fn suffix_for(key: &str) -> &'static str {
+        if key.ends_with(DICT_SEP) && !key.ends_with(DIR_INDEX_SUF) {
+            DICT_SEP
+        } else {
+            DIR_INDEX_SUF
+        }
+    }
+
+    fn parent_name(path: &str) -> (String, String) {
+        let mut path = path.to_string();
+        if Self::is_dir_key(&path) && path != PATH_SEP {
+            if path.ends_with(DIR_INDEX_SUF) {
+                path.pop();
+            } else if path.ends_with(DICT_SEP) {
+                path.pop();
+            }
+        }
+        let (mut parent, last) = sep_path(&path);
+        if parent != PATH_SEP {
+            parent.push_str(DIR_INDEX_SUF);
+        }
+        (parent, last)
+    }
+
+    /// 去掉尾斜杠的节点路径（目录 key 的尾斜杠在 OS 层被折叠）。
+    fn node_path(&self, key: &str) -> PathBuf {
+        let s = self.fs_path(key).to_string_lossy().into_owned();
+        PathBuf::from(s.trim_end_matches('/'))
+    }
+
+    /// 确保 key 对应节点是目录；若当前是文件，转为目录并把内容搬到 __self__。
+    fn ensure_dir(&self, key: &str) {
+        let node = self.node_path(key);
+        if node.is_file() {
+            let content = fs::read(&node).ok();
+            let _ = fs::remove_file(&node);
+            let _ = fs::create_dir_all(&node);
+            if let Some(c) = content {
+                let _ = fs::write(node.join(SELF_MARKER), c);
+            }
+        } else {
+            let _ = fs::create_dir_all(&node);
+        }
+    }
+
+    fn read_order(&self, dir_key: &str) -> Vec<String> {
+        match fs::read(self.fs_path(dir_key).join(ORDER_MARKER)) {
+            Ok(b) => String::from_utf8_lossy(&b)
+                .split('\n')
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    fn write_order(&self, dir_key: &str, order: &[String]) {
+        let p = self.fs_path(dir_key).join(ORDER_MARKER);
+        if order.is_empty() {
+            let _ = fs::remove_file(p);
+        } else {
+            let content = format!("{}\n", order.join("\n"));
+            let _ = fs::write(p, content);
+        }
+    }
+
+    fn add_order(&self, dir_key: &str, child: &str) {
+        let mut order = self.read_order(dir_key);
+        if !order.iter().any(|c| c == child) {
+            order.push(child.to_string());
+            self.write_order(dir_key, &order);
+        }
+    }
+
+    fn remove_order(&self, dir_key: &str, child: &str) {
+        let order: Vec<String> = self.read_order(dir_key).into_iter().filter(|c| c != child).collect();
+        self.write_order(dir_key, &order);
     }
 
     // ── link 解析（读叶值，同 backend.rs） ─────────────────────────────
@@ -136,13 +236,16 @@ impl FsKVSpace {
     // ── 目录 children 派生 ────────────────────────────────────────────
 
     fn dir_children(&self, dir_key: &str) -> Vec<String> {
+        if dir_key.contains("//") {
+            return Vec::new();
+        }
         let p = self.fs_path(dir_key);
         let is_dict = dir_key.ends_with(DICT_SEP);
         let mut children = Vec::new();
         if let Ok(entries) = fs::read_dir(&p) {
             for e in entries.flatten() {
                 let name = e.file_name().to_string_lossy().into_owned();
-                if name == EXTINDEX_MARKER {
+                if name == EXTINDEX_MARKER || name == SELF_MARKER || name == ORDER_MARKER {
                     continue;
                 }
                 let decoded = name.replace("./", ".");
@@ -151,17 +254,30 @@ impl FsKVSpace {
                         children.push(decoded.trim_end_matches('.').to_string());
                     } else {
                         children.push(format!("{}/", decoded));
+                        // 目录带值：额外发射无尾斜杠的叶名（对应 __self__）
+                        if e.path().join(SELF_MARKER).is_file() {
+                            children.push(decoded);
+                        }
                     }
                 } else {
                     children.push(decoded);
                 }
             }
         }
+        // 按 __order__ 文件还原插入顺序（read_dir 顺序不保证 = 插入序）
+        let order = self.read_order(dir_key);
+        if !order.is_empty() {
+            children.sort_by_key(|c| order.iter().position(|o| o == c).unwrap_or(usize::MAX));
+        }
         children
     }
 
     /// 目录 key 的 XValue：dict → DictIndex，hierarchy → ExtIndex（有 marker）或 Index。
+    /// 不存在的目录返回 None（对齐 redis 后端：目录 key 不存在 → None）。
     fn dir_value(&self, dir_key: &str) -> XValue {
+        if dir_key.contains("//") || !self.fs_path(dir_key).is_dir() {
+            return XValue::None;
+        }
         let children = self.dir_children(dir_key);
         if dir_key.ends_with(DICT_SEP) {
             return new_dict_index(&children);
@@ -223,23 +339,27 @@ impl KVSpace for FsKVSpace {
 
             // 目录 index 值：结构派生，无需存；ExtIndex 写 marker。
             if let XValue::ExtIndex(e) = &p.val {
-                let dir = self.fs_path(&resolved);
-                let _ = fs::create_dir_all(&dir);
-                let marker = dir.join(EXTINDEX_MARKER);
+                let (parent, name) = Self::parent_name(&resolved);
+                self.ensure_dir(&resolved);
+                let marker = self.fs_path(&resolved).join(EXTINDEX_MARKER);
                 fs::write(&marker, e.ext_path.as_bytes())
                     .map_err(|e| format!("kvspace-fs: extindex {}: {}", resolved, e))?;
+                self.add_order(&parent, &format!("{}{}", name, Self::suffix_for(&resolved)));
                 continue;
             }
             if let XValue::Index(_) | XValue::Dict(_) = &p.val {
-                let _ = fs::create_dir_all(self.fs_path(&resolved));
+                let (parent, name) = Self::parent_name(&resolved);
+                self.ensure_dir(&resolved);
+                self.add_order(&parent, &format!("{}{}", name, Self::suffix_for(&resolved)));
                 continue;
             }
 
             // 叶值：确保父目录存在，写文件。
-            let (parent, _name, _) = split_index(&resolved);
+            let (parent, name, _) = split_index(&resolved);
             let parent_dir = self.fs_path(&parent);
             let _ = fs::create_dir_all(&parent_dir);
             self.write_leaf(&resolved, &p.val.encode());
+            self.add_order(&parent, &name);
         }
         Ok(())
     }
@@ -270,11 +390,20 @@ impl KVSpace for FsKVSpace {
     fn del(&mut self, keys: &[String]) -> Result<(), String> {
         for key in keys {
             let resolved = self.resolve_parent(key);
-            if Self::is_dir_key(&resolved) {
+            let is_dir = Self::is_dir_key(&resolved);
+            let (parent, name) = if is_dir {
+                let (p, n) = Self::parent_name(&resolved);
+                (p, format!("{}{}", n, Self::suffix_for(&resolved)))
+            } else {
+                let (p, n, _) = split_index(&resolved);
+                (p, n)
+            };
+            if is_dir {
                 let _ = fs::remove_dir_all(self.fs_path(&resolved));
             } else {
                 self.remove_leaf(&resolved);
             }
+            self.remove_order(&parent, &name);
         }
         Ok(())
     }
@@ -293,6 +422,8 @@ impl KVSpace for FsKVSpace {
             }
         }
         let _ = fs::remove_dir_all(self.fs_path(&resolved));
+        let (parent, name) = Self::parent_name(&resolved);
+        self.remove_order(&parent, &format!("{}{}", name, Self::suffix_for(&resolved)));
         Ok(())
     }
 
@@ -314,6 +445,10 @@ impl KVSpace for FsKVSpace {
             return Err(format!("{}: ExtIndex path={} extpath={}", ERR_DIR_MUST_END_WITH_SLASH, path, ext_path));
         }
         let resolved = self.resolve_parent(path);
+        // 级联检查：ext_path 本身是 extindex → 不容许（对齐 backend.rs）
+        if self.fs_path(ext_path).join(EXTINDEX_MARKER).is_file() {
+            return Err(format!("{}: {}", ERR_EXT_CASCADE, ext_path));
+        }
         let dir = self.fs_path(&resolved);
         let _ = fs::create_dir_all(&dir);
         let marker = dir.join(EXTINDEX_MARKER);

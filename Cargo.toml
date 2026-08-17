@@ -8,5 +8,6 @@ description = "可嵌入的 KVSpace（Rust），严格翻译 kvspace-go；后端
 [lib]
 name = "kvspace_durable"
 path = "src/lib.rs"
+crate-type = ["rlib", "staticlib", "cdylib"]
 
 [dependencies]

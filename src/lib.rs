@@ -22,6 +22,7 @@ pub mod backend;
 pub mod conn;
 pub mod fs;
 pub mod redis;
+pub mod ffi;
 
 pub use r#const::*;
 pub use xvalue::*;
