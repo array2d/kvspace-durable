@@ -5,15 +5,14 @@
 use crate::r#const::*;
 
 // ── XValueHead ─────────────────────────────────────────────────────────────
-// XValueHead = [1B kind_len][kind][1B ref][1B arr_flag][1B ndim][ndim×4B dims][4B raw_len]
+// XValueHead = [1B kind_len][kind][1B ref][1B ndim][ndim×4B dims][4B raw_len]
 #[derive(Default, Clone, Debug, PartialEq)]
 pub struct XValueHead {
     pub kind: String,
     pub is_ptr: bool, // 派生：ref==1
-    pub array_len: i32, // 派生：标量=1，定长=∏dims，变长=raw_len/elemSize
+    pub array_len: i32, // 派生：标量=1，定长=∏dims
     pub r#ref: i32, // 0=内联 1=软链接(*) 2=扩展句柄(@)
-    pub arr_flag: i32, // 0=标量 1=连续([]) 2=分离(<>)
-    pub ndim: i32, // 0=变长，N=定长 N 维
+    pub ndim: i32, // 0=标量，N=N 维数组（唯一「是否数组」标志）
     pub dims: Vec<i32>, // 各维长度
     pub body_len: i32, // body 字节数
 }
@@ -21,7 +20,7 @@ pub struct XValueHead {
 impl XValueHead {
     /// 返回 XValueHead（元数据）字节数，不含 body。
     pub fn head_len(&self) -> i32 {
-        1 + self.kind.len() as i32 + 1 + 1 + 1 + 4 * self.dims.len() as i32 + 4
+        1 + self.kind.len() as i32 + 1 + 1 + 4 * self.dims.len() as i32 + 4
     }
 
     /// 从完整 XValue 字节 data 截取 body。
@@ -352,45 +351,43 @@ fn bool_string(b: bool) -> String {
 
 // ── TLV 编解码 ─────────────────────────────────────────────────────────────
 // XValue = XValueHead + body。
-// XValueHead = [1B kind_len][kind][1B ref][1B arr_flag][1B ndim][ndim×4B dims][4B raw_len]
+// XValueHead = [1B kind_len][kind][1B ref][1B ndim][ndim×4B dims][4B raw_len]
 // body       = [raw]，offset = head_len()。
 // ref: 0=内联 1=软链接(*) 2=扩展句柄(@)；ref=1 时 body 为目标 key 路径。None 编码为 nil。
 
 pub fn tlv_encode(kind: &str, raw: &[u8], array_len: i32) -> Vec<u8> {
-    let array_len = if array_len <= 0 { 1 } else { array_len };
-    let (arr_flag, dims) = array_to_header(array_len);
-    encode_head(kind, 0, arr_flag, &dims, raw)
+    encode_head(kind, 0, &array_to_header(kind, array_len), raw)
 }
 
 pub fn tlv_encode_ptr(kind: &str, raw: &[u8], array_len: i32) -> Vec<u8> {
     let array_len = if array_len <= 0 { 1 } else { array_len };
-    let (arr_flag, dims) = array_to_header(array_len);
-    encode_head(kind, 1, arr_flag, &dims, raw)
+    encode_head(kind, 1, &array_to_header(kind, array_len), raw)
 }
 
-/// arrayToHeader：将 arraylen 映射为 (arr_flag, dims)：<=1 标量，>1 连续一维数组。
-fn array_to_header(array_len: i32) -> (i32, Vec<i32>) {
-    if array_len <= 1 {
-        (0, Vec::new())
+/// array_len → dims：char/* 恒一维（含空串/单字符）；其余标量(≤1)=0 维、多元素=1 维。
+fn array_to_header(kind: &str, array_len: i32) -> Vec<i32> {
+    if kind.starts_with("char/") {
+        vec![array_len.max(0)]
+    } else if array_len > 1 {
+        vec![array_len]
     } else {
-        (1, vec![array_len])
+        Vec::new()
     }
 }
 
-pub fn encode_head(kind: &str, r#ref: i32, arr_flag: i32, dims: &[i32], raw: &[u8]) -> Vec<u8> {
+pub fn encode_head(kind: &str, r#ref: i32, dims: &[i32], raw: &[u8]) -> Vec<u8> {
     let ndim = dims.len() as i32;
-    let mut buf = vec![0u8; 1 + kind.len() + 1 + 1 + 1 + 4 * dims.len() + 4 + raw.len()];
+    let mut buf = vec![0u8; 1 + kind.len() + 1 + 1 + 4 * dims.len() + 4 + raw.len()];
     buf[0] = kind.len() as u8;
     buf[1..1 + kind.len()].copy_from_slice(kind.as_bytes());
     let o = 1 + kind.len();
     buf[o] = r#ref as u8;
-    buf[o + 1] = arr_flag as u8;
-    buf[o + 2] = ndim as u8;
+    buf[o + 1] = ndim as u8;
     for (i, d) in dims.iter().enumerate() {
-        let off = o + 3 + 4 * i;
+        let off = o + 2 + 4 * i;
         buf[off..off + 4].copy_from_slice(&(*d as u32).to_le_bytes());
     }
-    let raw_len_off = o + 3 + 4 * dims.len();
+    let raw_len_off = o + 2 + 4 * dims.len();
     buf[raw_len_off..raw_len_off + 4].copy_from_slice(&(raw.len() as u32).to_le_bytes());
     buf[raw_len_off + 4..].copy_from_slice(raw);
     buf
@@ -402,34 +399,32 @@ pub fn decode_xvalue_head(data: &[u8]) -> XValueHead {
     }
     let kind_len = data[0] as usize;
     let o = 1 + kind_len;
-    if data.len() < o + 3 + 4 {
+    if data.len() < o + 2 + 4 {
         return XValueHead::default();
     }
     let kind = String::from_utf8_lossy(&data[1..o]).into_owned();
     let r#ref = data[o] as i32;
-    let arr_flag = data[o + 1] as i32;
-    let ndim = data[o + 2] as i32;
-    if data.len() < o + 3 + 4 * ndim as usize + 4 {
+    let ndim = data[o + 1] as i32;
+    if data.len() < o + 2 + 4 * ndim as usize + 4 {
         return XValueHead::default();
     }
     let mut dims = Vec::with_capacity(ndim as usize);
     for i in 0..ndim as usize {
-        let off = o + 3 + 4 * i;
+        let off = o + 2 + 4 * i;
         dims.push(i32::from_le_bytes(data[off..off + 4].try_into().unwrap()));
     }
-    let raw_len_off = o + 3 + 4 * ndim as usize;
+    let raw_len_off = o + 2 + 4 * ndim as usize;
     let raw_len = u32::from_le_bytes(data[raw_len_off..raw_len_off + 4].try_into().unwrap()) as i32;
     let start = raw_len_off + 4;
     if data.len() < start + raw_len as usize {
         return XValueHead::default();
     }
-    let array_len = header_array_len(arr_flag, ndim, &dims, raw_len, &kind);
+    let array_len = header_array_len(ndim, &dims);
     XValueHead {
         kind,
         is_ptr: r#ref == 1,
         array_len,
         r#ref,
-        arr_flag,
         ndim,
         dims,
         body_len: raw_len,
@@ -455,19 +450,12 @@ pub fn body_bytes(v: &XValue) -> Vec<u8> {
     h.body(&data).to_vec()
 }
 
-/// headerArrayLen 从 arr_flag/ndim/dims 推导 arraylength。
-fn header_array_len(arr_flag: i32, ndim: i32, dims: &[i32], raw_len: i32, kind: &str) -> i32 {
-    if arr_flag == 0 {
+/// headerArrayLen 从 ndim/dims 推导 arraylength：ndim=0 标量(1)，否则 ∏dims。
+fn header_array_len(ndim: i32, dims: &[i32]) -> i32 {
+    if ndim <= 0 {
         1
-    } else if ndim > 0 {
-        dims.iter().product()
     } else {
-        let es = elem_size(kind);
-        if es > 0 {
-            raw_len / es
-        } else {
-            0
-        }
+        dims.iter().product()
     }
 }
 

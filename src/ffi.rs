@@ -74,6 +74,8 @@ pub struct KVHead {
     pub array_len: i32, // 派生数组长度
     pub body_len: i32,  // body 字节数
     pub body_offset: i32, // body 在 data 内的起始偏移（= head_len）
+    pub ndim: i32,      // 0=标量，N=N 维数组（唯一「是否数组」标志）
+    pub dims: [i32; 8], // 各维长度（kind+ndim+dims 即完整 kindexp）
 }
 
 fn fill_head(head: &crate::xvalue::XValueHead, out: *mut KVHead) {
@@ -87,6 +89,10 @@ fn fill_head(head: &crate::xvalue::XValueHead, out: *mut KVHead) {
         o.array_len = head.array_len;
         o.body_len = head.body_len;
         o.body_offset = head.head_len();
+        o.ndim = head.ndim;
+        for (i, d) in head.dims.iter().take(8).enumerate() {
+            o.dims[i] = *d;
+        }
     }
 }
 
@@ -371,7 +377,7 @@ pub extern "C" fn kvspace_disconn(h: *mut Handle, err: *mut c_char, err_cap: u32
 
 // ── XValue 编解码（head/TLV + 标准标量构造器） ─────────────────────────
 
-/// 通用 TLV 编码（内联，ref=0）。array_len 由 arr_flag/dims 推导。
+/// 通用 TLV 编码（内联，ref=0）。ndim/dims 由 kind + array_len 推导。
 /// kvlang 的自有 kind（rwir/rwfunc/scope）经此构造：body 由 kvlang 自己编码。
 #[no_mangle]
 pub extern "C" fn kvspace_tlv_encode(
