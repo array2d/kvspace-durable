@@ -19,7 +19,7 @@ use crate::conn::conn;
 use crate::kvspace::{KVSpace, KVPair};
 use crate::kvspace_common::get_one;
 use crate::xvalue::{
-    decode_xvalue, decode_xvalue_head, new_ptr, tlv_encode, tlv_encode_ptr,
+    decode_xvalue, decode_xvalue_head, encode_head, new_ptr,
 };
 use crate::xvalue_bool::new_bool;
 use crate::xvalue_byte::{new_char, new_char_byte};
@@ -377,19 +377,21 @@ pub extern "C" fn kvspace_disconn(h: *mut Handle, err: *mut c_char, err_cap: u32
 
 // ── XValue 编解码（head/TLV + 标准标量构造器） ─────────────────────────
 
-/// 通用 TLV 编码（内联，ref=0）。ndim/dims 由 kind + array_len 推导。
+/// 通用 TLV 编码（内联，ref=0）。dims/ndim 直接落盘：ndim=0 标量，dims 可为 NULL。
 /// kvlang 的自有 kind（rwir/rwfunc/scope）经此构造：body 由 kvlang 自己编码。
 #[no_mangle]
 pub extern "C" fn kvspace_tlv_encode(
     kind: *const c_char,
     raw: *const u8,
     raw_len: u32,
-    array_len: i32,
+    dims: *const i32,
+    ndim: i32,
     out: *mut *mut u8,
     out_len: *mut u32,
 ) -> c_int {
     let raw = unsafe { std::slice::from_raw_parts(raw, raw_len as usize) };
-    alloc(tlv_encode(unsafe { cstr(kind) }, raw, array_len), out, out_len)
+    let dims = ffi_dims(dims, ndim);
+    alloc(encode_head(unsafe { cstr(kind) }, 0, dims, raw), out, out_len)
 }
 
 /// 通用 TLV 编码（软链接，ref=1），body 为目标 key 路径。
@@ -398,12 +400,23 @@ pub extern "C" fn kvspace_tlv_encode_ptr(
     kind: *const c_char,
     raw: *const u8,
     raw_len: u32,
-    array_len: i32,
+    dims: *const i32,
+    ndim: i32,
     out: *mut *mut u8,
     out_len: *mut u32,
 ) -> c_int {
     let raw = unsafe { std::slice::from_raw_parts(raw, raw_len as usize) };
-    alloc(tlv_encode_ptr(unsafe { cstr(kind) }, raw, array_len), out, out_len)
+    let dims = ffi_dims(dims, ndim);
+    alloc(encode_head(unsafe { cstr(kind) }, 1, dims, raw), out, out_len)
+}
+
+#[inline]
+fn ffi_dims<'a>(dims: *const i32, ndim: i32) -> &'a [i32] {
+    if dims.is_null() || ndim <= 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(dims, ndim as usize) }
+    }
 }
 
 /// 解码 XValueHead（不解析 body）。返回 kind/is_ptr/array_len/body_len/body_offset。
