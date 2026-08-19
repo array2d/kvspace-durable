@@ -6,7 +6,7 @@ use std::process::exit;
 use kvspace_durable::*;
 
 fn default_dsn() -> String {
-    env::var("KVLANG_KVSPACE").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string())
+    env::var("KVSPACE").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string())
 }
 
 /// ParseValue 解析 CLI value 字符串为 XValue。
