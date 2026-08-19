@@ -42,20 +42,20 @@ impl XValueHead {
             });
         }
         match self.kind.as_str() {
-            KIND_BOOL => XValue::Bool(crate::xvalue_bool::decode_bool(body)),
-            KIND_INT8 => XValue::Int8(crate::xvalue_int::decode_int8(body)),
-            KIND_INT16 => XValue::Int16(crate::xvalue_int::decode_int16(body)),
-            KIND_INT32 => XValue::Int32(crate::xvalue_int::decode_int32(body)),
-            KIND_INT64 => XValue::Int64(crate::xvalue_int::decode_int64(body)),
-            KIND_UINT8 => XValue::Uint8(crate::xvalue_uint::decode_uint8(body)),
-            KIND_UINT16 => XValue::Uint16(crate::xvalue_uint::decode_uint16(body)),
-            KIND_UINT32 => XValue::Uint32(crate::xvalue_uint::decode_uint32(body)),
-            KIND_UINT64 => XValue::Uint64(crate::xvalue_uint::decode_uint64(body)),
-            KIND_FLOAT32 => XValue::Float32(crate::xvalue_float::decode_float32(body)),
-            KIND_FLOAT64 => XValue::Float64(crate::xvalue_float::decode_float64(body)),
-            KIND_CHAR_UTF8 => XValue::CharByte(crate::xvalue_byte::decode_char_byte(body)),
-            KIND_CHAR_ASCII => XValue::CharAscii(crate::xvalue_byte::decode_char_ascii(body)),
-            KIND_CHAR => XValue::Char32(crate::xvalue_byte::decode_char32(body)),
+            KIND_BOOL => XValue::Bool(crate::xvalue_bool::decode_bool(body, &self.dims)),
+            KIND_INT8 => XValue::Int8(crate::xvalue_int::decode_int8(body, &self.dims)),
+            KIND_INT16 => XValue::Int16(crate::xvalue_int::decode_int16(body, &self.dims)),
+            KIND_INT32 => XValue::Int32(crate::xvalue_int::decode_int32(body, &self.dims)),
+            KIND_INT64 => XValue::Int64(crate::xvalue_int::decode_int64(body, &self.dims)),
+            KIND_UINT8 => XValue::Uint8(crate::xvalue_uint::decode_uint8(body, &self.dims)),
+            KIND_UINT16 => XValue::Uint16(crate::xvalue_uint::decode_uint16(body, &self.dims)),
+            KIND_UINT32 => XValue::Uint32(crate::xvalue_uint::decode_uint32(body, &self.dims)),
+            KIND_UINT64 => XValue::Uint64(crate::xvalue_uint::decode_uint64(body, &self.dims)),
+            KIND_FLOAT32 => XValue::Float32(crate::xvalue_float::decode_float32(body, &self.dims)),
+            KIND_FLOAT64 => XValue::Float64(crate::xvalue_float::decode_float64(body, &self.dims)),
+            KIND_CHAR_UTF8 => XValue::CharByte(crate::xvalue_byte::decode_char_byte(body, &self.dims)),
+            KIND_CHAR_ASCII => XValue::CharAscii(crate::xvalue_byte::decode_char_ascii(body, &self.dims)),
+            KIND_CHAR => XValue::Char32(crate::xvalue_byte::decode_char32(body, &self.dims)),
             KIND_DICT => {
                 if body.is_empty() {
                     XValue::Dict(Vec::new())
@@ -74,26 +74,40 @@ impl XValueHead {
     }
 }
 
+// ── Arr：定长/多维数组的 shape 载体 ─────────────────────────────────────
+/// 定长/多维数组 = 连续元素 + 形状。dims 空 = 标量（ndim 0），[n] = 一维，
+/// [d0,d1] = 二维。decode 时从 head 透传，encode 时原样落盘，保证往返不丢 shape。
+#[derive(Clone, Debug, PartialEq)]
+pub struct Arr<T> {
+    pub data: Vec<T>,
+    pub dims: Vec<i32>,
+}
+
+/// 从元素数推导 dims（非 char）：>1 → [n]（一维），≤1 → []（标量）。
+pub fn dims_from_len(n: usize) -> Vec<i32> {
+    if n > 1 { vec![n as i32] } else { Vec::new() }
+}
+
 // ── XValue 枚举 ────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum XValue {
     None,
     Ptr(Ptr),
-    Bool(Vec<bool>),
-    Int8(Vec<i8>),
-    Int16(Vec<i16>),
-    Int32(Vec<i32>),
-    Int64(Vec<i64>),
-    Uint8(Vec<u8>),
-    Uint16(Vec<u16>),
-    Uint32(Vec<u32>),
-    Uint64(Vec<u64>),
-    Float32(Vec<f32>),
-    Float64(Vec<f64>),
-    CharByte(Vec<u8>), // char/utf8，1B×N
-    CharAscii(Vec<u8>), // char/ascii，1B×N
-    Char32(Vec<u32>), // char/utf32，码点，4B×N
+    Bool(Arr<bool>),
+    Int8(Arr<i8>),
+    Int16(Arr<i16>),
+    Int32(Arr<i32>),
+    Int64(Arr<i64>),
+    Uint8(Arr<u8>),
+    Uint16(Arr<u16>),
+    Uint32(Arr<u32>),
+    Uint64(Arr<u64>),
+    Float32(Arr<f32>),
+    Float64(Arr<f64>),
+    CharByte(Arr<u8>), // char/utf8，1B×N
+    CharAscii(Arr<u8>), // char/ascii，1B×N
+    Char32(Arr<u32>), // char/utf32，码点，4B×N
     Dict(Vec<String>), // dict（空 = Dict{}，非空 = DictIndex）
     Index(Vec<String>), // index
     ExtIndex(ExtIndex), // extindex
@@ -134,20 +148,20 @@ impl XValue {
         match self {
             XValue::None => 0,
             XValue::Ptr(p) => p.target.len() as i32,
-            XValue::Bool(d) => d.len() as i32,
-            XValue::Int8(d) => d.len() as i32,
-            XValue::Int16(d) => (d.len() * 2) as i32,
-            XValue::Int32(d) => (d.len() * 4) as i32,
-            XValue::Int64(d) => (d.len() * 8) as i32,
-            XValue::Uint8(d) => d.len() as i32,
-            XValue::Uint16(d) => (d.len() * 2) as i32,
-            XValue::Uint32(d) => (d.len() * 4) as i32,
-            XValue::Uint64(d) => (d.len() * 8) as i32,
-            XValue::Float32(d) => (d.len() * 4) as i32,
-            XValue::Float64(d) => (d.len() * 8) as i32,
-            XValue::CharByte(d) => d.len() as i32,
-            XValue::CharAscii(d) => d.len() as i32,
-            XValue::Char32(d) => (d.len() * 4) as i32,
+            XValue::Bool(d) => d.data.len() as i32,
+            XValue::Int8(d) => d.data.len() as i32,
+            XValue::Int16(d) => (d.data.len() * 2) as i32,
+            XValue::Int32(d) => (d.data.len() * 4) as i32,
+            XValue::Int64(d) => (d.data.len() * 8) as i32,
+            XValue::Uint8(d) => d.data.len() as i32,
+            XValue::Uint16(d) => (d.data.len() * 2) as i32,
+            XValue::Uint32(d) => (d.data.len() * 4) as i32,
+            XValue::Uint64(d) => (d.data.len() * 8) as i32,
+            XValue::Float32(d) => (d.data.len() * 4) as i32,
+            XValue::Float64(d) => (d.data.len() * 8) as i32,
+            XValue::CharByte(d) => d.data.len() as i32,
+            XValue::CharAscii(d) => d.data.len() as i32,
+            XValue::Char32(d) => (d.data.len() * 4) as i32,
             XValue::Dict(d) => d.join(INDEX_VALUE_SEP).len() as i32,
             XValue::Index(d) => d.join(INDEX_VALUE_SEP).len() as i32,
             XValue::ExtIndex(e) => crate::xvalue_index::encode_ext_index_raw(&e.ext_path, &e.childs).len() as i32,
@@ -159,20 +173,20 @@ impl XValue {
         match self {
             XValue::None => 0,
             XValue::Ptr(p) => p.array_len,
-            XValue::Bool(d) => d.len() as i32,
-            XValue::Int8(d) => d.len() as i32,
-            XValue::Int16(d) => d.len() as i32,
-            XValue::Int32(d) => d.len() as i32,
-            XValue::Int64(d) => d.len() as i32,
-            XValue::Uint8(d) => d.len() as i32,
-            XValue::Uint16(d) => d.len() as i32,
-            XValue::Uint32(d) => d.len() as i32,
-            XValue::Uint64(d) => d.len() as i32,
-            XValue::Float32(d) => d.len() as i32,
-            XValue::Float64(d) => d.len() as i32,
-            XValue::CharByte(d) => d.len() as i32,
-            XValue::CharAscii(d) => d.len() as i32,
-            XValue::Char32(d) => d.len() as i32,
+            XValue::Bool(d) => d.data.len() as i32,
+            XValue::Int8(d) => d.data.len() as i32,
+            XValue::Int16(d) => d.data.len() as i32,
+            XValue::Int32(d) => d.data.len() as i32,
+            XValue::Int64(d) => d.data.len() as i32,
+            XValue::Uint8(d) => d.data.len() as i32,
+            XValue::Uint16(d) => d.data.len() as i32,
+            XValue::Uint32(d) => d.data.len() as i32,
+            XValue::Uint64(d) => d.data.len() as i32,
+            XValue::Float32(d) => d.data.len() as i32,
+            XValue::Float64(d) => d.data.len() as i32,
+            XValue::CharByte(d) => d.data.len() as i32,
+            XValue::CharAscii(d) => d.data.len() as i32,
+            XValue::Char32(d) => d.data.len() as i32,
             XValue::Dict(_) => 1,
             XValue::Index(_) => 1,
             XValue::ExtIndex(_) => 1,
@@ -184,20 +198,20 @@ impl XValue {
         match self {
             XValue::None => Vec::new(),
             XValue::Ptr(p) => tlv_encode_ptr(&p.kind, p.target.as_bytes(), p.array_len),
-            XValue::Bool(d) => crate::xvalue_bool::encode_bool(d),
-            XValue::Int8(d) => crate::xvalue_int::encode_int8(d),
-            XValue::Int16(d) => crate::xvalue_int::encode_int16(d),
-            XValue::Int32(d) => crate::xvalue_int::encode_int32(d),
-            XValue::Int64(d) => crate::xvalue_int::encode_int64(d),
-            XValue::Uint8(d) => crate::xvalue_uint::encode_uint8(d),
-            XValue::Uint16(d) => crate::xvalue_uint::encode_uint16(d),
-            XValue::Uint32(d) => crate::xvalue_uint::encode_uint32(d),
-            XValue::Uint64(d) => crate::xvalue_uint::encode_uint64(d),
-            XValue::Float32(d) => crate::xvalue_float::encode_float32(d),
-            XValue::Float64(d) => crate::xvalue_float::encode_float64(d),
-            XValue::CharByte(d) => crate::xvalue_byte::encode_char_byte(d),
-            XValue::CharAscii(d) => crate::xvalue_byte::encode_char_ascii(d),
-            XValue::Char32(d) => crate::xvalue_byte::encode_char32(d),
+            XValue::Bool(d) => crate::xvalue_bool::encode_bool(&d.data, &d.dims),
+            XValue::Int8(d) => crate::xvalue_int::encode_int8(&d.data, &d.dims),
+            XValue::Int16(d) => crate::xvalue_int::encode_int16(&d.data, &d.dims),
+            XValue::Int32(d) => crate::xvalue_int::encode_int32(&d.data, &d.dims),
+            XValue::Int64(d) => crate::xvalue_int::encode_int64(&d.data, &d.dims),
+            XValue::Uint8(d) => crate::xvalue_uint::encode_uint8(&d.data, &d.dims),
+            XValue::Uint16(d) => crate::xvalue_uint::encode_uint16(&d.data, &d.dims),
+            XValue::Uint32(d) => crate::xvalue_uint::encode_uint32(&d.data, &d.dims),
+            XValue::Uint64(d) => crate::xvalue_uint::encode_uint64(&d.data, &d.dims),
+            XValue::Float32(d) => crate::xvalue_float::encode_float32(&d.data, &d.dims),
+            XValue::Float64(d) => crate::xvalue_float::encode_float64(&d.data, &d.dims),
+            XValue::CharByte(d) => crate::xvalue_byte::encode_char_byte(&d.data, &d.dims),
+            XValue::CharAscii(d) => crate::xvalue_byte::encode_char_ascii(&d.data, &d.dims),
+            XValue::Char32(d) => crate::xvalue_byte::encode_char32(&d.data, &d.dims),
             XValue::Dict(d) => {
                 let raw = d.join(INDEX_VALUE_SEP).into_bytes();
                 tlv_encode(KIND_DICT, &raw, 1)
@@ -218,20 +232,20 @@ impl XValue {
         match self {
             XValue::None => KIND_NONE.to_string(),
             XValue::Ptr(p) => format!("→{}", p.target),
-            XValue::Bool(d) => bool_string(d[0]),
-            XValue::Int8(d) => (d[0] as i64).to_string(),
-            XValue::Int16(d) => (d[0] as i64).to_string(),
-            XValue::Int32(d) => (d[0] as i64).to_string(),
-            XValue::Int64(d) => d[0].to_string(),
-            XValue::Uint8(d) => (d[0] as u64).to_string(),
-            XValue::Uint16(d) => (d[0] as u64).to_string(),
-            XValue::Uint32(d) => (d[0] as u64).to_string(),
-            XValue::Uint64(d) => d[0].to_string(),
-            XValue::Float32(d) => fmt_float(d[0] as f64),
-            XValue::Float64(d) => fmt_float(d[0]),
-            XValue::CharByte(d) => String::from_utf8_lossy(d).into_owned(),
-            XValue::CharAscii(d) => String::from_utf8_lossy(d).into_owned(),
-            XValue::Char32(d) => d.iter().map(|&c| char::from_u32(c).unwrap_or('\u{FFFD}')).collect(),
+            XValue::Bool(d) => bool_string(d.data[0]),
+            XValue::Int8(d) => (d.data[0] as i64).to_string(),
+            XValue::Int16(d) => (d.data[0] as i64).to_string(),
+            XValue::Int32(d) => (d.data[0] as i64).to_string(),
+            XValue::Int64(d) => d.data[0].to_string(),
+            XValue::Uint8(d) => (d.data[0] as u64).to_string(),
+            XValue::Uint16(d) => (d.data[0] as u64).to_string(),
+            XValue::Uint32(d) => (d.data[0] as u64).to_string(),
+            XValue::Uint64(d) => d.data[0].to_string(),
+            XValue::Float32(d) => fmt_float(d.data[0] as f64),
+            XValue::Float64(d) => fmt_float(d.data[0]),
+            XValue::CharByte(d) => String::from_utf8_lossy(&d.data).into_owned(),
+            XValue::CharAscii(d) => String::from_utf8_lossy(&d.data).into_owned(),
+            XValue::Char32(d) => d.data.iter().map(|&c| char::from_u32(c).unwrap_or('\u{FFFD}')).collect(),
             XValue::Dict(d) => dict_value_string(d),
             XValue::Index(d) => index_value_string(d),
             XValue::ExtIndex(e) => e.value_string(),
