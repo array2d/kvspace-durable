@@ -4,9 +4,9 @@
 // extern "C" 符号表调用本库，不接触 Rust 类型。所有 XValue 以 TLV 字节跨边界。
 //
 // 约定：
-//   - 句柄：kvspace_conn 返回 *mut Handle（Box<dyn KVSpace>），kvspace_free 释放。
+//   - 句柄：kvspaceConnect 返回 *mut Handle（Box<dyn KVSpace>），kvspaceFree 释放。
 //   - 输入字符串：*const c_char（NUL 终止）；输入字节：*const u8 + u32 len。
-//   - 输出字节：*mut *mut u8 + *mut u32，由 callee 分配，调用方用 kvspace_bytes_free(ptr, len) 释放。
+//   - 输出字节：*mut *mut u8 + *mut u32，由 callee 分配，调用方用 kvspaceBytesFree(ptr, len) 释放。
 //   - 错误：返回 c_int（0=成功，1=失败），失败信息写入 err 缓冲（err_cap 上限）。
 //
 // 注意：本层函数不得 panic 跨边界（panic 会 abort 进程）；调用方保证入参合法。
@@ -68,7 +68,7 @@ fn write_err(err: *mut c_char, err_cap: u32, msg: &str) {
 
 /// XValueHead 解码结果（repr(C)，供跨边界读取头元数据）。
 #[repr(C)]
-pub struct KVHead {
+pub struct kvspaceHead_t {
     pub kind: [u8; 32], // NUL 终止的 kind 字符串
     pub is_ptr: u8,     // ref==1
     pub array_len: i32, // 派生数组长度
@@ -78,7 +78,7 @@ pub struct KVHead {
     pub dims: [i32; 8], // 各维长度（kind+ndim+dims 即完整 kindexp）
 }
 
-fn fill_head(head: &crate::xvalue::XValueHead, out: *mut KVHead) {
+fn fill_head(head: &crate::xvalue::XValueHead, out: *mut kvspaceHead_t) {
     unsafe {
         let mut o = &mut *out;
         let k = head.kind.as_bytes();
@@ -99,20 +99,20 @@ fn fill_head(head: &crate::xvalue::XValueHead, out: *mut KVHead) {
 // ── 生命周期 ─────────────────────────────────────────────────────────
 
 #[no_mangle]
-pub extern "C" fn kvspace_conn(dsn: *const c_char) -> *mut Handle {
+pub extern "C" fn kvspaceConnect(dsn: *const c_char) -> *mut Handle {
     let dsn = unsafe { cstr(dsn) };
     Box::into_raw(Box::new(conn(dsn)))
 }
 
 #[no_mangle]
-pub extern "C" fn kvspace_free(h: *mut Handle) {
+pub extern "C" fn kvspaceFree(h: *mut Handle) {
     if !h.is_null() {
         unsafe { drop(Box::from_raw(h)) };
     }
 }
 
 #[no_mangle]
-pub extern "C" fn kvspace_bytes_free(p: *mut u8, len: u32) {
+pub extern "C" fn kvspaceBytesFree(p: *mut u8, len: u32) {
     if !p.is_null() {
         let slice = unsafe { std::ptr::slice_from_raw_parts_mut(p, len as usize) };
         unsafe { drop(Box::from_raw(slice)) };
@@ -122,7 +122,7 @@ pub extern "C" fn kvspace_bytes_free(p: *mut u8, len: u32) {
 // ── KVSpace 原语 ─────────────────────────────────────────────────────
 
 #[no_mangle]
-pub extern "C" fn kvspace_set(
+pub extern "C" fn kvspaceSet(
     h: *mut Handle,
     keys: *const *const c_char,
     vals: *const u8,
@@ -155,7 +155,7 @@ pub extern "C" fn kvspace_set(
 
 /// 单点读（对齐 GetOne）：None 编码为空字节（out_len==0）。
 #[no_mangle]
-pub extern "C" fn kvspace_get_one(
+pub extern "C" fn kvspaceGet(
     h: *mut Handle,
     key: *const c_char,
     out: *mut *mut u8,
@@ -172,7 +172,7 @@ pub extern "C" fn kvspace_get_one(
 /// 批量读：prefix 下 names 一次 MGET，返回每个值的 [4B len LE][TLV] 拼接。
 /// None 编码为 len=0。names 数量须与 C 侧一致，按序对应。
 #[no_mangle]
-pub extern "C" fn kvspace_get_batch(
+pub extern "C" fn kvspaceGetBatch(
     h: *mut Handle,
     prefix: *const c_char,
     names: *const *const c_char,
@@ -199,7 +199,7 @@ pub extern "C" fn kvspace_get_batch(
 
 /// 列目录：子项以 \n 连接返回（子名不含 \n）。空目录返回 out_len==0。
 #[no_mangle]
-pub extern "C" fn kvspace_list(
+pub extern "C" fn kvspaceList(
     h: *mut Handle,
     prefix: *const c_char,
     expand_ext: c_int,
@@ -216,7 +216,7 @@ pub extern "C" fn kvspace_list(
 }
 
 #[no_mangle]
-pub extern "C" fn kvspace_del(
+pub extern "C" fn kvspaceDel(
     h: *mut Handle,
     keys: *const *const c_char,
     nkeys: u32,
@@ -240,7 +240,7 @@ pub extern "C" fn kvspace_del(
 }
 
 #[no_mangle]
-pub extern "C" fn kvspace_del_tree(
+pub extern "C" fn kvspaceDelTree(
     h: *mut Handle,
     prefix: *const c_char,
     err: *mut c_char,
@@ -260,7 +260,7 @@ pub extern "C" fn kvspace_del_tree(
 }
 
 #[no_mangle]
-pub extern "C" fn kvspace_mkindex(
+pub extern "C" fn kvspaceMkindex(
     h: *mut Handle,
     path: *const c_char,
     err: *mut c_char,
@@ -280,7 +280,7 @@ pub extern "C" fn kvspace_mkindex(
 }
 
 #[no_mangle]
-pub extern "C" fn kvspace_ext_index(
+pub extern "C" fn kvspaceMkindexExt(
     h: *mut Handle,
     path: *const c_char,
     ext_path: *const c_char,
@@ -301,7 +301,7 @@ pub extern "C" fn kvspace_ext_index(
 }
 
 #[no_mangle]
-pub extern "C" fn kvspace_del_ext_index(
+pub extern "C" fn kvspaceRmindexExt(
     h: *mut Handle,
     path: *const c_char,
     err: *mut c_char,
@@ -321,7 +321,7 @@ pub extern "C" fn kvspace_del_ext_index(
 }
 
 #[no_mangle]
-pub extern "C" fn kvspace_watch(
+pub extern "C" fn kvspaceWatch(
     h: *mut Handle,
     key: *const c_char,
     target: *const u8,
@@ -346,7 +346,7 @@ pub extern "C" fn kvspace_watch(
 }
 
 #[no_mangle]
-pub extern "C" fn kvspace_clear(h: *mut Handle, err: *mut c_char, err_cap: u32) -> c_int {
+pub extern "C" fn kvspaceClear(h: *mut Handle, err: *mut c_char, err_cap: u32) -> c_int {
     if h.is_null() {
         return 1;
     }
@@ -361,7 +361,7 @@ pub extern "C" fn kvspace_clear(h: *mut Handle, err: *mut c_char, err_cap: u32) 
 }
 
 #[no_mangle]
-pub extern "C" fn kvspace_disconn(h: *mut Handle, err: *mut c_char, err_cap: u32) -> c_int {
+pub extern "C" fn kvspaceDisconnect(h: *mut Handle, err: *mut c_char, err_cap: u32) -> c_int {
     if h.is_null() {
         return 1;
     }
@@ -380,7 +380,7 @@ pub extern "C" fn kvspace_disconn(h: *mut Handle, err: *mut c_char, err_cap: u32
 /// 通用 TLV 编码（内联，ref=0）。dims/ndim 直接落盘：ndim=0 标量，dims 可为 NULL。
 /// kvlang 的自有 kind（rwir/rwfunc/scope）经此构造：body 由 kvlang 自己编码。
 #[no_mangle]
-pub extern "C" fn kvspace_tlv_encode(
+pub extern "C" fn kvspaceTlvEncode(
     kind: *const c_char,
     raw: *const u8,
     raw_len: u32,
@@ -396,7 +396,7 @@ pub extern "C" fn kvspace_tlv_encode(
 
 /// 通用 TLV 编码（软链接，ref=1），body 为目标 key 路径。
 #[no_mangle]
-pub extern "C" fn kvspace_tlv_encode_ptr(
+pub extern "C" fn kvspaceTlvEncodePtr(
     kind: *const c_char,
     raw: *const u8,
     raw_len: u32,
@@ -421,10 +421,10 @@ fn ffi_dims<'a>(dims: *const i32, ndim: i32) -> &'a [i32] {
 
 /// 解码 XValueHead（不解析 body）。返回 kind/is_ptr/array_len/body_len/body_offset。
 #[no_mangle]
-pub extern "C" fn kvspace_decode_head(
+pub extern "C" fn kvspaceDecodeHead(
     data: *const u8,
     data_len: u32,
-    out: *mut KVHead,
+    out: *mut kvspaceHead_t,
 ) -> c_int {
     if data.is_null() || out.is_null() {
         return 1;
@@ -439,7 +439,7 @@ pub extern "C" fn kvspace_decode_head(
 // ── 标准标量构造器（返回完整 TLV 字节） ───────────────────────────────
 
 #[no_mangle]
-pub extern "C" fn kvspace_new_ptr(
+pub extern "C" fn kvspaceNewPtr(
     kind: *const c_char,
     target: *const c_char,
     array_len: i32,
@@ -451,7 +451,7 @@ pub extern "C" fn kvspace_new_ptr(
 }
 
 #[no_mangle]
-pub extern "C" fn kvspace_new_char(
+pub extern "C" fn kvspaceNewChar(
     kind: *const c_char,
     s: *const c_char,
     out: *mut *mut u8,
@@ -462,7 +462,7 @@ pub extern "C" fn kvspace_new_char(
 }
 
 #[no_mangle]
-pub extern "C" fn kvspace_new_char_byte(
+pub extern "C" fn kvspaceNewCharByte(
     bytes: *const u8,
     len: u32,
     out: *mut *mut u8,
@@ -473,7 +473,7 @@ pub extern "C" fn kvspace_new_char_byte(
 }
 
 #[no_mangle]
-pub extern "C" fn kvspace_new_bool(
+pub extern "C" fn kvspaceNewBool(
     v: u8,
     out: *mut *mut u8,
     out_len: *mut u32,
@@ -483,7 +483,7 @@ pub extern "C" fn kvspace_new_bool(
 }
 
 #[no_mangle]
-pub extern "C" fn kvspace_new_int64(
+pub extern "C" fn kvspaceNewInt64(
     v: i64,
     out: *mut *mut u8,
     out_len: *mut u32,
@@ -493,7 +493,7 @@ pub extern "C" fn kvspace_new_int64(
 }
 
 #[no_mangle]
-pub extern "C" fn kvspace_new_float64(
+pub extern "C" fn kvspaceNewFloat64(
     v: f64,
     out: *mut *mut u8,
     out_len: *mut u32,

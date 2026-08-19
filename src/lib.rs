@@ -1,4 +1,5 @@
 #![allow(unused)]
+#![allow(non_snake_case)]
 
 // kvspace-durable — 严格翻译 kvspace-go。
 // 文件对应：const.go → const.rs，xvalue*.go → xvalue*.rs，kvspace.go → kvspace.rs，
