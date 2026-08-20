@@ -12,7 +12,7 @@ pub fn join_path(parent: &str, child: &str) -> String {
     if parent == PATH_SEP {
         return format!("{}{}", PATH_SEP, child);
     }
-    if parent.ends_with(PATH_SEP) || parent.ends_with(DICT_SEP) {
+    if parent.ends_with(PATH_SEP) || parent.ends_with(OBJ_SEP) {
         return format!("{}{}", parent, child);
     }
     format!("{}{}{}", parent, PATH_SEP, child)

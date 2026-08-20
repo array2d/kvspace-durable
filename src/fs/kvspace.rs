@@ -10,7 +10,7 @@ use crate::kvspace::{KVSpace, KVPair};
 use crate::kvspace_common::{join_path, sep_path, split_index, validate_ptr, watch_value, SepKind};
 use crate::r#const::*;
 use crate::xvalue::*;
-use crate::xvalue_index::{new_dict_index, new_ext_index, new_index};
+use crate::xvalue_index::{new_map_index, new_obj_index, new_ext_index, new_index};
 
 const EXTINDEX_MARKER: &str = "__extindex__";
 const SELF_MARKER: &str = "__self__";
@@ -58,7 +58,7 @@ impl FsKVSpace {
     }
 
     fn is_dir_key(key: &str) -> bool {
-        key.ends_with(DIR_INDEX_SUF) || key.ends_with(DICT_SEP)
+        key.ends_with(DIR_INDEX_SUF) || key.ends_with(OBJ_SEP)
     }
 
     fn read_leaf(&self, key: &str) -> Option<Vec<u8>> {
@@ -97,8 +97,8 @@ impl FsKVSpace {
     }
 
     fn suffix_for(key: &str) -> &'static str {
-        if key.ends_with(DICT_SEP) && !key.ends_with(DIR_INDEX_SUF) {
-            DICT_SEP
+        if key.ends_with(OBJ_SEP) && !key.ends_with(DIR_INDEX_SUF) {
+            OBJ_SEP
         } else {
             DIR_INDEX_SUF
         }
@@ -109,7 +109,7 @@ impl FsKVSpace {
         if Self::is_dir_key(&path) && path != PATH_SEP {
             if path.ends_with(DIR_INDEX_SUF) {
                 path.pop();
-            } else if path.ends_with(DICT_SEP) {
+            } else if path.ends_with(OBJ_SEP) {
                 path.pop();
             }
         }
@@ -249,7 +249,7 @@ impl FsKVSpace {
             return Vec::new();
         }
         let p = self.fs_path(dir_key);
-        let is_dict = dir_key.ends_with(DICT_SEP);
+        let is_dict = dir_key.ends_with(OBJ_SEP);
         let mut children = Vec::new();
         if let Ok(entries) = fs::read_dir(&p) {
             for e in entries.flatten() {
@@ -281,15 +281,15 @@ impl FsKVSpace {
         children
     }
 
-    /// 目录 key 的 XValue：dict → DictIndex，hierarchy → ExtIndex（有 marker）或 Index。
+    /// 目录 key 的 XValue：dict → ObjIndex，hierarchy → ExtIndex（有 marker）或 Index。
     /// 不存在的目录返回 None（对齐 redis 后端：目录 key 不存在 → None）。
     fn dir_value(&self, dir_key: &str) -> XValue {
         if dir_key.contains("//") || !self.fs_path(dir_key).is_dir() {
             return XValue::None;
         }
         let children = self.dir_children(dir_key);
-        if dir_key.ends_with(DICT_SEP) {
-            return new_dict_index(&children);
+        if dir_key.ends_with(OBJ_SEP) {
+            return new_obj_index(&children);
         }
         let marker = self.fs_path(dir_key).join(EXTINDEX_MARKER);
         if let Ok(b) = fs::read(&marker) {
@@ -318,7 +318,7 @@ impl KVSpace for FsKVSpace {
                     return decode_xvalue(&data);
                 }
                 // dict 形式回落：读 seen 回落 seen.
-                let dict_key = format!("{}{}", full, DICT_SEP);
+                let dict_key = format!("{}{}", full, OBJ_SEP);
                 if self.fs_path(&dict_key).is_dir() {
                     return self.dir_value(&dict_key);
                 }
@@ -342,7 +342,7 @@ impl KVSpace for FsKVSpace {
             match &p.val {
                 XValue::Index(_) | XValue::ExtIndex(_) => {
                     if !Self::is_dir_key(&resolved) {
-                        panic!("Set: index/extindex value at non-directory key {:?}", resolved);
+                        panic!("Set: directory-kind value at non-directory key {:?}", resolved);
                     }
                 }
                 _ => {}
@@ -361,14 +361,14 @@ impl KVSpace for FsKVSpace {
                 self.add_order(&parent, &format!("{}{}", name, Self::suffix_for(&resolved)));
                 continue;
             }
-            if let XValue::Dict(_) = &p.val {
+            if let XValue::Obj(_) = &p.val {
                 let (parent, name) = Self::parent_name(&resolved);
-                let dict_key = format!("{}{}", resolved, DICT_SEP);
+                let dict_key = format!("{}{}", resolved, OBJ_SEP);
                 self.ensure_dir(&dict_key);
-                self.add_order(&parent, &format!("{}{}", name, DICT_SEP));
+                self.add_order(&parent, &format!("{}{}", name, OBJ_SEP));
                 continue;
             }
-            if let XValue::Index(_) = &p.val {
+            if let XValue::Index(_) | XValue::Map(_) = &p.val {
                 let (parent, name) = Self::parent_name(&resolved);
                 self.ensure_dir(&resolved);
                 self.add_order(&parent, &format!("{}{}", name, DIR_INDEX_SUF));

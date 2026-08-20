@@ -56,13 +56,14 @@ impl XValueHead {
             KIND_CHAR_UTF8 => XValue::CharByte(crate::xvalue_byte::decode_char_byte(body, &self.dims)),
             KIND_CHAR_ASCII => XValue::CharAscii(crate::xvalue_byte::decode_char_ascii(body, &self.dims)),
             KIND_CHAR => XValue::Char32(crate::xvalue_byte::decode_char32(body, &self.dims)),
-            KIND_DICT => {
+            KIND_OBJ => {
                 if body.is_empty() {
-                    XValue::Dict(Vec::new())
+                    XValue::Obj(Vec::new())
                 } else {
-                    XValue::Dict(crate::xvalue_index::decode_dict_index(body))
+                    XValue::Obj(crate::xvalue_index::decode_obj_index(body))
                 }
             }
+            KIND_MAP => XValue::Map(crate::xvalue_index::decode_index(body)),
             KIND_INDEX => XValue::Index(crate::xvalue_index::decode_index(body)),
             KIND_EXT_INDEX => XValue::ExtIndex(crate::xvalue_index::decode_ext_index(body)),
             _ => XValue::Opaque(Opaque {
@@ -108,7 +109,8 @@ pub enum XValue {
     CharByte(Arr<u8>), // char/utf8，1B×N
     CharAscii(Arr<u8>), // char/ascii，1B×N
     Char32(Arr<u32>), // char/utf32，码点，4B×N
-    Dict(Vec<String>), // dict（空 = Dict{}，非空 = DictIndex）
+    Obj(Vec<String>), // obj（空 = Obj{}，非空 = ObjIndex）
+    Map(Vec<String>), // map（同构 map：key 恒 char 字符串，value 固定 kind；child 名=带中括号索引串）
     Index(Vec<String>), // index
     ExtIndex(ExtIndex), // extindex
     Opaque(Opaque), // 未知 kind（如 kvlang 的 rwir/rwfunc/scope），原样存取
@@ -133,7 +135,8 @@ impl XValue {
             XValue::CharByte(_) => KIND_CHAR_UTF8,
             XValue::CharAscii(_) => KIND_CHAR_ASCII,
             XValue::Char32(_) => KIND_CHAR,
-            XValue::Dict(_) => KIND_DICT,
+            XValue::Obj(_) => KIND_OBJ,
+            XValue::Map(_) => KIND_MAP,
             XValue::Index(_) => KIND_INDEX,
             XValue::ExtIndex(_) => KIND_EXT_INDEX,
             XValue::Opaque(o) => o.kind.as_str(),
@@ -162,7 +165,8 @@ impl XValue {
             XValue::CharByte(d) => d.data.len() as i32,
             XValue::CharAscii(d) => d.data.len() as i32,
             XValue::Char32(d) => (d.data.len() * 4) as i32,
-            XValue::Dict(d) => d.join(INDEX_VALUE_SEP).len() as i32,
+            XValue::Obj(d) => d.join(INDEX_VALUE_SEP).len() as i32,
+            XValue::Map(d) => d.join(INDEX_VALUE_SEP).len() as i32,
             XValue::Index(d) => d.join(INDEX_VALUE_SEP).len() as i32,
             XValue::ExtIndex(e) => crate::xvalue_index::encode_ext_index_raw(&e.ext_path, &e.childs).len() as i32,
             XValue::Opaque(o) => o.body.len() as i32,
@@ -187,7 +191,8 @@ impl XValue {
             XValue::CharByte(d) => d.data.len() as i32,
             XValue::CharAscii(d) => d.data.len() as i32,
             XValue::Char32(d) => d.data.len() as i32,
-            XValue::Dict(_) => 1,
+            XValue::Obj(_) => 1,
+            XValue::Map(_) => 1,
             XValue::Index(_) => 1,
             XValue::ExtIndex(_) => 1,
             XValue::Opaque(o) => o.array_len,
@@ -212,9 +217,13 @@ impl XValue {
             XValue::CharByte(d) => crate::xvalue_byte::encode_char_byte(&d.data, &d.dims),
             XValue::CharAscii(d) => crate::xvalue_byte::encode_char_ascii(&d.data, &d.dims),
             XValue::Char32(d) => crate::xvalue_byte::encode_char32(&d.data, &d.dims),
-            XValue::Dict(d) => {
+            XValue::Obj(d) => {
                 let raw = d.join(INDEX_VALUE_SEP).into_bytes();
-                tlv_encode(KIND_DICT, &raw, 1)
+                tlv_encode(KIND_OBJ, &raw, 1)
+            }
+            XValue::Map(d) => {
+                let raw = d.join(INDEX_VALUE_SEP).into_bytes();
+                tlv_encode(KIND_MAP, &raw, 1)
             }
             XValue::Index(d) => {
                 let raw = d.join(INDEX_VALUE_SEP).into_bytes();
@@ -246,7 +255,8 @@ impl XValue {
             XValue::CharByte(d) => String::from_utf8_lossy(&d.data).into_owned(),
             XValue::CharAscii(d) => String::from_utf8_lossy(&d.data).into_owned(),
             XValue::Char32(d) => d.data.iter().map(|&c| char::from_u32(c).unwrap_or('\u{FFFD}')).collect(),
-            XValue::Dict(d) => dict_value_string(d),
+            XValue::Obj(d) => obj_value_string(d),
+            XValue::Map(d) => format!("map{{{}}}", d.len()),
             XValue::Index(d) => index_value_string(d),
             XValue::ExtIndex(e) => e.value_string(),
             XValue::Opaque(o) => String::from_utf8_lossy(&o.body).into_owned(),
@@ -321,11 +331,11 @@ pub struct Opaque {
     pub array_len: i32,
 }
 
-fn dict_value_string(childs: &[String]) -> String {
+fn obj_value_string(childs: &[String]) -> String {
     if childs.len() == 1 && childs[0].is_empty() {
         "{empty}".to_string()
     } else if childs.is_empty() {
-        KIND_DICT.to_string()
+        KIND_OBJ.to_string()
     } else {
         format!("{{{}}}", childs.len())
     }

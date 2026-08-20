@@ -10,7 +10,7 @@ use crate::kvspace_common::{
 };
 use crate::store::KVStore;
 use crate::xvalue::{decode_xvalue, decode_xvalue_head, is_none, is_ptr, ptr_target, XValue};
-use crate::xvalue_index::{new_dict_index, new_ext_index, new_index};
+use crate::xvalue_index::{new_map_index, new_obj_index, new_ext_index, new_index};
 
 pub struct Backend<S: KVStore> {
     store: S,
@@ -24,7 +24,7 @@ impl<S: KVStore> Backend<S> {
     // ── 目录与路径工具 ──────────────────────────────────────────────
 
     fn is_dir(path: &str) -> bool {
-        path.ends_with(DIR_INDEX_SUF) || path.ends_with(DICT_SEP)
+        path.ends_with(DIR_INDEX_SUF) || path.ends_with(OBJ_SEP)
     }
 
     fn assert_dir(path: &str) {
@@ -38,7 +38,7 @@ impl<S: KVStore> Backend<S> {
         if Self::is_dir(&path) && path != PATH_SEP {
             if path.ends_with(DIR_INDEX_SUF) {
                 path.pop();
-            } else if path.ends_with(DICT_SEP) {
+            } else if path.ends_with(OBJ_SEP) {
                 path.pop();
             }
         }
@@ -50,8 +50,8 @@ impl<S: KVStore> Backend<S> {
     }
 
     fn suffix_for(path: &str) -> &'static str {
-        if path.ends_with(DICT_SEP) && !path.ends_with(DIR_INDEX_SUF) {
-            DICT_SEP
+        if path.ends_with(OBJ_SEP) && !path.ends_with(DIR_INDEX_SUF) {
+            OBJ_SEP
         } else {
             DIR_INDEX_SUF
         }
@@ -124,7 +124,8 @@ impl<S: KVStore> Backend<S> {
                 }
                 match v {
                     XValue::Index(c) => normalize_children(c),
-                    XValue::Dict(c) => normalize_children(c),
+                    XValue::Obj(c) => normalize_children(c),
+                    XValue::Map(c) => normalize_children(c),
                     XValue::ExtIndex(e) => e.childs,
                     other => panic!("read_dir_index: unexpected kind {}", other.kind()),
                 }
@@ -135,8 +136,8 @@ impl<S: KVStore> Backend<S> {
     fn add_child(&self, parent: &str, name: &str) {
         match self.store.get(parent) {
             None => {
-                if parent.ends_with(DICT_SEP) {
-                    let v = new_dict_index(&[name.to_string()]);
+                if parent.ends_with(OBJ_SEP) {
+                    let v = new_obj_index(&[name.to_string()]);
                     self.store.set(parent, &v.encode());
                 } else {
                     let v = new_index(&[name.to_string()]);
@@ -155,13 +156,22 @@ impl<S: KVStore> Backend<S> {
                         let v = new_index(&nodes);
                         self.store.set(parent, &v.encode());
                     }
-                    XValue::Dict(nodes) => {
+                    XValue::Obj(nodes) => {
                         let mut nodes = normalize_children(nodes);
                         if nodes.iter().any(|n| n == name) {
                             return;
                         }
                         nodes.push(name.to_string());
-                        let v = new_dict_index(&nodes);
+                        let v = new_obj_index(&nodes);
+                        self.store.set(parent, &v.encode());
+                    }
+                    XValue::Map(nodes) => {
+                        let mut nodes = normalize_children(nodes);
+                        if nodes.iter().any(|n| n == name) {
+                            return;
+                        }
+                        nodes.push(name.to_string());
+                        let v = new_map_index(&nodes);
                         self.store.set(parent, &v.encode());
                     }
                     XValue::ExtIndex(e) => {
@@ -194,10 +204,16 @@ impl<S: KVStore> Backend<S> {
                         let v = new_index(&filtered);
                         self.store.set(parent, &v.encode());
                     }
-                    XValue::Dict(nodes) => {
+                    XValue::Obj(nodes) => {
                         let nodes = normalize_children(nodes);
                         let filtered: Vec<String> = nodes.into_iter().filter(|n| !is_removed(n)).collect();
-                        let v = new_dict_index(&filtered);
+                        let v = new_obj_index(&filtered);
+                        self.store.set(parent, &v.encode());
+                    }
+                    XValue::Map(nodes) => {
+                        let nodes = normalize_children(nodes);
+                        let filtered: Vec<String> = nodes.into_iter().filter(|n| !is_removed(n)).collect();
+                        let v = new_map_index(&filtered);
                         self.store.set(parent, &v.encode());
                     }
                     XValue::ExtIndex(e) => {
@@ -287,7 +303,7 @@ impl<S: KVStore> KVSpace for Backend<S> {
             match &p.val {
                 XValue::Index(_) | XValue::ExtIndex(_) => {
                     if !Self::is_dir(&resolved) {
-                        panic!("Set: index/extindex value at non-directory key {:?}", resolved);
+                        panic!("Set: directory-kind value at non-directory key {:?}", resolved);
                     }
                 }
                 _ => {}
@@ -305,14 +321,14 @@ impl<S: KVStore> KVSpace for Backend<S> {
             }
 
             let (parent, name, _) = split_index(&resolved);
-            if parent.ends_with(DICT_SEP) {
+            if parent.ends_with(OBJ_SEP) {
                 if self.store.get(&parent).is_none() {
-                    let v = new_dict_index(&[]);
+                    let v = new_obj_index(&[]);
                     self.store.set(&parent, &v.encode());
                 }
                 let (dp, dn) = Self::parent_name(&parent);
                 mk_index_recursive(self, &dp);
-                children.push((dp, format!("{}{}", dn, DICT_SEP)));
+                children.push((dp, format!("{}{}", dn, OBJ_SEP)));
             } else {
                 mk_index_recursive(self, &parent);
             }
@@ -347,13 +363,14 @@ impl<S: KVStore> KVSpace for Backend<S> {
             let mut nodes: Vec<String> = Vec::new();
             let mut ext_path = String::new();
             let mut is_ext = false;
-            let mut is_dict = parent.ends_with(DICT_SEP);
+            let mut is_dict = parent.ends_with(OBJ_SEP);
 
             if let Some(data) = self.store.get(&parent) {
                 let v = decode_xvalue(&data);
                 match v {
                     XValue::Index(c) => nodes = normalize_children(c),
-                    XValue::Dict(c) => {
+                    XValue::Map(c) => nodes = normalize_children(c),
+                    XValue::Obj(c) => {
                         nodes = normalize_children(c);
                         is_dict = true;
                     }
@@ -380,7 +397,7 @@ impl<S: KVStore> KVSpace for Backend<S> {
             let v = if is_ext {
                 new_ext_index(&nodes, &ext_path)
             } else if is_dict {
-                new_dict_index(&nodes)
+                new_obj_index(&nodes)
             } else {
                 new_index(&nodes)
             };
@@ -476,7 +493,7 @@ impl<S: KVStore> KVSpace for Backend<S> {
         }
 
         let (parent, name) = Self::parent_name(&resolved);
-        let names = vec![name.clone(), format!("{}{}", name, DICT_SEP)];
+        let names = vec![name.clone(), format!("{}{}", name, OBJ_SEP)];
         self.remove_child(&parent, &names);
         Ok(())
     }

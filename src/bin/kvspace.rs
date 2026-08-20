@@ -39,7 +39,7 @@ fn parse_value(raw: &str) -> Result<XValue, String> {
                 "string" => Ok(new_char_byte(repr.as_bytes())),
                 "nil" => Ok(XValue::None),
                 KIND_INDEX => Ok(new_index(&[])),
-                KIND_DICT => Ok(new_dict_index(&[])),
+                KIND_OBJ => Ok(new_obj_index(&[])),
                 _ => Err(format!("unknown kind: {:?}", kind)),
             }
         }

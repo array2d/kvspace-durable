@@ -34,7 +34,7 @@ pub const ERR_LINK_PATH_EXISTS: &str = "kvspace: Link path already contains a no
 // ── XValueHead kind ─────────────────────────────────────────────────────────
 
 pub const KIND_NONE: &str = "None";
-pub const DICT_SEP: &str = ".";
+pub const OBJ_SEP: &str = ".";
 
 // kind 继承树：uint8 是所有定长数值类型的祖先。
 // 字节宽度由 ElemSize(kind) 定义——任何 elemSize>0 的 kind 继承 uint8。
@@ -53,6 +53,7 @@ pub const KIND_INT64: &str = "int64"; // → byte, 8B
 pub const KIND_UINT64: &str = "uint64"; // → byte, 8B
 pub const KIND_FLOAT64: &str = "float64"; // → byte, 8B
 
-pub const KIND_DICT: &str = "dict";
+pub const KIND_OBJ: &str = "obj";
+pub const KIND_MAP: &str = "map";
 pub const KIND_INDEX: &str = "index";
 pub const KIND_EXT_INDEX: &str = "extindex"; // 扩展索引，写留在上层

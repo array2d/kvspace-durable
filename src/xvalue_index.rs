@@ -1,4 +1,4 @@
-// xvalue_index.rs — 对齐 xvalue_index.go（Index、DictIndex、ExtIndex）
+// xvalue_index.rs — 对齐 xvalue_index.go（Index、ObjIndex、ExtIndex）
 
 use crate::r#const::*;
 use crate::xvalue::{ExtIndex, XValue};
@@ -6,8 +6,11 @@ use crate::xvalue::{ExtIndex, XValue};
 pub fn new_index(children: &[String]) -> XValue {
     XValue::Index(children.to_vec())
 }
-pub fn new_dict_index(children: &[String]) -> XValue {
-    XValue::Dict(children.to_vec())
+pub fn new_obj_index(children: &[String]) -> XValue {
+    XValue::Obj(children.to_vec())
+}
+pub fn new_map_index(children: &[String]) -> XValue {
+    XValue::Map(children.to_vec())
 }
 pub fn new_ext_index(children: &[String], ext_path: &str) -> XValue {
     XValue::ExtIndex(ExtIndex {
@@ -23,7 +26,7 @@ pub fn decode_index(body: &[u8]) -> Vec<String> {
     }
     s.split('\n').map(|x| x.to_string()).collect()
 }
-pub fn decode_dict_index(body: &[u8]) -> Vec<String> {
+pub fn decode_obj_index(body: &[u8]) -> Vec<String> {
     decode_index(body)
 }
 pub fn decode_ext_index(body: &[u8]) -> ExtIndex {

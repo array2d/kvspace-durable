@@ -13,7 +13,7 @@ pub mod xvalue_uint;
 pub mod xvalue_float;
 pub mod xvalue_bool;
 pub mod xvalue_byte;
-pub mod xvalue_dict;
+pub mod xvalue_obj;
 pub mod xvalue_index;
 
 pub mod kvspace;
@@ -32,7 +32,7 @@ pub use xvalue_uint::*;
 pub use xvalue_float::*;
 pub use xvalue_bool::*;
 pub use xvalue_byte::*;
-pub use xvalue_dict::*;
+pub use xvalue_obj::*;
 pub use xvalue_index::*;
 
 pub use backend::Backend;
