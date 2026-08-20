@@ -18,8 +18,9 @@ use std::time::Duration;
 use crate::conn::conn;
 use crate::kvspace::{KVSpace, KVPair};
 use crate::kvspace_common::get_one;
+use crate::r#const::{KIND_CHAR_UTF8, KIND_UINT8};
 use crate::xvalue::{
-    decode_xvalue, decode_xvalue_head, encode_head, new_ptr,
+    body_bytes, decode_xvalue, decode_xvalue_head, encode_head, is_none, new_ptr,
 };
 use crate::xvalue_bool::new_bool;
 use crate::xvalue_byte::{new_char, new_char_byte};
@@ -500,4 +501,232 @@ pub extern "C" fn kvspaceNewFloat64(
 ) -> c_int {
     let x = new_float64(&[v]);
     alloc(x.encode(), out, out_len)
+}
+
+fn nq_key(key: &str) -> String {
+    format!("/\u{2025}notify{key}")
+}
+
+fn nq_load(kv: &mut dyn KVSpace, qk: &str) -> Vec<u8> {
+    let v = get_one(kv, qk);
+    if is_none(&v) {
+        return Vec::new();
+    }
+    body_bytes(&v)
+}
+
+fn nq_frames(body: &[u8]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 4 <= body.len() {
+        let n = u32::from_le_bytes([body[i], body[i + 1], body[i + 2], body[i + 3]]) as usize;
+        i += 4;
+        if i + n > body.len() {
+            break;
+        }
+        out.push(body[i..i + n].to_vec());
+        i += n;
+    }
+    out
+}
+
+fn nq_save(kv: &mut dyn KVSpace, qk: &str, frames: &[Vec<u8>]) -> Result<(), String> {
+    if frames.is_empty() {
+        return kv.del(&[qk.to_string()]);
+    }
+    let mut raw = Vec::new();
+    for f in frames {
+        raw.extend_from_slice(&(f.len() as u32).to_le_bytes());
+        raw.extend_from_slice(f);
+    }
+    let tlv = encode_head(KIND_UINT8, 0, &[raw.len() as i32], &raw);
+    kv.set(&[KVPair {
+        key: qk.to_string(),
+        val: decode_xvalue(&tlv),
+    }])
+}
+
+#[no_mangle]
+pub extern "C" fn kvspaceNotify(
+    h: *mut Handle,
+    key: *const c_char,
+    val: *const u8,
+    len: u32,
+    err: *mut c_char,
+    err_cap: u32,
+) -> c_int {
+    if h.is_null() || val.is_null() || len == 0 {
+        return 1;
+    }
+    let kv: &mut dyn KVSpace = unsafe { &mut **h };
+    let key = unsafe { cstr(key) };
+    let frame = unsafe { std::slice::from_raw_parts(val, len as usize) }.to_vec();
+    let qk = nq_key(key);
+    let mut frames = nq_frames(&nq_load(kv, &qk));
+    frames.push(frame);
+    match nq_save(kv, &qk, &frames) {
+        Ok(()) => 0,
+        Err(e) => {
+            write_err(err, err_cap, &e);
+            1
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn kvspaceTake(
+    h: *mut Handle,
+    key: *const c_char,
+    timeout_ns: u64,
+    out: *mut *mut u8,
+    out_len: *mut u32,
+) -> c_int {
+    if out.is_null() || out_len.is_null() {
+        return 1;
+    }
+    unsafe {
+        *out = std::ptr::null_mut();
+        *out_len = 0;
+    }
+    if h.is_null() {
+        return 1;
+    }
+    let kv: &mut dyn KVSpace = unsafe { &mut **h };
+    let key = unsafe { cstr(key) };
+    let deadline = std::time::Instant::now() + Duration::from_nanos(timeout_ns);
+    loop {
+        if let Some(item) = nq_try_pop(kv, key) {
+            return alloc(item, out, out_len);
+        }
+        if std::time::Instant::now() >= deadline {
+            return 0;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn nq_try_pop(kv: &mut dyn KVSpace, key: &str) -> Option<Vec<u8>> {
+    let qk = nq_key(key);
+    let mut frames = nq_frames(&nq_load(kv, &qk));
+    if frames.is_empty() {
+        return None;
+    }
+    let item = frames.remove(0);
+    let _ = nq_save(kv, &qk, &frames);
+    Some(item)
+}
+
+#[no_mangle]
+pub extern "C" fn kvspaceWatchAny(
+    h: *mut Handle,
+    keys: *const *const c_char,
+    nkeys: u32,
+    timeout_ns: u64,
+    out_key: *mut *mut u8,
+    out_key_len: *mut u32,
+    out: *mut *mut u8,
+    out_len: *mut u32,
+) -> c_int {
+    if out_key.is_null() || out_key_len.is_null() || out.is_null() || out_len.is_null() {
+        return 1;
+    }
+    unsafe {
+        *out_key = std::ptr::null_mut();
+        *out_key_len = 0;
+        *out = std::ptr::null_mut();
+        *out_len = 0;
+    }
+    if h.is_null() || keys.is_null() || nkeys == 0 {
+        return 1;
+    }
+    let kv: &mut dyn KVSpace = unsafe { &mut **h };
+    let deadline = std::time::Instant::now() + Duration::from_nanos(timeout_ns);
+    let ks: &[*const c_char] = unsafe { std::slice::from_raw_parts(keys, nkeys as usize) };
+    loop {
+        for p in ks {
+            let key = unsafe { cstr(*p) };
+            if key.is_empty() {
+                continue;
+            }
+            if let Some(item) = nq_try_pop(kv, key) {
+                let _ = alloc(key.as_bytes().to_vec(), out_key, out_key_len);
+                return alloc(item, out, out_len);
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return 0;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn kvspaceIncr(
+    h: *mut Handle,
+    key: *const c_char,
+    out: *mut i64,
+    err: *mut c_char,
+    err_cap: u32,
+) -> c_int {
+    if h.is_null() || out.is_null() {
+        write_err(err, err_cap, "Incr: bad args");
+        return 1;
+    }
+    unsafe { *out = 0; }
+    let kv: &mut dyn KVSpace = unsafe { &mut **h };
+    let key = unsafe { cstr(key) };
+    let cur = get_one(kv, key);
+    let mut n: i64 = 0;
+    if !is_none(&cur) {
+        if !cur.kind().starts_with("char/") {
+            write_err(err, err_cap, "Incr: counter is not a Char");
+            return 1;
+        }
+        let s = cur.value_string();
+        match s.parse::<i64>() {
+            Ok(v) => n = v,
+            Err(_) => {
+                write_err(err, err_cap, "Incr: unparsable counter");
+                return 1;
+            }
+        }
+    }
+    if n == i64::MAX {
+        write_err(err, err_cap, "Incr: overflow");
+        return 1;
+    }
+    n += 1;
+    let val = new_char(KIND_CHAR_UTF8, &n.to_string());
+    match kv.set(&[KVPair { key: key.to_string(), val }]) {
+        Ok(()) => {
+            unsafe { *out = n; }
+            0
+        }
+        Err(e) => {
+            write_err(err, err_cap, &e);
+            1
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn kvspaceExpire(
+    h: *mut Handle,
+    key: *const c_char,
+    ttl_ns: u64,
+    err: *mut c_char,
+    err_cap: u32,
+) -> c_int {
+    if h.is_null() {
+        write_err(err, err_cap, "Expire: bad args");
+        return 1;
+    }
+    let kv: &mut dyn KVSpace = unsafe { &mut **h };
+    match kv.expire(unsafe { cstr(key) }, Duration::from_nanos(ttl_ns)) {
+        Ok(()) => 0,
+        Err(e) => {
+            write_err(err, err_cap, &e);
+            1
+        }
+    }
 }

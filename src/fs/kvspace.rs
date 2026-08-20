@@ -2,12 +2,13 @@
 // 编码：kvspace 的 '.' 一律替换为 './'（父目录名带尾点 + "/" 分隔成员），反向 './' → '.'。
 // "/" 与 "." 的 index 都从 readdir 派生；ExtIndex 用目录内 __extindex__ 文件存 ext_target_path（第一行）。
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::kvspace::{KVSpace, KVPair};
-use crate::kvspace_common::{join_path, sep_path, split_index, validate_ptr, watch_value, SepKind};
+use crate::kvspace_common::{expire_key_ok, join_path, sep_path, split_index, validate_ptr, watch_value, SepKind};
 use crate::r#const::*;
 use crate::xvalue::*;
 use crate::xvalue_index::{new_map_index, new_obj_index, new_ext_index, new_index};
@@ -18,6 +19,7 @@ const ORDER_MARKER: &str = "__order__";
 
 pub struct FsKVSpace {
     root: PathBuf,
+    deadlines: HashMap<String, Instant>,
 }
 
 pub fn connect(root: &str) -> FsKVSpace {
@@ -28,7 +30,7 @@ pub fn connect(root: &str) -> FsKVSpace {
 impl FsKVSpace {
     pub fn new(root: &str) -> Self {
         fs::create_dir_all(root).unwrap_or_else(|e| panic!("kvspace-fs: create root {}: {}", root, e));
-        FsKVSpace { root: PathBuf::from(root) }
+        FsKVSpace { root: PathBuf::from(root), deadlines: HashMap::new() }
     }
 
     /// kvspace key → fs 路径：'.'（成员分隔）→ './'；段首 '.'（如 .todo<vid>）是字面量不替换。
@@ -59,6 +61,17 @@ impl FsKVSpace {
 
     fn is_dir_key(key: &str) -> bool {
         key.ends_with(DIR_INDEX_SUF) || key.ends_with(OBJ_SEP)
+    }
+
+    fn expired_now(&mut self, key: &str) -> bool {
+        match self.deadlines.get(key).copied() {
+            Some(t) if Instant::now() >= t => {
+                self.deadlines.remove(key);
+                let _ = fs::remove_file(self.fs_path(key));
+                true
+            }
+            _ => false,
+        }
     }
 
     fn read_leaf(&self, key: &str) -> Option<Vec<u8>> {
@@ -322,6 +335,9 @@ impl KVSpace for FsKVSpace {
                 if Self::is_dir_key(&full) {
                     return self.dir_value(&full);
                 }
+                if self.expired_now(&full) {
+                    return XValue::None;
+                }
                 if let Some(data) = self.read_leaf(&full) {
                     return decode_xvalue(&data);
                 }
@@ -401,6 +417,10 @@ impl KVSpace for FsKVSpace {
             return Vec::new();
         }
         let mut members = self.dir_children(&resolved);
+        members.retain(|m| {
+            let full = join_path(&resolved, m);
+            !self.deadlines.contains_key(&full)
+        });
 
         if expand_ext {
             let ext_t = self.prefix_ext(&resolved);
@@ -499,6 +519,19 @@ impl KVSpace for FsKVSpace {
     }
 
     fn dis_conn(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn expire(&mut self, key: &str, ttl: Duration) -> Result<(), String> {
+        expire_key_ok(key)?;
+        if ttl.is_zero() {
+            return Err("Expire: ttl must be > 0".into());
+        }
+        let resolved = self.resolve_path(key);
+        if self.read_leaf(&resolved).is_none() || self.expired_now(&resolved) {
+            return Err("Expire: missing key".into());
+        }
+        self.deadlines.insert(resolved, Instant::now() + ttl);
         Ok(())
     }
 }

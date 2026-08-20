@@ -7,6 +7,21 @@ use crate::kvspace::{KVSpace, KVPair};
 use crate::xvalue::{body_bytes, is_none, plain, XValue};
 use crate::xvalue_index::new_index;
 
+pub fn expire_key_ok(key: &str) -> Result<(), String> {
+    if key.is_empty() || !key.starts_with('/') {
+        return Err("Expire: key is not an absolute path".into());
+    }
+    if key.ends_with('/') {
+        return Err("Expire: directory".into());
+    }
+    for seg in key[1..].split('/') {
+        if seg.is_empty() || seg == "." || seg == ".." {
+            return Err("Expire: key is not an absolute path".into());
+        }
+    }
+    Ok(())
+}
+
 /// JoinPath 拼接父子路径。
 pub fn join_path(parent: &str, child: &str) -> String {
     if parent == PATH_SEP {

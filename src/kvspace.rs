@@ -44,4 +44,7 @@ pub trait KVSpace {
 
     fn clear(&mut self) -> Result<(), String>;
     fn dis_conn(&mut self) -> Result<(), String>;
+
+    /// Hide key from List immediately. Get still returns it until ttl.
+    fn expire(&mut self, key: &str, ttl: Duration) -> Result<(), String>;
 }
