@@ -593,14 +593,65 @@ pub extern "C" fn kvspaceTake(
     }
     let kv: &mut dyn KVSpace = unsafe { &mut **h };
     let key = unsafe { cstr(key) };
-    let qk = nq_key(key);
     let deadline = std::time::Instant::now() + Duration::from_nanos(timeout_ns);
     loop {
-        let mut frames = nq_frames(&nq_load(kv, &qk));
-        if !frames.is_empty() {
-            let item = frames.remove(0);
-            let _ = nq_save(kv, &qk, &frames);
+        if let Some(item) = nq_try_pop(kv, key) {
             return alloc(item, out, out_len);
+        }
+        if std::time::Instant::now() >= deadline {
+            return 0;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn nq_try_pop(kv: &mut dyn KVSpace, key: &str) -> Option<Vec<u8>> {
+    let qk = nq_key(key);
+    let mut frames = nq_frames(&nq_load(kv, &qk));
+    if frames.is_empty() {
+        return None;
+    }
+    let item = frames.remove(0);
+    let _ = nq_save(kv, &qk, &frames);
+    Some(item)
+}
+
+#[no_mangle]
+pub extern "C" fn kvspaceWatchAny(
+    h: *mut Handle,
+    keys: *const *const c_char,
+    nkeys: u32,
+    timeout_ns: u64,
+    out_key: *mut *mut u8,
+    out_key_len: *mut u32,
+    out: *mut *mut u8,
+    out_len: *mut u32,
+) -> c_int {
+    if out_key.is_null() || out_key_len.is_null() || out.is_null() || out_len.is_null() {
+        return 1;
+    }
+    unsafe {
+        *out_key = std::ptr::null_mut();
+        *out_key_len = 0;
+        *out = std::ptr::null_mut();
+        *out_len = 0;
+    }
+    if h.is_null() || keys.is_null() || nkeys == 0 {
+        return 1;
+    }
+    let kv: &mut dyn KVSpace = unsafe { &mut **h };
+    let deadline = std::time::Instant::now() + Duration::from_nanos(timeout_ns);
+    let ks: &[*const c_char] = unsafe { std::slice::from_raw_parts(keys, nkeys as usize) };
+    loop {
+        for p in ks {
+            let key = unsafe { cstr(*p) };
+            if key.is_empty() {
+                continue;
+            }
+            if let Some(item) = nq_try_pop(kv, key) {
+                let _ = alloc(key.as_bytes().to_vec(), out_key, out_key_len);
+                return alloc(item, out, out_len);
+            }
         }
         if std::time::Instant::now() >= deadline {
             return 0;
