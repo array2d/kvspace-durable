@@ -5,7 +5,18 @@
 use crate::r#const::*;
 
 // ── XValueHead ─────────────────────────────────────────────────────────────
-// XValueHead = [1B kind_len][kind][1B ref][1B ndim][ndim×4B dims][4B raw_len]
+// XValueHead = [1B kind_len][kind][1B ref][1B ndim][ndim×4B dims][padding][4B raw_len]
+//   shape 段 = dims + padding，ndim≥1 时恒 X_MAX_NDIM×4（32B），使 body_offset 与 ndim 无关，
+//   xv.reshape 可原地改写 dims 不搬 body；ndim=0 标量无 shape 段（padding=0）。
+
+/// 形状段最大维数（对齐 kvspace-c 的 X_MAX_NDIM）。
+pub const X_MAX_NDIM: i32 = 8;
+
+/// shape 段字节数：标量(ndim=0)=0，数组(ndim≥1)=X_MAX_NDIM×4。
+fn shape_seg(ndim: i32) -> i32 {
+    if ndim == 0 { 0 } else { X_MAX_NDIM * 4 }
+}
+
 #[derive(Default, Clone, Debug, PartialEq)]
 pub struct XValueHead {
     pub kind: String,
@@ -20,7 +31,7 @@ pub struct XValueHead {
 impl XValueHead {
     /// 返回 XValueHead（元数据）字节数，不含 body。
     pub fn head_len(&self) -> i32 {
-        1 + self.kind.len() as i32 + 1 + 1 + 4 * self.dims.len() as i32 + 4
+        1 + self.kind.len() as i32 + 1 + 1 + shape_seg(self.dims.len() as i32) + 4
     }
 
     /// 从完整 XValue 字节 data 截取 body。
@@ -375,7 +386,7 @@ fn bool_string(b: bool) -> String {
 
 // ── TLV 编解码 ─────────────────────────────────────────────────────────────
 // XValue = XValueHead + body。
-// XValueHead = [1B kind_len][kind][1B ref][1B ndim][ndim×4B dims][4B raw_len]
+// XValueHead = [1B kind_len][kind][1B ref][1B ndim][ndim×4B dims][padding][4B raw_len]
 // body       = [raw]，offset = head_len()。
 // ref: 0=内联 1=软链接(*) 2=扩展句柄(@)；ref=1 时 body 为目标 key 路径。None 编码为 nil。
 
@@ -401,7 +412,9 @@ fn array_to_header(kind: &str, array_len: i32) -> Vec<i32> {
 
 pub fn encode_head(kind: &str, r#ref: i32, dims: &[i32], raw: &[u8]) -> Vec<u8> {
     let ndim = dims.len() as i32;
-    let mut buf = vec![0u8; 1 + kind.len() + 1 + 1 + 4 * dims.len() + 4 + raw.len()];
+    let seg = shape_seg(ndim) as usize;
+    // padding 段（seg - 4*ndim 字节）由 vec! 初始化为 0。
+    let mut buf = vec![0u8; 1 + kind.len() + 1 + 1 + seg + 4 + raw.len()];
     buf[0] = kind.len() as u8;
     buf[1..1 + kind.len()].copy_from_slice(kind.as_bytes());
     let o = 1 + kind.len();
@@ -411,7 +424,7 @@ pub fn encode_head(kind: &str, r#ref: i32, dims: &[i32], raw: &[u8]) -> Vec<u8> 
         let off = o + 2 + 4 * i;
         buf[off..off + 4].copy_from_slice(&(*d as u32).to_le_bytes());
     }
-    let raw_len_off = o + 2 + 4 * dims.len();
+    let raw_len_off = o + 2 + seg;
     buf[raw_len_off..raw_len_off + 4].copy_from_slice(&(raw.len() as u32).to_le_bytes());
     buf[raw_len_off + 4..].copy_from_slice(raw);
     buf
@@ -429,7 +442,11 @@ pub fn decode_xvalue_head(data: &[u8]) -> XValueHead {
     let kind = String::from_utf8_lossy(&data[1..o]).into_owned();
     let r#ref = data[o] as i32;
     let ndim = data[o + 1] as i32;
-    if data.len() < o + 2 + 4 * ndim as usize + 4 {
+    if ndim > X_MAX_NDIM {
+        return XValueHead::default();
+    }
+    let seg = shape_seg(ndim) as usize;
+    if data.len() < o + 2 + seg + 4 {
         return XValueHead::default();
     }
     let mut dims = Vec::with_capacity(ndim as usize);
@@ -437,7 +454,7 @@ pub fn decode_xvalue_head(data: &[u8]) -> XValueHead {
         let off = o + 2 + 4 * i;
         dims.push(i32::from_le_bytes(data[off..off + 4].try_into().unwrap()));
     }
-    let raw_len_off = o + 2 + 4 * ndim as usize;
+    let raw_len_off = o + 2 + seg;
     let raw_len = u32::from_le_bytes(data[raw_len_off..raw_len_off + 4].try_into().unwrap()) as i32;
     let start = raw_len_off + 4;
     if data.len() < start + raw_len as usize {
