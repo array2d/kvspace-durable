@@ -176,6 +176,14 @@ impl KVStore for RedisStore {
         keys
     }
 
+    fn pexpire(&self, key: &str, ttl: std::time::Duration) -> bool {
+        let ms = ttl.as_millis().max(1).to_string();
+        match self.cmd(&[b"PEXPIRE", key.as_bytes(), ms.as_bytes()]) {
+            Resp::Integer(n) => n == 1,
+            _ => false,
+        }
+    }
+
     fn flush(&self) {
         let _ = self.cmd(&[b"FLUSHDB"]);
     }

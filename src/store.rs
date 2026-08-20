@@ -13,4 +13,8 @@ pub trait KVStore {
     /// 返回所有以 prefix 开头的 key（含 prefix 自身，若存在）。
     fn scan_keys(&self, prefix: &str) -> Vec<String>;
     fn flush(&self);
+    /// Native TTL. true if the store will drop Get after ttl. false → caller hides Get itself.
+    fn pexpire(&self, _key: &str, _ttl: std::time::Duration) -> bool {
+        false
+    }
 }

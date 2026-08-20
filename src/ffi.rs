@@ -657,3 +657,25 @@ pub extern "C" fn kvspaceIncr(
         }
     }
 }
+
+#[no_mangle]
+pub extern "C" fn kvspaceExpire(
+    h: *mut Handle,
+    key: *const c_char,
+    ttl_ns: u64,
+    err: *mut c_char,
+    err_cap: u32,
+) -> c_int {
+    if h.is_null() {
+        write_err(err, err_cap, "Expire: bad args");
+        return 1;
+    }
+    let kv: &mut dyn KVSpace = unsafe { &mut **h };
+    match kv.expire(unsafe { cstr(key) }, Duration::from_nanos(ttl_ns)) {
+        Ok(()) => 0,
+        Err(e) => {
+            write_err(err, err_cap, &e);
+            1
+        }
+    }
+}

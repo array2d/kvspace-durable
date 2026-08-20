@@ -1,12 +1,14 @@
 // backend.rs — 对齐 redis/kvspace.go 的 KVSpace 实现逻辑，参数化于 KVStore 原语。
 // redis 与 fs 后端共用这份逻辑，只替换底层 store。
 
-use std::time::Duration;
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use crate::r#const::*;
 use crate::kvspace::{KVSpace, KVPair};
 use crate::kvspace_common::{
-    dir_exists, get_one, join_path, mk_index_recursive, sep_path, split_index, validate_ptr, watch_value,
+    dir_exists, expire_key_ok, get_one, join_path, mk_index_recursive, sep_path, split_index, validate_ptr, watch_value,
 };
 use crate::store::KVStore;
 use crate::xvalue::{decode_xvalue, decode_xvalue_head, is_none, is_ptr, ptr_target, XValue};
@@ -14,11 +16,47 @@ use crate::xvalue_index::{new_dict_index, new_ext_index, new_index};
 
 pub struct Backend<S: KVStore> {
     store: S,
+    deadlines: RefCell<HashMap<String, Instant>>,
 }
 
 impl<S: KVStore> Backend<S> {
     pub fn new(store: S) -> Self {
-        Backend { store }
+        Backend { store, deadlines: RefCell::new(HashMap::new()) }
+    }
+
+    fn remove_child_exact(&self, parent: &str, name: &str) {
+        match self.store.get(parent) {
+            None => {}
+            Some(data) => {
+                let v = decode_xvalue(&data);
+                match v {
+                    XValue::Index(nodes) => {
+                        let filtered: Vec<String> = normalize_children(nodes).into_iter().filter(|n| n != name).collect();
+                        self.store.set(parent, &new_index(&filtered).encode());
+                    }
+                    XValue::Dict(nodes) => {
+                        let filtered: Vec<String> = normalize_children(nodes).into_iter().filter(|n| n != name).collect();
+                        self.store.set(parent, &new_dict_index(&filtered).encode());
+                    }
+                    XValue::ExtIndex(e) => {
+                        let filtered: Vec<String> = e.childs.into_iter().filter(|n| n != name).collect();
+                        self.store.set(parent, &new_ext_index(&filtered, &e.ext_path).encode());
+                    }
+                    other => panic!("remove_child_exact: unexpected kind {}", other.kind()),
+                }
+            }
+        }
+    }
+
+    fn expired_now(&self, key: &str) -> bool {
+        let mut d = self.deadlines.borrow_mut();
+        match d.get(key).copied() {
+            Some(t) if Instant::now() >= t => {
+                d.remove(key);
+                true
+            }
+            _ => false,
+        }
     }
 
     // ── 目录与路径工具 ──────────────────────────────────────────────
@@ -259,8 +297,10 @@ impl<S: KVStore> KVSpace for Backend<S> {
         let full_refs: Vec<&str> = full_keys.iter().map(|(_, f)| f.as_str()).collect();
         let full_vals = self.store.get_many(&full_refs);
         let mut ext_keys: Vec<(usize, String)> = Vec::new();
-        for (idx, (i, _)) in full_keys.iter().enumerate() {
-            if let Some(data) = &full_vals[idx] {
+        for (idx, (i, full)) in full_keys.iter().enumerate() {
+            if self.expired_now(full) {
+                results[*i] = Some(XValue::None);
+            } else if let Some(data) = &full_vals[idx] {
                 results[*i] = Some(decode_xvalue(data));
             } else if !ext_t.is_empty() {
                 ext_keys.push((*i, join_path(&ext_t, &keys[*i])));
@@ -554,6 +594,23 @@ impl<S: KVStore> KVSpace for Backend<S> {
     }
 
     fn dis_conn(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn expire(&mut self, key: &str, ttl: Duration) -> Result<(), String> {
+        expire_key_ok(key)?;
+        if ttl.is_zero() {
+            return Err("Expire: ttl must be > 0".into());
+        }
+        let resolved = self.resolve_path(key);
+        if self.store.get(&resolved).is_none() || self.expired_now(&resolved) {
+            return Err("Expire: missing key".into());
+        }
+        let (parent, name, _) = split_index(&resolved);
+        self.remove_child_exact(&parent, &name);
+        if !self.store.pexpire(&resolved, ttl) {
+            self.deadlines.borrow_mut().insert(resolved, Instant::now() + ttl);
+        }
         Ok(())
     }
 }
