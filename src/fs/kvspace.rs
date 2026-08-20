@@ -249,27 +249,35 @@ impl FsKVSpace {
             return Vec::new();
         }
         let p = self.fs_path(dir_key);
-        let is_dict = dir_key.ends_with(OBJ_SEP);
+        // 目录名（末段）是否以 '.' 结尾：成员前缀目录（"math."）内的成员不再扁平化。
+        let name = dir_key.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+        let is_member_dir = name.ends_with(OBJ_SEP);
         let mut children = Vec::new();
         if let Ok(entries) = fs::read_dir(&p) {
             for e in entries.flatten() {
-                let name = e.file_name().to_string_lossy().into_owned();
-                if name == EXTINDEX_MARKER || name == SELF_MARKER || name == ORDER_MARKER {
+                let fname = e.file_name().to_string_lossy().into_owned();
+                if fname == EXTINDEX_MARKER || fname == SELF_MARKER || fname == ORDER_MARKER {
                     continue;
                 }
-                let decoded = name.replace("./", ".");
-                if e.path().is_dir() {
-                    if is_dict {
-                        children.push(decoded.trim_end_matches('.').to_string());
+                if fname.ends_with(OBJ_SEP) {
+                    if is_member_dir {
+                        // 成员目录内：obj 是完整 key，发射为 "init."
+                        children.push(fname);
                     } else {
-                        children.push(format!("{}/", decoded));
-                        // 目录带值：额外发射无尾斜杠的叶名（对应 __self__）
-                        if e.path().join(SELF_MARKER).is_file() {
-                            children.push(decoded);
+                        // 普通目录内：成员前缀目录（"math."）扁平化展开为 "math.<成员>"
+                        let sub_key = format!("{}{}/", dir_key, fname);
+                        for sub in self.dir_children(&sub_key) {
+                            children.push(format!("{}{}", fname, sub));
                         }
                     }
+                } else if e.path().is_dir() {
+                    children.push(format!("{}/", fname));
+                    // 目录带值：额外发射无尾斜杠的叶名（对应 __self__）
+                    if e.path().join(SELF_MARKER).is_file() {
+                        children.push(fname.clone());
+                    }
                 } else {
-                    children.push(decoded);
+                    children.push(fname);
                 }
             }
         }
