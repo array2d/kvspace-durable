@@ -18,7 +18,7 @@ use std::time::Duration;
 use crate::conn::conn;
 use crate::kvspace::{KVSpace, KVPair};
 use crate::kvspace_common::get_one;
-use crate::r#const::KIND_UINT8;
+use crate::r#const::{KIND_CHAR_UTF8, KIND_UINT8};
 use crate::xvalue::{
     body_bytes, decode_xvalue, decode_xvalue_head, encode_head, is_none, new_ptr,
 };
@@ -606,5 +606,54 @@ pub extern "C" fn kvspaceTake(
             return 0;
         }
         std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn kvspaceIncr(
+    h: *mut Handle,
+    key: *const c_char,
+    out: *mut i64,
+    err: *mut c_char,
+    err_cap: u32,
+) -> c_int {
+    if h.is_null() || out.is_null() {
+        write_err(err, err_cap, "Incr: bad args");
+        return 1;
+    }
+    unsafe { *out = 0; }
+    let kv: &mut dyn KVSpace = unsafe { &mut **h };
+    let key = unsafe { cstr(key) };
+    let cur = get_one(kv, key);
+    let mut n: i64 = 0;
+    if !is_none(&cur) {
+        if !cur.kind().starts_with("char/") {
+            write_err(err, err_cap, "Incr: counter is not a Char");
+            return 1;
+        }
+        let s = cur.value_string();
+        match s.parse::<i64>() {
+            Ok(v) => n = v,
+            Err(_) => {
+                write_err(err, err_cap, "Incr: unparsable counter");
+                return 1;
+            }
+        }
+    }
+    if n == i64::MAX {
+        write_err(err, err_cap, "Incr: overflow");
+        return 1;
+    }
+    n += 1;
+    let val = new_char(KIND_CHAR_UTF8, &n.to_string());
+    match kv.set(&[KVPair { key: key.to_string(), val }]) {
+        Ok(()) => {
+            unsafe { *out = n; }
+            0
+        }
+        Err(e) => {
+            write_err(err, err_cap, &e);
+            1
+        }
     }
 }
