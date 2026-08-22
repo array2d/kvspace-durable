@@ -124,8 +124,8 @@ pub enum XValue {
     CharByte(Arr<u8>), // char/utf8，1B×N
     CharAscii(Arr<u8>), // char/ascii，1B×N
     Char32(Arr<u32>), // char/utf32，码点，4B×N
-    Obj(Vec<String>), // obj（空 = Obj{}，非空 = ObjIndex）
-    Map(Vec<String>), // map（同构 map：key 恒 char 字符串，value 固定 kind；child 名=带中括号索引串）
+    Obj(Vec<String>), // objindex（命名成员对象：键为任意字符串，值 json）
+    Map(Vec<String>), // strkeymapindex（散 key 序列：键为数字字符串，元素 json，变长可增删）
     Index(Vec<String>), // index
     ExtIndex(ExtIndex), // extindex
     Opaque(Opaque), // 未知 kind（如 kvlang 的 rwir/rwfunc/scope），原样存取
@@ -180,9 +180,9 @@ impl XValue {
             XValue::CharByte(d) => d.data.len() as i32,
             XValue::CharAscii(d) => d.data.len() as i32,
             XValue::Char32(d) => (d.data.len() * 4) as i32,
-            XValue::Obj(d) => d.join(INDEX_VALUE_SEP).len() as i32,
-            XValue::Map(d) => d.join(INDEX_VALUE_SEP).len() as i32,
-            XValue::Index(d) => d.join(INDEX_VALUE_SEP).len() as i32,
+            XValue::Obj(d) => crate::xvalue_index::encode_index_raw(d).len() as i32,
+            XValue::Map(d) => crate::xvalue_index::encode_index_raw(d).len() as i32,
+            XValue::Index(d) => crate::xvalue_index::encode_index_raw(d).len() as i32,
             XValue::ExtIndex(e) => crate::xvalue_index::encode_ext_index_raw(&e.ext_path, &e.childs).len() as i32,
             XValue::Opaque(o) => o.body.len() as i32,
         }
@@ -233,15 +233,15 @@ impl XValue {
             XValue::CharAscii(d) => crate::xvalue_byte::encode_char_ascii(&d.data, &d.dims),
             XValue::Char32(d) => crate::xvalue_byte::encode_char32(&d.data, &d.dims),
             XValue::Obj(d) => {
-                let raw = d.join(INDEX_VALUE_SEP).into_bytes();
+                let raw = crate::xvalue_index::encode_index_raw(d);
                 tlv_encode(KIND_OBJ, &raw, 1)
             }
             XValue::Map(d) => {
-                let raw = d.join(INDEX_VALUE_SEP).into_bytes();
+                let raw = crate::xvalue_index::encode_index_raw(d);
                 tlv_encode(KIND_MAP, &raw, 1)
             }
             XValue::Index(d) => {
-                let raw = d.join(INDEX_VALUE_SEP).into_bytes();
+                let raw = crate::xvalue_index::encode_index_raw(d);
                 tlv_encode(KIND_INDEX, &raw, 1)
             }
             XValue::ExtIndex(e) => {

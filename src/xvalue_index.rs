@@ -19,8 +19,24 @@ pub fn new_ext_index(children: &[String], ext_path: &str) -> XValue {
     })
 }
 
+/// index/objindex/strkeymapindex 三类 index body 一律前缀 [4B count LE]（成员数），
+/// 后接成员名列表（INDEX_VALUE_SEP 连接）。count 使成员数 O(1) 可取，不再靠 split 现数。
+pub fn encode_index_raw(children: &[String]) -> Vec<u8> {
+    let mut buf = (children.len() as u32).to_le_bytes().to_vec();
+    buf.extend(children.join(INDEX_VALUE_SEP).into_bytes());
+    buf
+}
+
+/// 跳过 body 前 [4B count LE] 前缀，返回成员名段。
+fn body_names(body: &[u8]) -> &[u8] {
+    if body.len() < 4 {
+        return &[];
+    }
+    &body[4..]
+}
+
 pub fn decode_index(body: &[u8]) -> Vec<String> {
-    let s = String::from_utf8_lossy(body).into_owned();
+    let s = String::from_utf8_lossy(body_names(body)).into_owned();
     if s.is_empty() {
         return Vec::new();
     }
@@ -34,16 +50,18 @@ pub fn decode_ext_index(body: &[u8]) -> ExtIndex {
     ExtIndex { childs, ext_path }
 }
 
-/// encodeExtIndexRaw：parts = [ExtIndexHead + extpath] + children，用 IndexValueSep 连接。
+/// encodeExtIndexRaw：[4B count LE][…extpath\nname1\nname2...]，count = children.len()（extpath 不计入）。
 pub fn encode_ext_index_raw(ext_path: &str, children: &[String]) -> Vec<u8> {
+    let mut buf = (children.len() as u32).to_le_bytes().to_vec();
     let mut parts = vec![format!("{}{}", EXT_INDEX_HEAD, ext_path)];
     parts.extend(children.iter().cloned());
-    parts.join(INDEX_VALUE_SEP).into_bytes()
+    buf.extend(parts.join(INDEX_VALUE_SEP).into_bytes());
+    buf
 }
 
-/// decodeExtIndexRaw：首段（去掉 ExtIndexHead 前缀）= extpath，余段按 IndexValueSep 拆分为 children。
+/// decodeExtIndexRaw：跳过 [4B count LE]，首段（去 ExtIndexHead 前缀）= extpath，余段按 IndexValueSep 拆 children。
 pub fn decode_ext_index_raw(body: &[u8]) -> (String, Vec<String>) {
-    let s = String::from_utf8_lossy(body).into_owned();
+    let s = String::from_utf8_lossy(body_names(body)).into_owned();
     if s.is_empty() {
         return (String::new(), Vec::new());
     }
