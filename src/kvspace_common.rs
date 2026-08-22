@@ -81,7 +81,7 @@ pub fn mk_index_recursive(kv: &mut dyn KVSpace, path: &str) {
                     p.push_str(DIR_INDEX_SUF);
                 }
                 if !dir_exists(kv, &p, &n) {
-                    let _ = kv.set(&[KVPair { key: dir.to_string(), val: new_index(&[]) }]);
+                    let _ = kv.set(&[KVPair { key: dir.to_string(), val: new_index(&[]), raw: None }]);
                 }
             }
         }

@@ -341,6 +341,15 @@ impl KVSpace for FsKVSpace {
             .collect()
     }
 
+    fn get_raw(&mut self, key: &str) -> Vec<u8> {
+        let (mut p, l) = sep_path(key);
+        if p != PATH_SEP {
+            p.push_str(DIR_INDEX_SUF);
+        }
+        let full = join_path(&self.resolve_path(&p), &l);
+        self.read_leaf(&full).unwrap_or_default()
+    }
+
     fn set(&mut self, pairs: &[KVPair]) -> Result<(), String> {
         for p in pairs {
             let resolved = self.resolve_path(&p.key);
@@ -386,7 +395,8 @@ impl KVSpace for FsKVSpace {
             // 叶值：确保父是目录（父可能是同名叶文件，如 /lib/println），写文件。
             let (parent, name, _) = split_index(&resolved);
             self.ensure_dir(&parent);
-            self.write_leaf(&resolved, &p.val.encode());
+            let bytes = p.raw.clone().unwrap_or_else(|| p.val.encode());
+            self.write_leaf(&resolved, &bytes);
             self.add_order(&parent, &name);
         }
         Ok(())

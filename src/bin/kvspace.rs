@@ -51,6 +51,16 @@ fn fatalf(msg: &str) -> ! {
     exit(1)
 }
 
+/// 用权限位（ro/vid）重编码 XValue 的 head，保留 kind/ref/dims/body。
+fn encode_with_perm(v: &XValue, ro: bool, vid: u32) -> Vec<u8> {
+    if is_none(v) {
+        return Vec::new();
+    }
+    let data = v.encode();
+    let h = decode_xvalue_head(&data);
+    encode_head_perm(&h.kind, h.r#ref, &h.dims, h.body(&data), ro, vid)
+}
+
 fn parse_bool_flag(args: &[String], name: &str, default: bool) -> (bool, Vec<String>) {
     let mut val = default;
     let mut rest = Vec::new();
@@ -103,15 +113,31 @@ fn main() {
             }
             "set" => {
                 if tail.len() < 2 {
-                    fatalf("usage: kvspace set <key> <value>");
+                    fatalf("usage: kvspace set <key> <value> [ro|rw] [vid]");
                 }
+                let ro = tail.len() > 2 && tail[2] == "ro";
+                let vid = if tail.len() > 3 { tail[3].parse::<u32>().unwrap_or(0) } else { 0 };
                 match parse_value(&tail[1]) {
                     Ok(v) => {
-                        if let Err(e) = kv.set(&[KVPair { key: tail[0].clone(), val: v }]) {
+                        let raw = encode_with_perm(&v, ro, vid);
+                        if let Err(e) = kv.set(&[KVPair { key: tail[0].clone(), val: v, raw: Some(raw) }]) {
                             fatalf(&e);
                         }
                     }
                     Err(e) => fatalf(&e),
+                }
+            }
+            "head" => {
+                for k in tail {
+                    let raw = kv.get_raw(k);
+                    if raw.is_empty() {
+                        println!("{}\t(nil)", k);
+                    } else {
+                        let h = decode_xvalue_head(&raw);
+                        let dims = h.dims.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(",");
+                        println!("{}\t{}\tref={}\tro={}\tvid={}\tndim={}\tdims=[{}]",
+                            k, h.kind, h.r#ref, h.ro as u8, h.vid, h.ndim, dims);
+                    }
                 }
             }
             "del" => {

@@ -8,6 +8,7 @@ use crate::xvalue::XValue;
 pub struct KVPair {
     pub key: String,
     pub val: XValue,
+    pub raw: Option<Vec<u8>>, // 原始 TLV 字节：Set 透传，保留 head 权限位（ro/vid）
 }
 
 /// KVSpace KV 存储接口。
@@ -21,6 +22,8 @@ pub struct KVPair {
 pub trait KVSpace {
     /// 单点读：Get 返回完整 XValue，整存整取。
     fn get(&mut self, prefix: &str, keys: &[String], resolve: bool) -> Vec<XValue>;
+    /// 单点读原始字节（不 decode/re-encode，保 head 权限位 ro/vid）。无值返回空。
+    fn get_raw(&mut self, key: &str) -> Vec<u8>;
     /// 单点写：Set 写完整 XValue，并维护目录索引；总是穿透 link 写入 target。
     fn set(&mut self, pairs: &[KVPair]) -> Result<(), String>;
 

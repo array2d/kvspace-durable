@@ -5,7 +5,9 @@
 use crate::r#const::*;
 
 // ── XValueHead ─────────────────────────────────────────────────────────────
-// XValueHead = [1B kind_len][kind][1B ref][1B ndim][ndim×4B dims][padding][4B raw_len]
+// XValueHead = [1B kind_len][kind][1B ref|ro][1B ndim][4B vid LE][ndim×4B dims][padding][4B raw_len]
+//   ref|ro 字节：bit[1:0]=ref（0=内联 1=软链接 2=@扩展句柄），bit[2]=ro（1=只读），bit[7:3] 保留。
+//   vid：vthread id（u32 LE，默认 0），后续可设计父子继承。
 //   shape 段 = dims + padding，ndim≥1 时恒 X_MAX_NDIM×4（32B），使 body_offset 与 ndim 无关，
 //   xv.reshape 可原地改写 dims 不搬 body；ndim=0 标量无 shape 段（padding=0）。
 
@@ -26,12 +28,14 @@ pub struct XValueHead {
     pub ndim: i32, // 0=标量，N=N 维数组（唯一「是否数组」标志）
     pub dims: Vec<i32>, // 各维长度
     pub body_len: i32, // body 字节数
+    pub ro: bool, // 只读：1=只读，0=可写（默认）
+    pub vid: u32, // vthread id（默认 0）
 }
 
 impl XValueHead {
     /// 返回 XValueHead（元数据）字节数，不含 body。
     pub fn head_len(&self) -> i32 {
-        1 + self.kind.len() as i32 + 1 + 1 + shape_seg(self.dims.len() as i32) + 4
+        1 + self.kind.len() as i32 + 1 + 1 + 4 + shape_seg(self.dims.len() as i32) + 4
     }
 
     /// 从完整 XValue 字节 data 截取 body。
@@ -386,7 +390,7 @@ fn bool_string(b: bool) -> String {
 
 // ── TLV 编解码 ─────────────────────────────────────────────────────────────
 // XValue = XValueHead + body。
-// XValueHead = [1B kind_len][kind][1B ref][1B ndim][ndim×4B dims][padding][4B raw_len]
+// XValueHead = [1B kind_len][kind][1B ref|ro][1B ndim][4B vid LE][ndim×4B dims][padding][4B raw_len]
 // body       = [raw]，offset = head_len()。
 // ref: 0=内联 1=软链接(*) 2=扩展句柄(@)；ref=1 时 body 为目标 key 路径。None 编码为 nil。
 
@@ -411,20 +415,25 @@ fn array_to_header(kind: &str, array_len: i32) -> Vec<i32> {
 }
 
 pub fn encode_head(kind: &str, r#ref: i32, dims: &[i32], raw: &[u8]) -> Vec<u8> {
+    encode_head_perm(kind, r#ref, dims, raw, false, 0)
+}
+
+pub fn encode_head_perm(kind: &str, r#ref: i32, dims: &[i32], raw: &[u8], ro: bool, vid: u32) -> Vec<u8> {
     let ndim = dims.len() as i32;
     let seg = shape_seg(ndim) as usize;
     // padding 段（seg - 4*ndim 字节）由 vec! 初始化为 0。
-    let mut buf = vec![0u8; 1 + kind.len() + 1 + 1 + seg + 4 + raw.len()];
+    let mut buf = vec![0u8; 1 + kind.len() + 1 + 1 + 4 + seg + 4 + raw.len()];
     buf[0] = kind.len() as u8;
     buf[1..1 + kind.len()].copy_from_slice(kind.as_bytes());
     let o = 1 + kind.len();
-    buf[o] = r#ref as u8;
+    buf[o] = (r#ref as u8 & 0x03) | if ro { 0x04 } else { 0 };
     buf[o + 1] = ndim as u8;
+    buf[o + 2..o + 6].copy_from_slice(&vid.to_le_bytes());
     for (i, d) in dims.iter().enumerate() {
-        let off = o + 2 + 4 * i;
+        let off = o + 6 + 4 * i;
         buf[off..off + 4].copy_from_slice(&(*d as u32).to_le_bytes());
     }
-    let raw_len_off = o + 2 + seg;
+    let raw_len_off = o + 6 + seg;
     buf[raw_len_off..raw_len_off + 4].copy_from_slice(&(raw.len() as u32).to_le_bytes());
     buf[raw_len_off + 4..].copy_from_slice(raw);
     buf
@@ -436,25 +445,28 @@ pub fn decode_xvalue_head(data: &[u8]) -> XValueHead {
     }
     let kind_len = data[0] as usize;
     let o = 1 + kind_len;
-    if data.len() < o + 2 + 4 {
+    if data.len() < o + 10 {
         return XValueHead::default();
     }
     let kind = String::from_utf8_lossy(&data[1..o]).into_owned();
-    let r#ref = data[o] as i32;
+    let mode = data[o];
+    let r#ref = (mode & 0x03) as i32;
+    let ro = (mode & 0x04) != 0;
     let ndim = data[o + 1] as i32;
     if ndim > X_MAX_NDIM {
         return XValueHead::default();
     }
+    let vid = u32::from_le_bytes(data[o + 2..o + 6].try_into().unwrap());
     let seg = shape_seg(ndim) as usize;
-    if data.len() < o + 2 + seg + 4 {
+    if data.len() < o + 6 + seg + 4 {
         return XValueHead::default();
     }
     let mut dims = Vec::with_capacity(ndim as usize);
     for i in 0..ndim as usize {
-        let off = o + 2 + 4 * i;
+        let off = o + 6 + 4 * i;
         dims.push(i32::from_le_bytes(data[off..off + 4].try_into().unwrap()));
     }
-    let raw_len_off = o + 2 + seg;
+    let raw_len_off = o + 6 + seg;
     let raw_len = u32::from_le_bytes(data[raw_len_off..raw_len_off + 4].try_into().unwrap()) as i32;
     let start = raw_len_off + 4;
     if data.len() < start + raw_len as usize {
@@ -469,6 +481,8 @@ pub fn decode_xvalue_head(data: &[u8]) -> XValueHead {
         ndim,
         dims,
         body_len: raw_len,
+        ro,
+        vid,
     }
 }
 

@@ -292,6 +292,15 @@ impl<S: KVStore> KVSpace for Backend<S> {
         results.into_iter().map(|r| r.unwrap_or(XValue::None)).collect()
     }
 
+    fn get_raw(&mut self, key: &str) -> Vec<u8> {
+        let (mut p, l) = sep_path(key);
+        if p != PATH_SEP {
+            p.push_str(DIR_INDEX_SUF);
+        }
+        let full = join_path(&self.resolve_path(&p), &l);
+        self.store.get(&full).unwrap_or_default()
+    }
+
     fn set(&mut self, pairs: &[KVPair]) -> Result<(), String> {
         let mut children: Vec<(String, String)> = Vec::new();
 
@@ -315,7 +324,8 @@ impl<S: KVStore> KVSpace for Backend<S> {
             if Self::is_dir(&resolved) {
                 let (parent, name) = Self::parent_name(&resolved);
                 mk_index_recursive(self, &parent);
-                self.store.set(&resolved, &p.val.encode());
+                let bytes = p.raw.clone().unwrap_or_else(|| p.val.encode());
+                self.store.set(&resolved, &bytes);
                 children.push((parent, format!("{}{}", name, Self::suffix_for(&resolved))));
                 continue;
             }
@@ -350,7 +360,8 @@ impl<S: KVStore> KVSpace for Backend<S> {
                 }
             }
 
-            self.store.set(&resolved, &p.val.encode());
+            let bytes = p.raw.clone().unwrap_or_else(|| p.val.encode());
+            self.store.set(&resolved, &bytes);
             children.push((parent, name));
         }
 
@@ -485,7 +496,13 @@ impl<S: KVStore> KVSpace for Backend<S> {
         }
 
         let resolved = self.resolve_path(prefix);
-        let keys = self.store.scan_keys(&resolved);
+        // scan 用去尾斜杠/点的前缀：scan_keys 匹配 k[prefix.len()] ∈ {'/','.'}，
+        // 尾斜杠会使子节点首字符（如 f）落空，导致子树孩子扫不到。
+        let mut scan = resolved.clone();
+        if Self::is_dir(&scan) && scan != PATH_SEP {
+            scan.pop();
+        }
+        let keys = self.store.scan_keys(&scan);
 
         self.store.del(&[&resolved]);
         for k in &keys {
