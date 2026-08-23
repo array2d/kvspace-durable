@@ -374,13 +374,17 @@ impl<S: KVStore> KVSpace for Backend<S> {
             let mut nodes: Vec<String> = Vec::new();
             let mut ext_path = String::new();
             let mut is_ext = false;
+            let mut is_map = false;
             let mut is_dict = parent.ends_with(OBJ_SEP);
 
             if let Some(data) = self.store.get(&parent) {
                 let v = decode_xvalue(&data);
                 match v {
                     XValue::Index(c) => nodes = normalize_children(c),
-                    XValue::Map(c) => nodes = normalize_children(c),
+                    XValue::Map(c) => {
+                        nodes = normalize_children(c);
+                        is_map = true;
+                    }
                     XValue::Obj(c) => {
                         nodes = normalize_children(c);
                         is_dict = true;
@@ -407,6 +411,8 @@ impl<S: KVStore> KVSpace for Backend<S> {
 
             let v = if is_ext {
                 new_ext_index(&nodes, &ext_path)
+            } else if is_map {
+                new_map_index(&nodes)
             } else if is_dict {
                 new_obj_index(&nodes)
             } else {
