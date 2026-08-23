@@ -11,16 +11,27 @@ pub struct RedisStore {
 }
 
 pub fn connect(addr: &str) -> RedisStore {
-    let addr = if addr.is_empty() { "127.0.0.1:6379" } else { addr };
+    let addr = if addr.is_empty() {
+        "127.0.0.1:6379"
+    } else {
+        addr
+    };
     RedisStore::new(addr)
 }
 
 impl RedisStore {
     pub fn new(addr: &str) -> Self {
-        let stream = TcpStream::connect(addr).unwrap_or_else(|e| panic!("kvspace-redis: connect {}: {}", addr, e));
-        stream.set_read_timeout(Some(std::time::Duration::from_secs(3))).ok();
-        stream.set_write_timeout(Some(std::time::Duration::from_secs(3))).ok();
-        RedisStore { stream: RefCell::new(stream) }
+        let stream = TcpStream::connect(addr)
+            .unwrap_or_else(|e| panic!("kvspace-redis: connect {}: {}", addr, e));
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+            .ok();
+        stream
+            .set_write_timeout(Some(std::time::Duration::from_secs(3)))
+            .ok();
+        RedisStore {
+            stream: RefCell::new(stream),
+        }
     }
 
     fn cmd(&self, args: &[&[u8]]) -> Resp {
@@ -32,7 +43,8 @@ impl RedisStore {
                 out.extend_from_slice(a);
                 out.extend_from_slice(b"\r\n");
             }
-            s.write_all(&out).unwrap_or_else(|e| panic!("kvspace-redis: write: {}", e));
+            s.write_all(&out)
+                .unwrap_or_else(|e| panic!("kvspace-redis: write: {}", e));
         }
         self.read_resp()
     }
@@ -43,7 +55,8 @@ impl RedisStore {
         let mut prev = 0u8;
         loop {
             let mut b = [0u8; 1];
-            s.read_exact(&mut b).unwrap_or_else(|e| panic!("kvspace-redis: read: {}", e));
+            s.read_exact(&mut b)
+                .unwrap_or_else(|e| panic!("kvspace-redis: read: {}", e));
             line.push(b[0]);
             if prev == b'\r' && b[0] == b'\n' {
                 line.truncate(line.len() - 2);
@@ -69,9 +82,11 @@ impl RedisStore {
                 }
                 let mut s = self.stream.borrow_mut();
                 let mut data = vec![0u8; len as usize];
-                s.read_exact(&mut data).unwrap_or_else(|e| panic!("kvspace-redis: read bulk: {}", e));
+                s.read_exact(&mut data)
+                    .unwrap_or_else(|e| panic!("kvspace-redis: read bulk: {}", e));
                 let mut crlf = [0u8; 2];
-                s.read_exact(&mut crlf).unwrap_or_else(|e| panic!("kvspace-redis: read crlf: {}", e));
+                s.read_exact(&mut crlf)
+                    .unwrap_or_else(|e| panic!("kvspace-redis: read crlf: {}", e));
                 Resp::Bulk(Some(data))
             }
             b'*' => {
@@ -157,10 +172,12 @@ impl KVStore for RedisStore {
                         for it in items {
                             if let Resp::Bulk(Some(b)) = it {
                                 let k = String::from_utf8_lossy(b).into_owned();
-                                if k == prefix || (k.len() > prefix.len() && k.starts_with(prefix) && {
-                                    let c = k.as_bytes()[prefix.len()];
-                                    c == b'/' || c == b'.'
-                                }) {
+                                if k == prefix
+                                    || (k.len() > prefix.len() && k.starts_with(prefix) && {
+                                        let c = k.as_bytes()[prefix.len()];
+                                        c == b'/' || c == b'.'
+                                    })
+                                {
                                     keys.push(k);
                                 }
                             }

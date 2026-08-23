@@ -16,11 +16,9 @@ use std::os::raw::{c_char, c_int};
 use std::time::Duration;
 
 use crate::conn::conn;
-use crate::kvspace::{KVSpace, KVPair};
+use crate::kvspace::{KVPair, KVSpace};
 use crate::kvspace_common::get_one;
-use crate::xvalue::{
-    decode_xvalue, decode_xvalue_head, encode_head, encode_head_perm, new_ptr,
-};
+use crate::xvalue::{decode_xvalue, decode_xvalue_head, encode_head, encode_head_perm, new_ptr};
 use crate::xvalue_bool::new_bool;
 use crate::xvalue_byte::{new_char, new_char_byte};
 use crate::xvalue_float::new_float64;
@@ -66,69 +64,27 @@ fn write_err(err: *mut c_char, err_cap: u32, msg: &str) {
     }
 }
 
-/// XValueHead 解码结果（repr(C)，供跨边界读取头元数据）。
+/// XValueHead 解码结果（repr(C)，供跨边界读取头元数据）。kindexpr 为唯一类型真相。
 #[repr(C)]
 pub struct kvspaceHead_t {
-    pub kind: [u8; 32], // NUL 终止的 kind 字符串
-    pub is_ptr: u8,     // ref==1
-    pub array_len: i32, // 派生数组长度
-    pub body_len: i32,  // body 字节数
-    pub body_offset: i32, // body 在 data 内的起始偏移（= head_len）
-    pub ndim: i32,      // 0=标量，N=N 维数组（唯一「是否数组」标志）
-    pub dims: [i32; 8], // 各维长度（kind+ndim+dims 即完整 kindexp）
+    pub kindexpr: [u8; 256], // NUL 终止（含 */@ 前缀与 [dims]，去 padding）
+    pub ro: u8,              // 1=只读，0=可写
+    pub vid: u32,            // vthread id
+    pub body_len: i32,       // body 字节数
+    pub body_offset: i32,    // body 在 data 内的起始偏移（= head_len）
 }
 
 fn fill_head(head: &crate::xvalue::XValueHead, out: *mut kvspaceHead_t) {
     unsafe {
         let mut o = &mut *out;
-        let k = head.kind.as_bytes();
-        let n = k.len().min(31);
-        o.kind[..n].copy_from_slice(&k[..n]);
-        o.kind[n] = 0;
-        o.is_ptr = head.is_ptr as u8;
-        o.array_len = head.array_len;
-        o.body_len = head.body_len;
-        o.body_offset = head.head_len();
-        o.ndim = head.ndim;
-        for (i, d) in head.dims.iter().take(8).enumerate() {
-            o.dims[i] = *d;
-        }
-    }
-}
-
-/// kvspaceHeadV_t — 带权限字段（ref/ro/vid）的扩展 head，供 kvspaceDecodeHeadV 返回。
-#[repr(C)]
-pub struct kvspaceHeadV_t {
-    pub kind: [u8; 32],
-    pub is_ptr: u8,   // 兼容：ref==1
-    pub ref_: u8,     // 原始 ref：0=内联 1=软链接 2=@扩展句柄
-    pub ro: u8,       // 1=只读，0=可写
-    pub array_len: i32,
-    pub body_len: i32,
-    pub body_offset: i32,
-    pub ndim: i32,
-    pub dims: [i32; 8],
-    pub vid: u32,     // vthread id
-}
-
-fn fill_head_v(head: &crate::xvalue::XValueHead, out: *mut kvspaceHeadV_t) {
-    unsafe {
-        let mut o = &mut *out;
-        let k = head.kind.as_bytes();
-        let n = k.len().min(31);
-        o.kind[..n].copy_from_slice(&k[..n]);
-        o.kind[n] = 0;
-        o.is_ptr = head.is_ptr as u8;
-        o.ref_ = head.r#ref as u8;
+        let k = head.kindexpr.as_bytes();
+        let n = k.len().min(255);
+        o.kindexpr[..n].copy_from_slice(&k[..n]);
+        o.kindexpr[n] = 0;
         o.ro = head.ro as u8;
-        o.array_len = head.array_len;
+        o.vid = head.vid;
         o.body_len = head.body_len;
         o.body_offset = head.head_len();
-        o.ndim = head.ndim;
-        for (i, d) in head.dims.iter().take(8).enumerate() {
-            o.dims[i] = *d;
-        }
-        o.vid = head.vid;
     }
 }
 
@@ -178,7 +134,11 @@ pub extern "C" fn kvspaceSet(
         let len = unsafe { *lens.add(i) } as usize;
         let bytes = unsafe { std::slice::from_raw_parts(vals.add(off), len) };
         off += len;
-        pairs.push(KVPair { key, val: decode_xvalue(bytes), raw: Some(bytes.to_vec()) });
+        pairs.push(KVPair {
+            key,
+            val: decode_xvalue(bytes),
+            raw: Some(bytes.to_vec()),
+        });
     }
     match kv.set(&pairs) {
         Ok(()) => 0,
@@ -370,9 +330,8 @@ pub extern "C" fn kvspaceWatch(
         return 1;
     }
     let kv: &mut dyn KVSpace = unsafe { &mut **h };
-    let target_v = decode_xvalue(unsafe {
-        std::slice::from_raw_parts(target, target_len as usize)
-    });
+    let target_v =
+        decode_xvalue(unsafe { std::slice::from_raw_parts(target, target_len as usize) });
     let v = kv.watch(
         unsafe { cstr(key) },
         &target_v,
@@ -427,7 +386,11 @@ pub extern "C" fn kvspaceTlvEncode(
 ) -> c_int {
     let raw = unsafe { std::slice::from_raw_parts(raw, raw_len as usize) };
     let dims = ffi_dims(dims, ndim);
-    alloc(encode_head(unsafe { cstr(kind) }, 0, dims, raw), out, out_len)
+    alloc(
+        encode_head(unsafe { cstr(kind) }, 0, dims, raw),
+        out,
+        out_len,
+    )
 }
 
 /// 通用 TLV 编码（软链接，ref=1），body 为目标 key 路径。
@@ -443,7 +406,11 @@ pub extern "C" fn kvspaceTlvEncodePtr(
 ) -> c_int {
     let raw = unsafe { std::slice::from_raw_parts(raw, raw_len as usize) };
     let dims = ffi_dims(dims, ndim);
-    alloc(encode_head(unsafe { cstr(kind) }, 1, dims, raw), out, out_len)
+    alloc(
+        encode_head(unsafe { cstr(kind) }, 1, dims, raw),
+        out,
+        out_len,
+    )
 }
 
 /// 带权限编码：显式指定 ref（0/1/2）、ro（1=只读）、vid。用于权限位落盘。
@@ -462,7 +429,11 @@ pub extern "C" fn kvspaceTlvEncodeMode(
 ) -> c_int {
     let raw = unsafe { std::slice::from_raw_parts(raw, raw_len as usize) };
     let dims = ffi_dims(dims, ndim);
-    alloc(encode_head_perm(unsafe { cstr(kind) }, r#ref, dims, raw, ro != 0, vid), out, out_len)
+    alloc(
+        encode_head_perm(unsafe { cstr(kind) }, r#ref, dims, raw, ro != 0, vid),
+        out,
+        out_len,
+    )
 }
 
 #[inline]
@@ -474,7 +445,7 @@ fn ffi_dims<'a>(dims: *const i32, ndim: i32) -> &'a [i32] {
     }
 }
 
-/// 解码 XValueHead（不解析 body）。返回 kind/is_ptr/array_len/body_len/body_offset。
+/// 解码 XValueHead（不解析 body）。返回 kindexpr/ro/vid/body_len/body_offset。
 #[no_mangle]
 pub extern "C" fn kvspaceDecodeHead(
     data: *const u8,
@@ -484,27 +455,8 @@ pub extern "C" fn kvspaceDecodeHead(
     if data.is_null() || out.is_null() {
         return 1;
     }
-    let head = decode_xvalue_head(unsafe {
-        std::slice::from_raw_parts(data, data_len as usize)
-    });
+    let head = decode_xvalue_head(unsafe { std::slice::from_raw_parts(data, data_len as usize) });
     fill_head(&head, out);
-    0
-}
-
-/// 解码带权限 head（含 ro/vid）。
-#[no_mangle]
-pub extern "C" fn kvspaceDecodeHeadV(
-    data: *const u8,
-    data_len: u32,
-    out: *mut kvspaceHeadV_t,
-) -> c_int {
-    if data.is_null() || out.is_null() {
-        return 1;
-    }
-    let head = decode_xvalue_head(unsafe {
-        std::slice::from_raw_parts(data, data_len as usize)
-    });
-    fill_head_v(&head, out);
     0
 }
 
@@ -545,31 +497,19 @@ pub extern "C" fn kvspaceNewCharByte(
 }
 
 #[no_mangle]
-pub extern "C" fn kvspaceNewBool(
-    v: u8,
-    out: *mut *mut u8,
-    out_len: *mut u32,
-) -> c_int {
+pub extern "C" fn kvspaceNewBool(v: u8, out: *mut *mut u8, out_len: *mut u32) -> c_int {
     let x = new_bool(&[v != 0]);
     alloc(x.encode(), out, out_len)
 }
 
 #[no_mangle]
-pub extern "C" fn kvspaceNewInt64(
-    v: i64,
-    out: *mut *mut u8,
-    out_len: *mut u32,
-) -> c_int {
+pub extern "C" fn kvspaceNewInt64(v: i64, out: *mut *mut u8, out_len: *mut u32) -> c_int {
     let x = new_int64(&[v]);
     alloc(x.encode(), out, out_len)
 }
 
 #[no_mangle]
-pub extern "C" fn kvspaceNewFloat64(
-    v: f64,
-    out: *mut *mut u8,
-    out_len: *mut u32,
-) -> c_int {
+pub extern "C" fn kvspaceNewFloat64(v: f64, out: *mut *mut u8, out_len: *mut u32) -> c_int {
     let x = new_float64(&[v]);
     alloc(x.encode(), out, out_len)
 }

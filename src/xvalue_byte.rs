@@ -9,35 +9,65 @@ fn char_dims(n: usize) -> Vec<i32> {
 }
 
 pub fn new_char_byte(v: &[u8]) -> XValue {
-    XValue::CharByte(Arr { data: v.to_vec(), dims: char_dims(v.len()) })
+    XValue::CharByte(Arr {
+        data: v.to_vec(),
+        dims: char_dims(v.len()),
+    })
 }
 pub fn new_char_ascii(v: &[u8]) -> XValue {
-    XValue::CharAscii(Arr { data: v.to_vec(), dims: char_dims(v.len()) })
+    XValue::CharAscii(Arr {
+        data: v.to_vec(),
+        dims: char_dims(v.len()),
+    })
 }
 pub fn new_char32(v: &[u32]) -> XValue {
-    XValue::Char32(Arr { data: v.to_vec(), dims: char_dims(v.len()) })
+    XValue::Char32(Arr {
+        data: v.to_vec(),
+        dims: char_dims(v.len()),
+    })
 }
 
 /// NewChar 根据 kind 从字符串构造字符值（char/utf32 默认，char/utf8/ascii 为字节）。
 pub fn new_char(kind: &str, s: &str) -> XValue {
     match kind {
-        KIND_CHAR_UTF8 => XValue::CharByte(Arr { data: s.as_bytes().to_vec(), dims: char_dims(s.len()) }),
-        KIND_CHAR_ASCII => XValue::CharAscii(Arr { data: s.as_bytes().to_vec(), dims: char_dims(s.len()) }),
+        KIND_CHAR_UTF8 => XValue::CharByte(Arr {
+            data: s.as_bytes().to_vec(),
+            dims: char_dims(s.len()),
+        }),
+        KIND_CHAR_ASCII => XValue::CharAscii(Arr {
+            data: s.as_bytes().to_vec(),
+            dims: char_dims(s.len()),
+        }),
         _ => {
             let v: Vec<u32> = s.chars().map(|c| c as u32).collect();
-            XValue::Char32(Arr { data: v.clone(), dims: char_dims(v.len()) })
+            XValue::Char32(Arr {
+                data: v.clone(),
+                dims: char_dims(v.len()),
+            })
         }
     }
 }
 
 pub fn decode_char_byte(body: &[u8], dims: &[i32]) -> Arr<u8> {
-    Arr { data: body.to_vec(), dims: dims.to_vec() }
+    Arr {
+        data: body.to_vec(),
+        dims: dims.to_vec(),
+    }
 }
 pub fn decode_char_ascii(body: &[u8], dims: &[i32]) -> Arr<u8> {
-    Arr { data: body.to_vec(), dims: dims.to_vec() }
+    Arr {
+        data: body.to_vec(),
+        dims: dims.to_vec(),
+    }
 }
 pub fn decode_char32(body: &[u8], dims: &[i32]) -> Arr<u32> {
-    Arr { data: body.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(), dims: dims.to_vec() }
+    Arr {
+        data: body
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+        dims: dims.to_vec(),
+    }
 }
 
 pub fn encode_char_byte(data: &[u8], dims: &[i32]) -> Vec<u8> {

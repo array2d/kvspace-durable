@@ -6,11 +6,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::kvspace::{KVSpace, KVPair};
+use crate::kvspace::{KVPair, KVSpace};
 use crate::kvspace_common::{join_path, sep_path, split_index, validate_ptr, watch_value, SepKind};
 use crate::r#const::*;
 use crate::xvalue::*;
-use crate::xvalue_index::{new_map_index, new_obj_index, new_ext_index, new_index};
+use crate::xvalue_index::{new_ext_index, new_index, new_map_index, new_obj_index};
 
 const EXTINDEX_MARKER: &str = "__extindex__";
 const SELF_MARKER: &str = "__self__";
@@ -21,14 +21,21 @@ pub struct FsKVSpace {
 }
 
 pub fn connect(root: &str) -> FsKVSpace {
-    let root = if root.is_empty() { "/tmp/kvspace-fs" } else { root };
+    let root = if root.is_empty() {
+        "/tmp/kvspace-fs"
+    } else {
+        root
+    };
     FsKVSpace::new(root)
 }
 
 impl FsKVSpace {
     pub fn new(root: &str) -> Self {
-        fs::create_dir_all(root).unwrap_or_else(|e| panic!("kvspace-fs: create root {}: {}", root, e));
-        FsKVSpace { root: PathBuf::from(root) }
+        fs::create_dir_all(root)
+            .unwrap_or_else(|e| panic!("kvspace-fs: create root {}: {}", root, e));
+        FsKVSpace {
+            root: PathBuf::from(root),
+        }
     }
 
     /// kvspace key → fs 路径：'.'（成员分隔）→ './'；段首 '.'（如 .todo<vid>）是字面量不替换。
@@ -171,7 +178,11 @@ impl FsKVSpace {
     }
 
     fn remove_order(&self, dir_key: &str, child: &str) {
-        let order: Vec<String> = self.read_order(dir_key).into_iter().filter(|c| c != child).collect();
+        let order: Vec<String> = self
+            .read_order(dir_key)
+            .into_iter()
+            .filter(|c| c != child)
+            .collect();
         self.write_order(dir_key, &order);
     }
 
@@ -190,7 +201,11 @@ impl FsKVSpace {
 
     fn resolve_parent(&self, path: &str) -> String {
         let dir_suf = Self::is_dir_key(path) && path != PATH_SEP;
-        let clean = if dir_suf { &path[..path.len() - 1] } else { path };
+        let clean = if dir_suf {
+            &path[..path.len() - 1]
+        } else {
+            path
+        };
         let (parent, last) = sep_path(clean);
         if parent == clean {
             return path.to_string();
@@ -208,7 +223,11 @@ impl FsKVSpace {
             return (path.to_string(), false);
         }
         let trimmed = path.trim_matches('/');
-        let parts: Vec<&str> = if trimmed.is_empty() { Vec::new() } else { trimmed.split('/').collect() };
+        let parts: Vec<&str> = if trimmed.is_empty() {
+            Vec::new()
+        } else {
+            trimmed.split('/').collect()
+        };
         let mut cur = PATH_SEP.to_string();
         for (i, p) in parts.iter().enumerate() {
             cur = join_path(&cur, p);
@@ -229,7 +248,7 @@ impl FsKVSpace {
     fn prefix_ext(&self, prefix: &str) -> String {
         if let Some(data) = self.read_leaf(prefix) {
             let head = decode_xvalue_head(&data);
-            if head.kind == KIND_EXT_INDEX {
+            if head.kind() == KIND_EXT_INDEX {
                 let body = head.body(&data);
                 return crate::xvalue_index::decode_ext_index(body).ext_path;
             }
@@ -250,7 +269,11 @@ impl FsKVSpace {
         }
         let p = self.fs_path(dir_key);
         // 目录名（末段）是否以 '.' 结尾：成员前缀目录（"math."）内的成员不再扁平化。
-        let name = dir_key.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+        let name = dir_key
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or("");
         let is_member_dir = name.ends_with(OBJ_SEP);
         let mut children = Vec::new();
         if let Ok(entries) = fs::read_dir(&p) {
@@ -313,7 +336,11 @@ impl KVSpace for FsKVSpace {
         if prefix != PATH_SEP && !Self::is_dir_key(prefix) {
             panic!("{}: {}", ERR_DIR_MUST_END_WITH_SLASH, prefix);
         }
-        let prefix = if resolve { self.resolve_path(prefix) } else { prefix.to_string() };
+        let prefix = if resolve {
+            self.resolve_path(prefix)
+        } else {
+            prefix.to_string()
+        };
         let ext_t = self.prefix_ext(&prefix);
 
         keys.iter()
@@ -359,7 +386,10 @@ impl KVSpace for FsKVSpace {
             match &p.val {
                 XValue::Index(_) | XValue::ExtIndex(_) => {
                     if !Self::is_dir_key(&resolved) {
-                        panic!("Set: directory-kind value at non-directory key {:?}", resolved);
+                        panic!(
+                            "Set: directory-kind value at non-directory key {:?}",
+                            resolved
+                        );
                     }
                 }
                 _ => {}
@@ -406,7 +436,11 @@ impl KVSpace for FsKVSpace {
         if prefix != PATH_SEP && !Self::is_dir_key(prefix) {
             panic!("{}: {}", ERR_DIR_MUST_END_WITH_SLASH, prefix);
         }
-        let resolved = if resolve { self.resolve_path(prefix) } else { prefix.to_string() };
+        let resolved = if resolve {
+            self.resolve_path(prefix)
+        } else {
+            prefix.to_string()
+        };
         if !Self::is_dir_key(&resolved) {
             return Vec::new();
         }
@@ -455,7 +489,7 @@ impl KVSpace for FsKVSpace {
             &resolved
         };
         if let Some(data) = self.read_leaf(link_key) {
-            if decode_xvalue_head(&data).is_ptr {
+            if decode_xvalue_head(&data).is_ptr() {
                 return self.del(&[resolved]);
             }
         }
@@ -480,7 +514,10 @@ impl KVSpace for FsKVSpace {
 
     fn ext_index(&mut self, path: &str, ext_path: &str) -> Result<(), String> {
         if !Self::is_dir_key(path) || !Self::is_dir_key(ext_path) {
-            return Err(format!("{}: ExtIndex path={} extpath={}", ERR_DIR_MUST_END_WITH_SLASH, path, ext_path));
+            return Err(format!(
+                "{}: ExtIndex path={} extpath={}",
+                ERR_DIR_MUST_END_WITH_SLASH, path, ext_path
+            ));
         }
         let resolved = self.resolve_parent(path);
         // 级联检查：ext_path 本身是 extindex → 不容许（对齐 backend.rs）

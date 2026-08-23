@@ -4,29 +4,62 @@ use crate::r#const::*;
 use crate::xvalue::{dims_from_len, encode_head, Arr, XValue};
 
 pub fn new_uint8(v: &[u8]) -> XValue {
-    XValue::Uint8(Arr { data: v.to_vec(), dims: dims_from_len(v.len()) })
+    XValue::Uint8(Arr {
+        data: v.to_vec(),
+        dims: dims_from_len(v.len()),
+    })
 }
 pub fn new_uint16(v: &[u16]) -> XValue {
-    XValue::Uint16(Arr { data: v.to_vec(), dims: dims_from_len(v.len()) })
+    XValue::Uint16(Arr {
+        data: v.to_vec(),
+        dims: dims_from_len(v.len()),
+    })
 }
 pub fn new_uint32(v: &[u32]) -> XValue {
-    XValue::Uint32(Arr { data: v.to_vec(), dims: dims_from_len(v.len()) })
+    XValue::Uint32(Arr {
+        data: v.to_vec(),
+        dims: dims_from_len(v.len()),
+    })
 }
 pub fn new_uint64(v: &[u64]) -> XValue {
-    XValue::Uint64(Arr { data: v.to_vec(), dims: dims_from_len(v.len()) })
+    XValue::Uint64(Arr {
+        data: v.to_vec(),
+        dims: dims_from_len(v.len()),
+    })
 }
 
 pub fn decode_uint8(body: &[u8], dims: &[i32]) -> Arr<u8> {
-    Arr { data: body.to_vec(), dims: dims.to_vec() }
+    Arr {
+        data: body.to_vec(),
+        dims: dims.to_vec(),
+    }
 }
 pub fn decode_uint16(body: &[u8], dims: &[i32]) -> Arr<u16> {
-    Arr { data: body.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect(), dims: dims.to_vec() }
+    Arr {
+        data: body
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect(),
+        dims: dims.to_vec(),
+    }
 }
 pub fn decode_uint32(body: &[u8], dims: &[i32]) -> Arr<u32> {
-    Arr { data: body.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(), dims: dims.to_vec() }
+    Arr {
+        data: body
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+        dims: dims.to_vec(),
+    }
 }
 pub fn decode_uint64(body: &[u8], dims: &[i32]) -> Arr<u64> {
-    Arr { data: body.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect(), dims: dims.to_vec() }
+    Arr {
+        data: body
+            .chunks_exact(8)
+            .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+            .collect(),
+        dims: dims.to_vec(),
+    }
 }
 
 pub fn encode_uint8(data: &[u8], dims: &[i32]) -> Vec<u8> {

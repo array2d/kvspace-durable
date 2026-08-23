@@ -4,11 +4,17 @@ use crate::r#const::*;
 use crate::xvalue::{dims_from_len, encode_head, Arr, XValue};
 
 pub fn new_bool(v: &[bool]) -> XValue {
-    XValue::Bool(Arr { data: v.to_vec(), dims: dims_from_len(v.len()) })
+    XValue::Bool(Arr {
+        data: v.to_vec(),
+        dims: dims_from_len(v.len()),
+    })
 }
 
 pub fn decode_bool(body: &[u8], dims: &[i32]) -> Arr<bool> {
-    Arr { data: body.iter().map(|&b| b != 0).collect(), dims: dims.to_vec() }
+    Arr {
+        data: body.iter().map(|&b| b != 0).collect(),
+        dims: dims.to_vec(),
+    }
 }
 
 pub fn encode_bool(data: &[bool], dims: &[i32]) -> Vec<u8> {

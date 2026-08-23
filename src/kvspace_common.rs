@@ -2,8 +2,8 @@
 
 use std::time::Duration;
 
+use crate::kvspace::{KVPair, KVSpace};
 use crate::r#const::*;
-use crate::kvspace::{KVSpace, KVPair};
 use crate::xvalue::{body_bytes, is_none, plain, XValue};
 use crate::xvalue_index::new_index;
 
@@ -49,7 +49,11 @@ pub fn split_index(path: &str) -> (String, String, SepKind) {
         if i > 0 {
             let m = &last[i + 1..];
             if !m.is_empty() {
-                return (format!("{}{}", parent, &last[..i + 1]), m.to_string(), SepKind::SepDict);
+                return (
+                    format!("{}{}", parent, &last[..i + 1]),
+                    m.to_string(),
+                    SepKind::SepDict,
+                );
             }
         }
     }
@@ -81,7 +85,11 @@ pub fn mk_index_recursive(kv: &mut dyn KVSpace, path: &str) {
                     p.push_str(DIR_INDEX_SUF);
                 }
                 if !dir_exists(kv, &p, &n) {
-                    let _ = kv.set(&[KVPair { key: dir.to_string(), val: new_index(&[]), raw: None }]);
+                    let _ = kv.set(&[KVPair {
+                        key: dir.to_string(),
+                        val: new_index(&[]),
+                        raw: None,
+                    }]);
                 }
             }
         }
@@ -98,7 +106,12 @@ pub fn dir_exists(kv: &mut dyn KVSpace, parent_dir: &str, name: &str) -> bool {
 }
 
 /// ValidatePtr 检查 Ptr 的 kind/arraylen 与目标值的匹配。
-pub fn validate_ptr(kv: &mut dyn KVSpace, target: &str, ptr_kind: &str, ptr_array_len: i32) -> Result<(), String> {
+pub fn validate_ptr(
+    kv: &mut dyn KVSpace,
+    target: &str,
+    ptr_kind: &str,
+    ptr_array_len: i32,
+) -> Result<(), String> {
     let v = get_one(kv, target);
     if is_none(&v) {
         return Ok(());
@@ -106,13 +119,19 @@ pub fn validate_ptr(kv: &mut dyn KVSpace, target: &str, ptr_kind: &str, ptr_arra
     if !ptr_kind.is_empty() && v.kind() != ptr_kind {
         return Err(format!(
             "{}: ptr kind mismatch: target {} is {}, ptr expects {}",
-            ERR_LINK_TYPE_MISMATCH, target, v.kind(), ptr_kind
+            ERR_LINK_TYPE_MISMATCH,
+            target,
+            v.kind(),
+            ptr_kind
         ));
     }
     if ptr_array_len > 0 && v.array_len() != ptr_array_len {
         return Err(format!(
             "{}: ptr arraylen mismatch: target {} has {}, ptr expects {}",
-            ERR_INVALID_VALUE, target, v.array_len(), ptr_array_len
+            ERR_INVALID_VALUE,
+            target,
+            v.array_len(),
+            ptr_array_len
         ));
     }
     Ok(())
@@ -128,7 +147,12 @@ pub fn get_one(kv: &mut dyn KVSpace, key: &str) -> XValue {
 }
 
 /// WatchValue 通用指数回退等待：轮询 GetOne(key) 直到 == targetValue。
-pub fn watch_value(kv: &mut dyn KVSpace, key: &str, target_value: &XValue, tick_duration: Duration) -> XValue {
+pub fn watch_value(
+    kv: &mut dyn KVSpace,
+    key: &str,
+    target_value: &XValue,
+    tick_duration: Duration,
+) -> XValue {
     const SPIN_COUNT: i64 = 100;
     let mut cur = Duration::ZERO;
     let mut i: i64 = 0;
@@ -170,7 +194,11 @@ pub fn read_prefix_ext(kv: &mut dyn KVSpace, prefix: &str) -> String {
     String::new()
 }
 
-pub fn strip_ext_children(kv: &mut dyn KVSpace, prefix: &str, children: Vec<String>) -> Vec<String> {
+pub fn strip_ext_children(
+    kv: &mut dyn KVSpace,
+    prefix: &str,
+    children: Vec<String>,
+) -> Vec<String> {
     let ext_target = read_prefix_ext(kv, prefix);
     if ext_target.is_empty() {
         return children;
@@ -216,7 +244,13 @@ pub fn fprint_list(kv: &mut dyn KVSpace, prefix: &str, show_ext: bool, show_kind
     }
 }
 
-pub fn fprint_tree(kv: &mut dyn KVSpace, prefix: &str, indent: &str, show_ext: bool, show_kind: bool) {
+pub fn fprint_tree(
+    kv: &mut dyn KVSpace,
+    prefix: &str,
+    indent: &str,
+    show_ext: bool,
+    show_kind: bool,
+) {
     let mut children = kv.list(prefix, true, true);
     if !show_ext {
         children = strip_ext_children(kv, prefix, children);

@@ -3,14 +3,15 @@
 
 use std::time::Duration;
 
-use crate::r#const::*;
-use crate::kvspace::{KVSpace, KVPair};
+use crate::kvspace::{KVPair, KVSpace};
 use crate::kvspace_common::{
-    dir_exists, get_one, join_path, mk_index_recursive, sep_path, split_index, validate_ptr, watch_value,
+    dir_exists, get_one, join_path, mk_index_recursive, sep_path, split_index, validate_ptr,
+    watch_value,
 };
+use crate::r#const::*;
 use crate::store::KVStore;
 use crate::xvalue::{decode_xvalue, decode_xvalue_head, is_none, is_ptr, ptr_target, XValue};
-use crate::xvalue_index::{new_map_index, new_obj_index, new_ext_index, new_index};
+use crate::xvalue_index::{new_ext_index, new_index, new_map_index, new_obj_index};
 
 pub struct Backend<S: KVStore> {
     store: S,
@@ -72,7 +73,11 @@ impl<S: KVStore> Backend<S> {
 
     fn resolve_parent(&self, path: &str) -> String {
         let dir_suf = Self::is_dir(path) && path != PATH_SEP;
-        let clean = if dir_suf { &path[..path.len() - 1] } else { path };
+        let clean = if dir_suf {
+            &path[..path.len() - 1]
+        } else {
+            path
+        };
         let (parent, last) = sep_path(clean);
         if parent == clean {
             return path.to_string();
@@ -191,7 +196,9 @@ impl<S: KVStore> Backend<S> {
 
     fn remove_child(&self, parent: &str, names: &[String]) {
         let is_removed = |n: &str| {
-            names.iter().any(|name| n == name || n == format!("{}{}", name, DIR_INDEX_SUF))
+            names
+                .iter()
+                .any(|name| n == name || n == format!("{}{}", name, DIR_INDEX_SUF))
         };
         match self.store.get(parent) {
             None => {}
@@ -200,24 +207,28 @@ impl<S: KVStore> Backend<S> {
                 match v {
                     XValue::Index(nodes) => {
                         let nodes = normalize_children(nodes);
-                        let filtered: Vec<String> = nodes.into_iter().filter(|n| !is_removed(n)).collect();
+                        let filtered: Vec<String> =
+                            nodes.into_iter().filter(|n| !is_removed(n)).collect();
                         let v = new_index(&filtered);
                         self.store.set(parent, &v.encode());
                     }
                     XValue::Obj(nodes) => {
                         let nodes = normalize_children(nodes);
-                        let filtered: Vec<String> = nodes.into_iter().filter(|n| !is_removed(n)).collect();
+                        let filtered: Vec<String> =
+                            nodes.into_iter().filter(|n| !is_removed(n)).collect();
                         let v = new_obj_index(&filtered);
                         self.store.set(parent, &v.encode());
                     }
                     XValue::Map(nodes) => {
                         let nodes = normalize_children(nodes);
-                        let filtered: Vec<String> = nodes.into_iter().filter(|n| !is_removed(n)).collect();
+                        let filtered: Vec<String> =
+                            nodes.into_iter().filter(|n| !is_removed(n)).collect();
                         let v = new_map_index(&filtered);
                         self.store.set(parent, &v.encode());
                     }
                     XValue::ExtIndex(e) => {
-                        let filtered: Vec<String> = e.childs.into_iter().filter(|n| !is_removed(n)).collect();
+                        let filtered: Vec<String> =
+                            e.childs.into_iter().filter(|n| !is_removed(n)).collect();
                         let v = new_ext_index(&filtered, &e.ext_path);
                         self.store.set(parent, &v.encode());
                     }
@@ -239,7 +250,7 @@ impl<S: KVStore> Backend<S> {
     fn prefix_ext(&self, prefix: &str) -> String {
         if let Some(data) = self.store.get(prefix) {
             let head = decode_xvalue_head(&data);
-            if head.kind == KIND_EXT_INDEX {
+            if head.kind() == KIND_EXT_INDEX {
                 let body = head.body(&data);
                 return crate::xvalue_index::decode_ext_index(body).ext_path;
             }
@@ -259,7 +270,11 @@ fn normalize_children(children: Vec<String>) -> Vec<String> {
 impl<S: KVStore> KVSpace for Backend<S> {
     fn get(&mut self, prefix: &str, keys: &[String], resolve: bool) -> Vec<XValue> {
         Self::assert_dir(prefix);
-        let prefix = if resolve { self.resolve_path(prefix) } else { prefix.to_string() };
+        let prefix = if resolve {
+            self.resolve_path(prefix)
+        } else {
+            prefix.to_string()
+        };
         let ext_t = self.prefix_ext(&prefix);
 
         let mut results: Vec<Option<XValue>> = vec![None; keys.len()];
@@ -286,10 +301,17 @@ impl<S: KVStore> KVSpace for Backend<S> {
             let ext_refs: Vec<&str> = ext_keys.iter().map(|(_, t)| t.as_str()).collect();
             let ext_vals = self.store.get_many(&ext_refs);
             for (idx, (i, _)) in ext_keys.iter().enumerate() {
-                results[*i] = Some(if let Some(data) = &ext_vals[idx] { decode_xvalue(data) } else { XValue::None });
+                results[*i] = Some(if let Some(data) = &ext_vals[idx] {
+                    decode_xvalue(data)
+                } else {
+                    XValue::None
+                });
             }
         }
-        results.into_iter().map(|r| r.unwrap_or(XValue::None)).collect()
+        results
+            .into_iter()
+            .map(|r| r.unwrap_or(XValue::None))
+            .collect()
     }
 
     fn get_raw(&mut self, key: &str) -> Vec<u8> {
@@ -312,7 +334,10 @@ impl<S: KVStore> KVSpace for Backend<S> {
             match &p.val {
                 XValue::Index(_) | XValue::ExtIndex(_) => {
                     if !Self::is_dir(&resolved) {
-                        panic!("Set: directory-kind value at non-directory key {:?}", resolved);
+                        panic!(
+                            "Set: directory-kind value at non-directory key {:?}",
+                            resolved
+                        );
                     }
                 }
                 _ => {}
@@ -346,7 +371,7 @@ impl<S: KVStore> KVSpace for Backend<S> {
             // extindex 写保护：只读扩展层上的同名节点禁止写入。
             if let Some(data) = self.store.get(&parent) {
                 let head = decode_xvalue_head(&data);
-                if head.kind == KIND_EXT_INDEX {
+                if head.kind() == KIND_EXT_INDEX {
                     let body = head.body(&data);
                     let ext_t = crate::xvalue_index::decode_ext_index(body).ext_path;
                     let local_nodes = self.read_dir_index(&parent);
@@ -366,7 +391,8 @@ impl<S: KVStore> KVSpace for Backend<S> {
         }
 
         // 按 parent 分组，去重合并 children 进父目录 index。
-        let mut parent_children: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+        let mut parent_children: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
         for (parent, name) in children {
             parent_children.entry(parent).or_default().push(name);
         }
@@ -426,7 +452,11 @@ impl<S: KVStore> KVSpace for Backend<S> {
 
     fn list(&mut self, prefix: &str, expand_ext: bool, resolve: bool) -> Vec<String> {
         Self::assert_dir(prefix);
-        let resolved = if resolve { self.resolve_path(prefix) } else { prefix.to_string() };
+        let resolved = if resolve {
+            self.resolve_path(prefix)
+        } else {
+            prefix.to_string()
+        };
         if !Self::is_dir(&resolved) {
             return Vec::new();
         }
@@ -464,7 +494,7 @@ impl<S: KVStore> KVSpace for Backend<S> {
             // extindex 删除保护：只读扩展层上的同名节点禁止删除。
             if let Some(data) = self.store.get(&parent) {
                 let head = decode_xvalue_head(&data);
-                if head.kind == KIND_EXT_INDEX {
+                if head.kind() == KIND_EXT_INDEX {
                     let body = head.body(&data);
                     let ext_t = crate::xvalue_index::decode_ext_index(body).ext_path;
                     let local_nodes = self.read_dir_index(&parent);
@@ -496,7 +526,7 @@ impl<S: KVStore> KVSpace for Backend<S> {
         }
         if let Some(data) = self.store.get(link_key) {
             let head = decode_xvalue_head(&data);
-            if head.is_ptr {
+            if head.is_ptr() {
                 return self.del(&[prefix.to_string()]);
             }
         }
@@ -532,7 +562,11 @@ impl<S: KVStore> KVSpace for Backend<S> {
         let resolved = self.resolve_path(path);
 
         let trimmed = resolved.trim_matches('/');
-        let parts: Vec<&str> = if trimmed.is_empty() { Vec::new() } else { trimmed.split('/').collect() };
+        let parts: Vec<&str> = if trimmed.is_empty() {
+            Vec::new()
+        } else {
+            trimmed.split('/').collect()
+        };
         let mut cur = PATH_SEP.to_string();
         for p in parts {
             cur = format!("{}{}", join_path(&cur, p), DIR_INDEX_SUF);
@@ -546,11 +580,14 @@ impl<S: KVStore> KVSpace for Backend<S> {
 
     fn ext_index(&mut self, path: &str, ext_path: &str) -> Result<(), String> {
         if !Self::is_dir(path) || !Self::is_dir(ext_path) {
-            return Err(format!("{}: ExtIndex path={} extpath={}", ERR_DIR_MUST_END_WITH_SLASH, path, ext_path));
+            return Err(format!(
+                "{}: ExtIndex path={} extpath={}",
+                ERR_DIR_MUST_END_WITH_SLASH, path, ext_path
+            ));
         }
         if let Some(data) = self.store.get(ext_path) {
             let head = decode_xvalue_head(&data);
-            if head.kind == KIND_EXT_INDEX {
+            if head.kind() == KIND_EXT_INDEX {
                 return Err(format!("{}: {}", ERR_EXT_CASCADE, ext_path));
             }
         }
@@ -574,7 +611,7 @@ impl<S: KVStore> KVSpace for Backend<S> {
         }
         if let Some(data) = self.store.get(link_key) {
             let head = decode_xvalue_head(&data);
-            if head.is_ptr {
+            if head.is_ptr() {
                 self.store.del(&[link_key]);
                 let (parent, name) = Self::parent_name(&resolved);
                 self.remove_child(&parent, &[name]);

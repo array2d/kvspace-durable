@@ -58,7 +58,7 @@ fn encode_with_perm(v: &XValue, ro: bool, vid: u32) -> Vec<u8> {
     }
     let data = v.encode();
     let h = decode_xvalue_head(&data);
-    encode_head_perm(&h.kind, h.r#ref, &h.dims, h.body(&data), ro, vid)
+    encode_head_perm(&h.kind(), h.r#ref(), &h.dims(), h.body(&data), ro, vid)
 }
 
 fn parse_bool_flag(args: &[String], name: &str, default: bool) -> (bool, Vec<String>) {
@@ -116,11 +116,19 @@ fn main() {
                     fatalf("usage: kvspace set <key> <value> [ro|rw] [vid]");
                 }
                 let ro = tail.len() > 2 && tail[2] == "ro";
-                let vid = if tail.len() > 3 { tail[3].parse::<u32>().unwrap_or(0) } else { 0 };
+                let vid = if tail.len() > 3 {
+                    tail[3].parse::<u32>().unwrap_or(0)
+                } else {
+                    0
+                };
                 match parse_value(&tail[1]) {
                     Ok(v) => {
                         let raw = encode_with_perm(&v, ro, vid);
-                        if let Err(e) = kv.set(&[KVPair { key: tail[0].clone(), val: v, raw: Some(raw) }]) {
+                        if let Err(e) = kv.set(&[KVPair {
+                            key: tail[0].clone(),
+                            val: v,
+                            raw: Some(raw),
+                        }]) {
                             fatalf(&e);
                         }
                     }
@@ -134,9 +142,22 @@ fn main() {
                         println!("{}\t(nil)", k);
                     } else {
                         let h = decode_xvalue_head(&raw);
-                        let dims = h.dims.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(",");
-                        println!("{}\t{}\tref={}\tro={}\tvid={}\tndim={}\tdims=[{}]",
-                            k, h.kind, h.r#ref, h.ro as u8, h.vid, h.ndim, dims);
+                        let dims = h
+                            .dims()
+                            .iter()
+                            .map(|d| d.to_string())
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        println!(
+                            "{}\t{}\tref={}\tro={}\tvid={}\tndim={}\tdims=[{}]",
+                            k,
+                            h.kind(),
+                            h.r#ref(),
+                            h.ro as u8,
+                            h.vid,
+                            h.ndim(),
+                            dims
+                        );
                     }
                 }
             }
