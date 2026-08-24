@@ -1,5 +1,7 @@
 # kvspace-durable
 
+[![CI](https://github.com/array2d/kvspace-durable/actions/workflows/ci.yml/badge.svg)](https://github.com/array2d/kvspace-durable/actions/workflows/ci.yml)
+
 Rust implementation of the **KVSpace** used by kvlang — the filesystem-style key-value store that serves as kvlang's unified addressing and memory space (keys are paths, values are XValues).
 
 This is one of two standard implementations of the KVSpace contract; the other is [kvspace-c](../kvspace-c). Both expose the same C ABI and the same XValue kindexpr format, so a consumer (the kvlang layout/runtime) switches between them by DSN only.
