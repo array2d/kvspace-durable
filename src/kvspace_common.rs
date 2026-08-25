@@ -30,22 +30,24 @@ pub fn sep_path(path: &str) -> (String, String) {
     }
 }
 
-/// SepKind 统一 KV 路径中 4 种 index 目录分隔符的种类。
-/// / → SepDir（层级目录）；. → SepDict（成员目录）；[ → SepArray（数组坐标）。
+/// SepKind 统一 KV 路径中 index 目录分隔符的种类。
+/// / → SepDir（层级目录）；. → SepDict（成员目录，含 objindex 成员与 strkeymapindex 坐标段）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SepKind {
     SepDir,
     SepDict,
-    SepArray,
 }
 
-/// SplitIndex 统一解析绝对路径末段，识别 4 种 index 分隔符：/ . [ ,
+/// SplitIndex 解析绝对路径末段。`m.[0,1]` 切成父目录 `m.` + 成员名 `[0,1]`：
+/// 坐标段整体是一个成员名，不是多级路径。
 pub fn split_index(path: &str) -> (String, String, SepKind) {
     let (mut parent, last) = sep_path(path);
     if parent != PATH_SEP {
         parent.push_str(DIR_INDEX_SUF);
     }
-    if let Some(i) = last.rfind('.') {
+    // 坐标成员优先按 `.[` 切：`[..]` 内可含 '.'（如 [12.24,my]），裸 rfind('.') 会切错。
+    let dot = last.rfind(".[").or_else(|| last.rfind('.'));
+    if let Some(i) = dot {
         if i > 0 {
             let m = &last[i + 1..];
             if !m.is_empty() {
@@ -54,14 +56,6 @@ pub fn split_index(path: &str) -> (String, String, SepKind) {
                     m.to_string(),
                     SepKind::SepDict,
                 );
-            }
-        }
-    }
-    if let Some(i) = last.rfind('[') {
-        if i > 0 && last.ends_with(']') {
-            let idx = &last[i + 1..last.len() - 1];
-            if !idx.is_empty() && !idx.contains('[') && !idx.contains(']') {
-                return (parent, last.to_string(), SepKind::SepArray);
             }
         }
     }

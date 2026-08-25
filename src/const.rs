@@ -29,6 +29,9 @@ pub const ERR_EXT_CASCADE: &str = "kvspace: ExtIndex 不容许级联";
 pub const ERR_EXT_TARGET: &str = "kvspace: ExtIndex target must be an existing ordinary index";
 pub const ERR_EXT_COLLISION: &str = "kvspace: ExtIndex local and extension children overlap";
 pub const ERR_LINK_TYPE_MISMATCH: &str = "kvspace: Link target 和 linkpath 类型不一致";
+pub const ERR_MAP_NDIM: &str = "kvspace: strkeymapindex 恒 ndim>=1，无维度容器应为 objindex";
+pub const ERR_MAP_COORD: &str = "kvspace: strkeymapindex 成员名必须是坐标段 [s0,s1,...]";
+pub const ERR_MEMBER_NAME: &str = "kvspace: objindex 成员名含非法字符";
 pub const ERR_LINK_PATH_EXISTS: &str = "kvspace: Link path already contains a non-link value";
 
 // ── XValueHead kind ─────────────────────────────────────────────────────────

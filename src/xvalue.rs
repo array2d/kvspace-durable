@@ -143,7 +143,10 @@ impl XValueHead {
                     XValue::Obj(crate::xvalue_index::decode_obj_index(body))
                 }
             }
-            KIND_MAP => XValue::Map(crate::xvalue_index::decode_index(body)),
+            KIND_MAP => XValue::Map(MapIndex {
+                childs: crate::xvalue_index::decode_index(body),
+                dims: dims.clone(),
+            }),
             KIND_INDEX => XValue::Index(crate::xvalue_index::decode_index(body)),
             KIND_EXT_INDEX => XValue::ExtIndex(crate::xvalue_index::decode_ext_index(body)),
             _ => XValue::Opaque(Opaque {
@@ -194,7 +197,7 @@ pub enum XValue {
     CharAscii(Arr<u8>), // char/ascii，1B×N
     Char32(Arr<u32>),   // char/utf32，码点，4B×N
     Obj(Vec<String>),   // objindex（命名成员对象：键为任意字符串，值 json）
-    Map(Vec<String>),   // strkeymapindex（散 key 序列：键为数字字符串，元素 json，变长可增删）
+    Map(MapIndex), // strkeymapindex（散 key ndarray：键为坐标段 [s0,s1,...]，恒 ndim≥1）
     Index(Vec<String>), // index
     ExtIndex(ExtIndex), // extindex
     Opaque(Opaque),     // 未知 kind（如 kvlang 的 rwir/rwfunc/scope），原样存取
@@ -250,7 +253,7 @@ impl XValue {
             XValue::CharAscii(d) => d.data.len() as i32,
             XValue::Char32(d) => (d.data.len() * 4) as i32,
             XValue::Obj(d) => crate::xvalue_index::encode_index_raw(d).len() as i32,
-            XValue::Map(d) => crate::xvalue_index::encode_index_raw(d).len() as i32,
+            XValue::Map(m) => crate::xvalue_index::encode_index_raw(&m.childs).len() as i32,
             XValue::Index(d) => crate::xvalue_index::encode_index_raw(d).len() as i32,
             XValue::ExtIndex(e) => {
                 crate::xvalue_index::encode_ext_index_raw(&e.ext_path, &e.childs).len() as i32
@@ -278,7 +281,7 @@ impl XValue {
             XValue::CharAscii(d) => d.data.len() as i32,
             XValue::Char32(d) => d.data.len() as i32,
             XValue::Obj(_) => 1,
-            XValue::Map(_) => 1,
+            XValue::Map(m) => m.dims.iter().product(),
             XValue::Index(_) => 1,
             XValue::ExtIndex(_) => 1,
             XValue::Opaque(o) => o.array_len,
@@ -307,9 +310,9 @@ impl XValue {
                 let raw = crate::xvalue_index::encode_index_raw(d);
                 tlv_encode(KIND_OBJ, &raw, 1)
             }
-            XValue::Map(d) => {
-                let raw = crate::xvalue_index::encode_index_raw(d);
-                tlv_encode(KIND_MAP, &raw, 1)
+            XValue::Map(m) => {
+                let raw = crate::xvalue_index::encode_index_raw(&m.childs);
+                encode_head(KIND_MAP, 0, &m.dims, &raw)
             }
             XValue::Index(d) => {
                 let raw = crate::xvalue_index::encode_index_raw(d);
@@ -346,7 +349,15 @@ impl XValue {
                 .map(|&c| char::from_u32(c).unwrap_or('\u{FFFD}'))
                 .collect(),
             XValue::Obj(d) => obj_value_string(d),
-            XValue::Map(d) => format!("map{{{}}}", d.len()),
+            XValue::Map(m) => format!(
+                "map[{}]{{{}}}",
+                m.dims
+                    .iter()
+                    .map(|d| d.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                m.childs.len()
+            ),
             XValue::Index(d) => index_value_string(d),
             XValue::ExtIndex(e) => e.value_string(),
             XValue::Opaque(o) => String::from_utf8_lossy(&o.body).into_owned(),
@@ -399,6 +410,14 @@ pub fn ptr_target(v: &XValue) -> String {
 pub struct ExtIndex {
     pub childs: Vec<String>,
     pub ext_path: String,
+}
+
+/// strkeymapindex：散 key ndarray。dims 是逻辑形状（恒 ndim≥1），childs 是实际存在的坐标段成员。
+/// 二者可不一致：坐标可缺席，缺席坐标读为 None。
+#[derive(Clone, Debug, PartialEq)]
+pub struct MapIndex {
+    pub childs: Vec<String>,
+    pub dims: Vec<i32>,
 }
 
 impl ExtIndex {

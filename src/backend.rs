@@ -3,6 +3,7 @@
 
 use std::time::Duration;
 
+use crate::coord::{cmp_coord, grow_coord_dims, is_coord, parse_coord};
 use crate::kvspace::{KVPair, KVSpace};
 use crate::kvspace_common::{
     dir_exists, get_one, join_path, mk_index_recursive, sep_path, split_index, validate_ptr,
@@ -130,7 +131,12 @@ impl<S: KVStore> Backend<S> {
                 match v {
                     XValue::Index(c) => normalize_children(c),
                     XValue::Obj(c) => normalize_children(c),
-                    XValue::Map(c) => normalize_children(c),
+                    // 坐标段成员按 row-major 数值升序（§8），非坐标段目录保持追加序。
+                    XValue::Map(m) => {
+                        let mut c = normalize_children(m.childs);
+                        c.sort_by(|a, b| cmp_coord(a, b));
+                        c
+                    }
                     XValue::ExtIndex(e) => e.childs,
                     other => panic!("read_dir_index: unexpected kind {}", other.kind()),
                 }
@@ -142,7 +148,7 @@ impl<S: KVStore> Backend<S> {
         match self.store.get(parent) {
             None => {
                 if parent.ends_with(OBJ_SEP) {
-                    let v = new_obj_index(&[name.to_string()]);
+                    let v = new_index_for_member(name);
                     self.store.set(parent, &v.encode());
                 } else {
                     let v = new_index(&[name.to_string()]);
@@ -170,13 +176,14 @@ impl<S: KVStore> Backend<S> {
                         let v = new_obj_index(&nodes);
                         self.store.set(parent, &v.encode());
                     }
-                    XValue::Map(nodes) => {
-                        let mut nodes = normalize_children(nodes);
+                    XValue::Map(m) => {
+                        let mut nodes = normalize_children(m.childs);
                         if nodes.iter().any(|n| n == name) {
                             return;
                         }
                         nodes.push(name.to_string());
-                        let v = new_map_index(&nodes);
+                        nodes.sort_by(|a, b| cmp_coord(a, b));
+                        let v = new_map_index(&nodes, &grow_coord_dims(&m.dims, &nodes));
                         self.store.set(parent, &v.encode());
                     }
                     XValue::ExtIndex(e) => {
@@ -219,11 +226,11 @@ impl<S: KVStore> Backend<S> {
                         let v = new_obj_index(&filtered);
                         self.store.set(parent, &v.encode());
                     }
-                    XValue::Map(nodes) => {
-                        let nodes = normalize_children(nodes);
+                    XValue::Map(m) => {
+                        let nodes = normalize_children(m.childs);
                         let filtered: Vec<String> =
                             nodes.into_iter().filter(|n| !is_removed(n)).collect();
-                        let v = new_map_index(&filtered);
+                        let v = new_map_index(&filtered, &m.dims);
                         self.store.set(parent, &v.encode());
                     }
                     XValue::ExtIndex(e) => {
@@ -256,6 +263,15 @@ impl<S: KVStore> Backend<S> {
             }
         }
         String::new()
+    }
+}
+
+/// 成员目录（以 `.` 结尾）新建时，按成员名是否为坐标段决定是 map 还是 obj。
+fn new_index_for_member(name: &str) -> XValue {
+    if is_coord(name) {
+        new_map_index(&[], &grow_coord_dims(&[], &[name.to_string()]))
+    } else {
+        new_obj_index(&[])
     }
 }
 
@@ -358,8 +374,7 @@ impl<S: KVStore> KVSpace for Backend<S> {
             let (parent, name, _) = split_index(&resolved);
             if parent.ends_with(OBJ_SEP) {
                 if self.store.get(&parent).is_none() {
-                    let v = new_obj_index(&[]);
-                    self.store.set(&parent, &v.encode());
+                    self.store.set(&parent, &new_index_for_member(&name).encode());
                 }
                 let (dp, dn) = Self::parent_name(&parent);
                 mk_index_recursive(self, &dp);
@@ -401,14 +416,16 @@ impl<S: KVStore> KVSpace for Backend<S> {
             let mut ext_path = String::new();
             let mut is_ext = false;
             let mut is_map = false;
+            let mut map_dims: Vec<i32> = Vec::new();
             let mut is_dict = parent.ends_with(OBJ_SEP);
 
             if let Some(data) = self.store.get(&parent) {
                 let v = decode_xvalue(&data);
                 match v {
                     XValue::Index(c) => nodes = normalize_children(c),
-                    XValue::Map(c) => {
-                        nodes = normalize_children(c);
+                    XValue::Map(m) => {
+                        nodes = normalize_children(m.childs);
+                        map_dims = m.dims;
                         is_map = true;
                     }
                     XValue::Obj(c) => {
@@ -435,10 +452,18 @@ impl<S: KVStore> KVSpace for Backend<S> {
                 }
             }
 
+            // 成员目录下成员名全是坐标段 → strkeymapindex（而非 objindex 兜底）。
+            if !is_map && !is_ext && is_dict && !nodes.is_empty() && nodes.iter().all(|n| is_coord(n))
+            {
+                is_map = true;
+            }
+            if is_map {
+                nodes.sort_by(|a, b| cmp_coord(a, b));
+            }
             let v = if is_ext {
                 new_ext_index(&nodes, &ext_path)
             } else if is_map {
-                new_map_index(&nodes)
+                new_map_index(&nodes, &grow_coord_dims(&map_dims, &nodes))
             } else if is_dict {
                 new_obj_index(&nodes)
             } else {

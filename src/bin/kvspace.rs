@@ -17,32 +17,46 @@ fn parse_value(raw: &str) -> Result<XValue, String> {
         }
         return Ok(new_ptr("", rest, 1));
     }
-    match raw.find(':') {
-        None => Ok(new_uint8(raw.as_bytes())),
-        Some(idx) => {
-            let kind = &raw[..idx];
-            let repr = &raw[idx + 1..];
-            match kind {
-                "int" => repr
-                    .parse::<i64>()
-                    .map(|i| new_int64(&[i]))
-                    .map_err(|_| format!("invalid int: {:?}", repr)),
-                "float" => repr
-                    .parse::<f64>()
-                    .map(|f| new_float64(&[f]))
-                    .map_err(|_| format!("invalid float: {:?}", repr)),
-                "bool" => match repr {
-                    "true" => Ok(new_bool(&[true])),
-                    "false" => Ok(new_bool(&[false])),
-                    _ => Err(format!("invalid bool: {:?}", repr)),
-                },
-                "string" => Ok(new_char_byte(repr.as_bytes())),
-                "nil" => Ok(XValue::None),
-                KIND_INDEX => Ok(new_index(&[])),
-                KIND_OBJ => Ok(new_obj_index(&[])),
-                _ => Err(format!("unknown kind: {:?}", kind)),
-            }
+    // map[dims]: 与 map:dims 皆可；kind 恒为 "map"。
+    if raw.starts_with("map") {
+        let dims: Vec<i32> = raw
+            .trim_start_matches("map")
+            .trim_matches([':', '[', ']'])
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.parse().unwrap_or(0))
+            .collect();
+        if dims.is_empty() {
+            return Err("map 需要 dims，如 map[2,3]:".to_string());
         }
+        return Ok(new_map_index(&[], &dims));
+    }
+    let split = raw.find(':').unwrap_or(raw.len());
+    let kind = &raw[..split];
+    let repr = &raw[split..].trim_start_matches(':');
+    match kind {
+        "int" => repr
+            .parse::<i64>()
+            .map(|i| new_int64(&[i]))
+            .map_err(|_| format!("invalid int: {:?}", repr)),
+        "float" => repr
+            .parse::<f64>()
+            .map(|f| new_float64(&[f]))
+            .map_err(|_| format!("invalid float: {:?}", repr)),
+        "bool" => match *repr {
+            "true" => Ok(new_bool(&[true])),
+            "false" => Ok(new_bool(&[false])),
+            _ => Err(format!("invalid bool: {:?}", repr)),
+        },
+        "string" => Ok(new_char_byte(repr.as_bytes())),
+        "float32" => repr
+            .parse::<f32>()
+            .map(|f| new_float32(&[f]))
+            .map_err(|_| format!("invalid float32: {:?}", repr)),
+        "nil" => Ok(XValue::None),
+        KIND_INDEX => Ok(new_index(&[])),
+        KIND_OBJ => Ok(new_obj_index(&[])),
+        _ => Err(format!("unknown kind: {:?}", kind)),
     }
 }
 

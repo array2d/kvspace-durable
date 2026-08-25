@@ -1,7 +1,7 @@
 // xvalue_index.rs — 对齐 xvalue_index.go（Index、ObjIndex、ExtIndex）
 
 use crate::r#const::*;
-use crate::xvalue::{ExtIndex, XValue};
+use crate::xvalue::{ExtIndex, MapIndex, XValue};
 
 pub fn new_index(children: &[String]) -> XValue {
     XValue::Index(children.to_vec())
@@ -9,8 +9,15 @@ pub fn new_index(children: &[String]) -> XValue {
 pub fn new_obj_index(children: &[String]) -> XValue {
     XValue::Obj(children.to_vec())
 }
-pub fn new_map_index(children: &[String]) -> XValue {
-    XValue::Map(children.to_vec())
+/// strkeymapindex 恒 ndim≥1；dims 为空即非法（无维度的字符串键容器是 objindex）。
+pub fn new_map_index(children: &[String], dims: &[i32]) -> XValue {
+    if dims.is_empty() {
+        panic!("{}", ERR_MAP_NDIM);
+    }
+    XValue::Map(MapIndex {
+        childs: children.to_vec(),
+        dims: dims.to_vec(),
+    })
 }
 pub fn new_ext_index(children: &[String], ext_path: &str) -> XValue {
     XValue::ExtIndex(ExtIndex {
