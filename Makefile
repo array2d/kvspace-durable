@@ -1,14 +1,10 @@
 .PHONY: build test clippy clean
 
-PREFIX ?= ~/.local
-
 build:
-	cargo build --release --bin kvspace
-	install -d $(PREFIX)/bin
-	install target/release/kvspace $(PREFIX)/bin/kvspace
+	cargo build --release
 
-test: build
-	python3 tutorial/test.py
+test:
+	cargo test
 
 clippy:
 	cargo clippy

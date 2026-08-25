@@ -4,7 +4,7 @@
 // extern "C" 符号表调用本库，不接触 Rust 类型。所有 XValue 以 TLV 字节跨边界。
 //
 // 约定：
-//   - 句柄：kvspaceConnect 返回 *mut Handle（Box<dyn KVSpace>），kvspaceFree 释放。
+//   - 句柄：kvspaceConnect 返回 *mut Handle（Box<dyn KVSpace>），kvspaceClose 释放。
 //   - 输入字符串：*const c_char（NUL 终止）；输入字节：*const u8 + u32 len。
 //   - 输出字节：*mut *mut u8 + *mut u32，由 callee 分配，调用方用 kvspaceBytesFree(ptr, len) 释放。
 //   - 错误：返回 c_int（0=成功，1=失败），失败信息写入 err 缓冲（err_cap 上限）。
@@ -97,7 +97,7 @@ pub extern "C" fn kvspaceConnect(dsn: *const c_char) -> *mut Handle {
 }
 
 #[no_mangle]
-pub extern "C" fn kvspaceFree(h: *mut Handle) {
+pub extern "C" fn kvspaceClose(h: *mut Handle) {
     if !h.is_null() {
         unsafe { drop(Box::from_raw(h)) };
     }
@@ -161,8 +161,16 @@ pub extern "C" fn kvspaceGet(
         return 1;
     }
     let kv: &mut dyn KVSpace = unsafe { &mut **h };
-    let v = get_one(kv, unsafe { cstr(key) });
-    alloc(v.encode(), out, out_len)
+    let raw = kv.get_raw(unsafe { cstr(key) });
+    if raw.is_empty() {
+        unsafe {
+            *out = std::ptr::null_mut();
+            *out_len = 0;
+        }
+        0
+    } else {
+        alloc(raw, out, out_len)
+    }
 }
 
 /// 批量读：prefix 下 names 一次 MGET，返回每个值的 [4B len LE][TLV] 拼接。
