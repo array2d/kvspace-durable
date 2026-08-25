@@ -18,6 +18,17 @@ pub fn join_path(parent: &str, child: &str) -> String {
     format!("{}{}{}", parent, PATH_SEP, child)
 }
 
+/// 去掉尾部分隔符（/ 或 ·，按字节长切片，多字节 · 安全）。
+pub fn strip_dir_suf(path: &str) -> &str {
+    if path.ends_with(DIR_INDEX_SUF) {
+        &path[..path.len() - DIR_INDEX_SUF.len()]
+    } else if path.ends_with(OBJ_SEP) {
+        &path[..path.len() - OBJ_SEP.len()]
+    } else {
+        path
+    }
+}
+
 /// SepPath 拆分路径为 (prefix, last)。
 pub fn sep_path(path: &str) -> (String, String) {
     if path == PATH_SEP {
@@ -31,28 +42,28 @@ pub fn sep_path(path: &str) -> (String, String) {
 }
 
 /// SepKind 统一 KV 路径中 index 目录分隔符的种类。
-/// / → SepDir（层级目录）；. → SepDict（成员目录，含 objindex 成员与 strkeymapindex 坐标段）。
+/// / → SepDir（层级目录）；· → SepDict（成员目录，含 objindex 成员与 strkeymapindex 坐标段）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SepKind {
     SepDir,
     SepDict,
 }
 
-/// SplitIndex 解析绝对路径末段。`m.[0,1]` 切成父目录 `m.` + 成员名 `[0,1]`：
-/// 坐标段整体是一个成员名，不是多级路径。
+/// SplitIndex 解析绝对路径末段。`m·[0,1]` 切成父目录 `m·` + 成员名 `[0,1]`：
+/// 坐标段整体是一个成员名，不是多级路径。成员分隔符 · 不在小数/坐标内出现，
+/// 故直接 rfind(OBJ_SEP) 即可，无需 `.` 时代的 `.[` 特判。
 pub fn split_index(path: &str) -> (String, String, SepKind) {
     let (mut parent, last) = sep_path(path);
     if parent != PATH_SEP {
         parent.push_str(DIR_INDEX_SUF);
     }
-    // 坐标成员优先按 `.[` 切：`[..]` 内可含 '.'（如 [12.24,my]），裸 rfind('.') 会切错。
-    let dot = last.rfind(".[").or_else(|| last.rfind('.'));
+    let dot = last.rfind(OBJ_SEP);
     if let Some(i) = dot {
         if i > 0 {
-            let m = &last[i + 1..];
+            let m = &last[i + OBJ_SEP.len()..];
             if !m.is_empty() {
                 return (
-                    format!("{}{}", parent, &last[..i + 1]),
+                    format!("{}{}", parent, &last[..i + OBJ_SEP.len()]),
                     m.to_string(),
                     SepKind::SepDict,
                 );

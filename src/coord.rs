@@ -1,5 +1,5 @@
 // coord.rs — strkeymapindex 坐标段 [s0,s1,...] 的构造、解析、校验与排序。
-// 坐标段是父目录 `m.` 下的一个成员名，不是多级路径。详见 docs/strkeymapindex-ndarray.md。
+// 坐标段是父目录 `m·` 下的一个成员名，不是多级路径。详见 docs/strkeymapindex-ndarray.md。
 
 use std::cmp::Ordering;
 
@@ -93,13 +93,15 @@ pub fn grow_coord_dims(dims: &[i32], names: &[String]) -> Vec<i32> {
     d
 }
 
-/// objindex 成员名字符约束：禁 / . [ ] \n \r \0 ‥ … 与 ASCII 控制字符，禁空串。
+/// objindex 成员名字符约束：禁 / · [ ] \n \r \0 ‥ … 与 ASCII 控制字符，禁空串。
+/// '.' 已放开（小数/含点字符串可作 key），成员分隔符改为 ·（OBJ_SEP）。
 pub fn valid_member_name(name: &str) -> bool {
     !name.is_empty()
+        && !name.contains(crate::r#const::OBJ_SEP)
         && !name.chars().any(|c| {
             matches!(
                 c,
-                '/' | '.' | '[' | ']' | '\n' | '\r' | '\0' | '\u{2025}' | '\u{2026}'
+                '/' | '[' | ']' | '\n' | '\r' | '\0' | '\u{2025}' | '\u{2026}'
             ) || (c as u32) < 0x20
         })
 }

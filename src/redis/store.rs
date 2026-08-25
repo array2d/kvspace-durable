@@ -4,6 +4,7 @@ use std::cell::RefCell;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 
+use crate::r#const::*;
 use crate::store::KVStore;
 
 pub struct RedisStore {
@@ -174,8 +175,8 @@ impl KVStore for RedisStore {
                                 let k = String::from_utf8_lossy(b).into_owned();
                                 if k == prefix
                                     || (k.len() > prefix.len() && k.starts_with(prefix) && {
-                                        let c = k.as_bytes()[prefix.len()];
-                                        c == b'/' || c == b'.'
+                                        let rest = &k[prefix.len()..];
+                                        rest.starts_with(PATH_SEP) || rest.starts_with(OBJ_SEP)
                                     })
                                 {
                                     keys.push(k);

@@ -1,6 +1,6 @@
 // const.rs — 对齐 const.go
 // 路径与成员分隔符统一管理。所有构造 KV 路径、解析限定名、成员访问的地方
-// 均须使用这些常量，禁止硬编码 "." 等裸字符串。
+// 均须使用这些常量，禁止硬编码 "·" 等裸字符串。
 
 // ── 路径结构 ──────────────────────────────────────────────────────────────
 
@@ -37,7 +37,7 @@ pub const ERR_LINK_PATH_EXISTS: &str = "kvspace: Link path already contains a no
 // ── XValueHead kind ─────────────────────────────────────────────────────────
 
 pub const KIND_NONE: &str = "None";
-pub const OBJ_SEP: &str = ".";
+pub const OBJ_SEP: &str = "·"; // 成员分隔符（U+00B7 中点号）：释放 '.' 供小数 key 使用
 
 // kind 继承树：uint8 是所有定长数值类型的祖先。
 // 字节宽度由 ElemSize(kind) 定义——任何 elemSize>0 的 kind 继承 uint8。

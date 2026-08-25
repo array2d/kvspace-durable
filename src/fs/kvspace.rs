@@ -1,6 +1,6 @@
 // fs/kvspace.rs — 结构感知的文件系统 KVSpace。
-// 编码：kvspace 的 '.' 一律替换为 './'（父目录名带尾点 + "/" 分隔成员），反向 './' → '.'。
-// "/" 与 "." 的 index 都从 readdir 派生；ExtIndex 用目录内 __extindex__ 文件存 ext_target_path（第一行）。
+// 编码：kvspace 的 '·'（成员分隔）一律替换为 '·/'（父目录名带尾中点 + "/" 分隔成员），反向 '·/' → '·'。
+// "/" 与 "·" 的 index 都从 readdir 派生；ExtIndex 用目录内 __extindex__ 文件存 ext_target_path（第一行）。
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -8,7 +8,9 @@ use std::time::Duration;
 
 use crate::kvspace::{KVPair, KVSpace};
 use crate::coord::{cmp_coord, is_coord, parse_coord, grow_coord_dims};
-use crate::kvspace_common::{join_path, sep_path, split_index, validate_ptr, watch_value, SepKind};
+use crate::kvspace_common::{
+    join_path, sep_path, split_index, strip_dir_suf, validate_ptr, watch_value, SepKind,
+};
 use crate::r#const::*;
 use crate::xvalue::*;
 use crate::xvalue_index::{new_ext_index, new_index, new_map_index, new_obj_index};
@@ -41,13 +43,15 @@ impl FsKVSpace {
         }
     }
 
-    /// kvspace key → fs 路径：'.'（成员分隔）→ './'；段首 '.'（如 .todo<vid>）是字面量不替换。
+    /// kvspace key → fs 路径：'·'（成员分隔）→ '·/'；段首 '·' 是字面量不替换。
     fn fs_path(&self, key: &str) -> PathBuf {
+        let sep = OBJ_SEP.chars().next().unwrap();
         let mut rel = String::with_capacity(key.len());
         let mut prev = '/';
         for c in key.chars() {
-            if c == '.' && prev != '/' {
-                rel.push_str("./");
+            if c == sep && prev != '/' {
+                rel.push(sep);
+                rel.push('/');
             } else {
                 rel.push(c);
             }
@@ -56,10 +60,11 @@ impl FsKVSpace {
         self.root.join(rel.trim_start_matches('/'))
     }
 
-    /// fs 路径 → kvspace key：'./' → '.'
+    /// fs 路径 → kvspace key：'·/' → '·'
     fn key_of(&self, path: &Path) -> String {
         let rel = path.strip_prefix(&self.root).unwrap_or(path);
-        let s = rel.to_string_lossy().replace("./", ".");
+        let pat = [OBJ_SEP, "/"].concat();
+        let s = rel.to_string_lossy().replace(pat.as_str(), OBJ_SEP);
         if s.is_empty() {
             PATH_SEP.to_string()
         } else {
@@ -205,7 +210,7 @@ impl FsKVSpace {
     fn resolve_parent(&self, path: &str) -> String {
         let dir_suf = Self::is_dir_key(path) && path != PATH_SEP;
         let clean = if dir_suf {
-            &path[..path.len() - 1]
+            strip_dir_suf(path)
         } else {
             path
         };
@@ -271,7 +276,7 @@ impl FsKVSpace {
             return Vec::new();
         }
         let p = self.fs_path(dir_key);
-        // 目录名（末段）是否以 '.' 结尾：成员前缀目录（"math."）内的成员不再扁平化。
+        // 目录名（末段）是否以 '·' 结尾：成员前缀目录（"math·"）内的成员不再扁平化。
         let name = dir_key
             .trim_end_matches('/')
             .rsplit('/')
@@ -430,23 +435,21 @@ impl KVSpace for FsKVSpace {
             }
             if let XValue::Obj(_) = &p.val {
                 let (parent, name) = Self::parent_name(&resolved);
-                let dict_key = format!("{}{}", resolved, OBJ_SEP);
-                self.ensure_dir(&dict_key);
+                self.ensure_dir(&resolved);
                 self.add_order(&parent, &format!("{}{}", name, OBJ_SEP));
                 continue;
             }
-            // map 成员是 `m.[i,j]`，与 obj 同为 `.` 成员目录；dims 落 __map__ 标记。
+            // map 成员是 `m·[i,j]`，与 obj 同为 `·` 成员目录；dims 落 __map__ 标记。
             if let XValue::Map(m) = &p.val {
                 let (parent, name) = Self::parent_name(&resolved);
-                let dict_key = format!("{}{}", resolved, OBJ_SEP);
-                self.ensure_dir(&dict_key);
+                self.ensure_dir(&resolved);
                 let dims = m
                     .dims
                     .iter()
                     .map(|d| d.to_string())
                     .collect::<Vec<_>>()
                     .join(",");
-                let _ = fs::write(self.fs_path(&dict_key).join(MAP_MARKER), dims.as_bytes());
+                let _ = fs::write(self.fs_path(&resolved).join(MAP_MARKER), dims.as_bytes());
                 self.add_order(&parent, &format!("{}{}", name, OBJ_SEP));
                 continue;
             }
@@ -538,7 +541,7 @@ impl KVSpace for FsKVSpace {
         let resolved = self.resolve_path(prefix);
         // 若 prefix 本身是链接（叶 Ptr），只删链接。
         let link_key = if Self::is_dir_key(&resolved) && resolved != PATH_SEP {
-            &resolved[..resolved.len() - 1]
+            strip_dir_suf(&resolved)
         } else {
             &resolved
         };

@@ -6,8 +6,8 @@ use std::time::Duration;
 use crate::coord::{cmp_coord, grow_coord_dims, is_coord, parse_coord};
 use crate::kvspace::{KVPair, KVSpace};
 use crate::kvspace_common::{
-    dir_exists, get_one, join_path, mk_index_recursive, sep_path, split_index, validate_ptr,
-    watch_value,
+    dir_exists, get_one, join_path, mk_index_recursive, sep_path, split_index, strip_dir_suf,
+    validate_ptr, watch_value,
 };
 use crate::r#const::*;
 use crate::store::KVStore;
@@ -75,7 +75,7 @@ impl<S: KVStore> Backend<S> {
     fn resolve_parent(&self, path: &str) -> String {
         let dir_suf = Self::is_dir(path) && path != PATH_SEP;
         let clean = if dir_suf {
-            &path[..path.len() - 1]
+            strip_dir_suf(path)
         } else {
             path
         };
@@ -545,7 +545,7 @@ impl<S: KVStore> KVSpace for Backend<S> {
             }
 
             if Self::is_dir(&resolved) {
-                let link_key = &resolved[..resolved.len() - 1];
+                let link_key = strip_dir_suf(&resolved);
                 self.store.del(&[link_key, &resolved]);
             } else {
                 self.store.del(&[&resolved]);
@@ -558,7 +558,7 @@ impl<S: KVStore> KVSpace for Backend<S> {
     fn del_tree(&mut self, prefix: &str) -> Result<(), String> {
         let mut link_key = prefix;
         if Self::is_dir(link_key) && link_key != PATH_SEP {
-            link_key = &prefix[..prefix.len() - 1];
+            link_key = strip_dir_suf(prefix);
         }
         if let Some(data) = self.store.get(link_key) {
             let head = decode_xvalue_head(&data);
@@ -568,7 +568,7 @@ impl<S: KVStore> KVSpace for Backend<S> {
         }
 
         let resolved = self.resolve_path(prefix);
-        // scan 用去尾斜杠/点的前缀：scan_keys 匹配 k[prefix.len()] ∈ {'/','.'}，
+        // scan 用去尾斜杠/点的前缀：scan_keys 匹配 k[prefix.len()..] 以 '/' 或 '·' 开头，
         // 尾斜杠会使子节点首字符（如 f）落空，导致子树孩子扫不到。
         let mut scan = resolved.clone();
         if Self::is_dir(&scan) && scan != PATH_SEP {
@@ -643,7 +643,7 @@ impl<S: KVStore> KVSpace for Backend<S> {
 
         let mut link_key = resolved.as_str();
         if Self::is_dir(link_key) {
-            link_key = &resolved[..resolved.len() - 1];
+            link_key = strip_dir_suf(&resolved);
         }
         if let Some(data) = self.store.get(link_key) {
             let head = decode_xvalue_head(&data);
