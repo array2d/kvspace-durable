@@ -20,7 +20,7 @@ use crate::kvspace::{KVPair, KVSpace};
 use crate::kvspace_common::get_one;
 use crate::xvalue::{decode_xvalue, decode_xvalue_head, encode_head, encode_head_perm, new_ptr};
 use crate::xvalue_bool::new_bool;
-use crate::xvalue_byte::{new_char, new_char_byte};
+use crate::xvalue_byte::new_char_byte;
 use crate::xvalue_float::new_float64;
 use crate::xvalue_int::new_int64;
 
@@ -533,17 +533,6 @@ pub extern "C" fn kvspaceNewPtr(
 
 #[no_mangle]
 pub extern "C" fn kvspaceNewChar(
-    kind: *const c_char,
-    s: *const c_char,
-    out: *mut *mut u8,
-    out_len: *mut u32,
-) -> c_int {
-    let v = new_char(unsafe { cstr(kind) }, unsafe { cstr(s) });
-    alloc(v.encode(), out, out_len)
-}
-
-#[no_mangle]
-pub extern "C" fn kvspaceNewCharByte(
     bytes: *const u8,
     len: u32,
     out: *mut *mut u8,
