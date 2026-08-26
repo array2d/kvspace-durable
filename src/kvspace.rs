@@ -20,6 +20,22 @@ pub struct KVPair {
 /// 软链接透明穿透：Set 写入 Ptr 值（*kind:target）后，访问 /linkpath/x 透明地访问 target/x。
 /// 删除语义例外（POSIX rm 式）：Del/DelTree 的最终组件作用于链接本体，不穿透 target。
 pub trait KVSpace {
+    /// 校验目录前缀（/、或以 / 或 · 结尾）。非法返回 Err，供 C ABI 边界在调用前短路。
+    fn validate_dir(&self, path: &str) -> Result<(), String> {
+        if path == crate::r#const::PATH_SEP
+            || path.ends_with(crate::r#const::DIR_INDEX_SUF)
+            || path.ends_with(crate::r#const::OBJ_SEP)
+        {
+            Ok(())
+        } else {
+            Err(format!(
+                "{}: {}",
+                crate::r#const::ERR_DIR_MUST_END_WITH_SLASH,
+                path
+            ))
+        }
+    }
+
     /// 单点读：Get 返回完整 XValue，整存整取。
     fn get(&mut self, prefix: &str, keys: &[String], resolve: bool) -> Vec<XValue>;
     /// 单点读原始字节（不 decode/re-encode，保 head 权限位 ro/vid）。无值返回空。

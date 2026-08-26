@@ -406,15 +406,15 @@ impl KVSpace for FsKVSpace {
         for p in pairs {
             let resolved = self.resolve_path(&p.key);
             if resolved.contains("//") {
-                panic!("Set: double-slash in key {:?}", resolved);
+                return Err(format!("Set: double-slash in key {:?}", resolved));
             }
             match &p.val {
                 XValue::Index(_) | XValue::ExtIndex(_) => {
                     if !Self::is_dir_key(&resolved) {
-                        panic!(
+                        return Err(format!(
                             "Set: directory-kind value at non-directory key {:?}",
                             resolved
-                        );
+                        ));
                     }
                 }
                 _ => {}

@@ -64,6 +64,36 @@ fn write_err(err: *mut c_char, err_cap: u32, msg: &str) {
     }
 }
 
+/// 把 panic 转成错误消息：任何 panic 都不得跨 extern "C" 边界（否则 SIGABRT）。
+fn panic_msg(p: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = p.downcast_ref::<&str>() {
+        s.to_string()
+    } else if let Some(s) = p.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "kvspace: panic across C ABI boundary".to_string()
+    }
+}
+
+/// 运行核心逻辑，捕获 panic 返回 Err。供各导出函数做统一兜底。
+fn catch_panic<F>(f: F) -> Result<(), String>
+where
+    F: FnOnce() -> Result<(), String>,
+{
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(panic_msg)?
+}
+
+/// 统一出口：Err → 写 err 缓冲并返回 1；Ok → 0。
+fn result_to_code(r: Result<(), String>, err: *mut c_char, err_cap: u32) -> c_int {
+    match r {
+        Ok(()) => 0,
+        Err(e) => {
+            write_err(err, err_cap, &e);
+            1
+        }
+    }
+}
+
 /// XValueHead 解码结果（repr(C)，供跨边界读取头元数据）。kindexpr 为唯一类型真相。
 #[repr(C)]
 pub struct kvspaceHead_t {
@@ -93,7 +123,10 @@ fn fill_head(head: &crate::xvalue::XValueHead, out: *mut kvspaceHead_t) {
 #[no_mangle]
 pub extern "C" fn kvspaceConnect(dsn: *const c_char) -> *mut Handle {
     let dsn = unsafe { cstr(dsn) };
-    Box::into_raw(Box::new(conn(dsn)))
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| conn(dsn))) {
+        Ok(kv) => Box::into_raw(Box::new(kv)),
+        Err(_) => std::ptr::null_mut(),
+    }
 }
 
 #[no_mangle]
@@ -127,26 +160,26 @@ pub extern "C" fn kvspaceSet(
         return 1;
     }
     let kv: &mut dyn KVSpace = unsafe { &mut **h };
-    let mut pairs = Vec::with_capacity(n as usize);
-    let mut off = 0usize;
-    for i in 0..n as usize {
-        let key = unsafe { cstr(*keys.add(i)) }.to_string();
-        let len = unsafe { *lens.add(i) } as usize;
-        let bytes = unsafe { std::slice::from_raw_parts(vals.add(off), len) };
-        off += len;
-        pairs.push(KVPair {
-            key,
-            val: decode_xvalue(bytes),
-            raw: Some(bytes.to_vec()),
-        });
-    }
-    match kv.set(&pairs) {
-        Ok(()) => 0,
-        Err(e) => {
-            write_err(err, err_cap, &e);
-            1
-        }
-    }
+    result_to_code(
+        catch_panic(|| {
+            let mut pairs = Vec::with_capacity(n as usize);
+            let mut off = 0usize;
+            for i in 0..n as usize {
+                let key = unsafe { cstr(*keys.add(i)) }.to_string();
+                let len = unsafe { *lens.add(i) } as usize;
+                let bytes = unsafe { std::slice::from_raw_parts(vals.add(off), len) };
+                off += len;
+                pairs.push(KVPair {
+                    key,
+                    val: decode_xvalue(bytes),
+                    raw: Some(bytes.to_vec()),
+                });
+            }
+            kv.set(&pairs)
+        }),
+        err,
+        err_cap,
+    )
 }
 
 /// 单点读（对齐 GetOne）：None 编码为空字节（out_len==0）。
@@ -160,17 +193,29 @@ pub extern "C" fn kvspaceGet(
     if h.is_null() {
         return 1;
     }
+    let key = unsafe { cstr(key) }.to_string();
     let kv: &mut dyn KVSpace = unsafe { &mut **h };
-    let raw = kv.get_raw(unsafe { cstr(key) });
-    if raw.is_empty() {
+    if catch_panic(|| {
+        let raw = kv.get_raw(&key);
+        if raw.is_empty() {
+            unsafe {
+                *out = std::ptr::null_mut();
+                *out_len = 0;
+            }
+        } else {
+            alloc(raw, out, out_len);
+        }
+        Ok(())
+    })
+    .is_err()
+    {
         unsafe {
             *out = std::ptr::null_mut();
             *out_len = 0;
         }
-        0
-    } else {
-        alloc(raw, out, out_len)
+        return 1;
     }
+    0
 }
 
 /// 批量读：prefix 下 names 一次 MGET，返回每个值的 [4B len LE][TLV] 拼接。
@@ -187,18 +232,39 @@ pub extern "C" fn kvspaceGetBatch(
     if h.is_null() {
         return 1;
     }
+    let prefix = unsafe { cstr(prefix) }.to_string();
     let kv: &mut dyn KVSpace = unsafe { &mut **h };
+    if let Err(e) = kv.validate_dir(&prefix) {
+        let _ = e;
+        unsafe {
+            *out = std::ptr::null_mut();
+            *out_len = 0;
+        }
+        return 1;
+    }
     let names: Vec<String> = (0..nnames as usize)
         .map(|i| unsafe { cstr(*names.add(i)) }.to_string())
         .collect();
-    let vals = kv.get(unsafe { cstr(prefix) }, &names, true);
-    let mut result = Vec::new();
-    for v in vals {
-        let bytes = v.encode();
-        result.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-        result.extend_from_slice(&bytes);
+    if catch_panic(|| {
+        let vals = kv.get(&prefix, &names, true);
+        let mut result = Vec::new();
+        for v in vals {
+            let bytes = v.encode();
+            result.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            result.extend_from_slice(&bytes);
+        }
+        alloc(result, out, out_len);
+        Ok(())
+    })
+    .is_err()
+    {
+        unsafe {
+            *out = std::ptr::null_mut();
+            *out_len = 0;
+        }
+        return 1;
     }
-    alloc(result, out, out_len)
+    0
 }
 
 /// 列目录：子项以 \n 连接返回（子名不含 \n）。空目录返回 out_len==0。
@@ -214,9 +280,30 @@ pub extern "C" fn kvspaceList(
     if h.is_null() {
         return 1;
     }
+    let prefix = unsafe { cstr(prefix) }.to_string();
     let kv: &mut dyn KVSpace = unsafe { &mut **h };
-    let children = kv.list(unsafe { cstr(prefix) }, expand_ext != 0, resolve != 0);
-    alloc(children.join("\n").into_bytes(), out, out_len)
+    if let Err(e) = kv.validate_dir(&prefix) {
+        let _ = e;
+        unsafe {
+            *out = std::ptr::null_mut();
+            *out_len = 0;
+        }
+        return 1;
+    }
+    if catch_panic(|| {
+        let children = kv.list(&prefix, expand_ext != 0, resolve != 0);
+        alloc(children.join("\n").into_bytes(), out, out_len);
+        Ok(())
+    })
+    .is_err()
+    {
+        unsafe {
+            *out = std::ptr::null_mut();
+            *out_len = 0;
+        }
+        return 1;
+    }
+    0
 }
 
 #[no_mangle]
@@ -234,13 +321,7 @@ pub extern "C" fn kvspaceDel(
     let keys: Vec<String> = (0..nkeys as usize)
         .map(|i| unsafe { cstr(*keys.add(i)) }.to_string())
         .collect();
-    match kv.del(&keys) {
-        Ok(()) => 0,
-        Err(e) => {
-            write_err(err, err_cap, &e);
-            1
-        }
-    }
+    result_to_code(catch_panic(|| kv.del(&keys)), err, err_cap)
 }
 
 #[no_mangle]
@@ -254,13 +335,7 @@ pub extern "C" fn kvspaceDelTree(
         return 1;
     }
     let kv: &mut dyn KVSpace = unsafe { &mut **h };
-    match kv.del_tree(unsafe { cstr(prefix) }) {
-        Ok(()) => 0,
-        Err(e) => {
-            write_err(err, err_cap, &e);
-            1
-        }
-    }
+    result_to_code(catch_panic(|| kv.del_tree(unsafe { cstr(prefix) })), err, err_cap)
 }
 
 #[no_mangle]
@@ -274,13 +349,7 @@ pub extern "C" fn kvspaceMkindex(
         return 1;
     }
     let kv: &mut dyn KVSpace = unsafe { &mut **h };
-    match kv.mkindex(unsafe { cstr(path) }) {
-        Ok(()) => 0,
-        Err(e) => {
-            write_err(err, err_cap, &e);
-            1
-        }
-    }
+    result_to_code(catch_panic(|| kv.mkindex(unsafe { cstr(path) })), err, err_cap)
 }
 
 #[no_mangle]
@@ -295,13 +364,11 @@ pub extern "C" fn kvspaceMkindexExt(
         return 1;
     }
     let kv: &mut dyn KVSpace = unsafe { &mut **h };
-    match kv.ext_index(unsafe { cstr(path) }, unsafe { cstr(ext_path) }) {
-        Ok(()) => 0,
-        Err(e) => {
-            write_err(err, err_cap, &e);
-            1
-        }
-    }
+    result_to_code(
+        catch_panic(|| kv.ext_index(unsafe { cstr(path) }, unsafe { cstr(ext_path) })),
+        err,
+        err_cap,
+    )
 }
 
 #[no_mangle]
@@ -315,13 +382,7 @@ pub extern "C" fn kvspaceRmindexExt(
         return 1;
     }
     let kv: &mut dyn KVSpace = unsafe { &mut **h };
-    match kv.del_ext_index(unsafe { cstr(path) }) {
-        Ok(()) => 0,
-        Err(e) => {
-            write_err(err, err_cap, &e);
-            1
-        }
-    }
+    result_to_code(catch_panic(|| kv.del_ext_index(unsafe { cstr(path) })), err, err_cap)
 }
 
 #[no_mangle]
@@ -354,13 +415,7 @@ pub extern "C" fn kvspaceClear(h: *mut Handle, err: *mut c_char, err_cap: u32) -
         return 1;
     }
     let kv: &mut dyn KVSpace = unsafe { &mut **h };
-    match kv.clear() {
-        Ok(()) => 0,
-        Err(e) => {
-            write_err(err, err_cap, &e);
-            1
-        }
-    }
+    result_to_code(catch_panic(|| kv.clear()), err, err_cap)
 }
 
 #[no_mangle]
@@ -369,13 +424,7 @@ pub extern "C" fn kvspaceDisconnect(h: *mut Handle, err: *mut c_char, err_cap: u
         return 1;
     }
     let kv: &mut dyn KVSpace = unsafe { &mut **h };
-    match kv.dis_conn() {
-        Ok(()) => 0,
-        Err(e) => {
-            write_err(err, err_cap, &e);
-            1
-        }
-    }
+    result_to_code(catch_panic(|| kv.dis_conn()), err, err_cap)
 }
 
 // ── XValue 编解码（head/TLV + 标准标量构造器） ─────────────────────────

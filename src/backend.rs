@@ -356,15 +356,15 @@ impl<S: KVStore> KVSpace for Backend<S> {
         for p in pairs {
             let resolved = self.resolve_path(&p.key);
             if resolved.contains("//") {
-                panic!("Set: double-slash in key {:?}", resolved);
+                return Err(format!("Set: double-slash in key {:?}", resolved));
             }
             match &p.val {
                 XValue::Index(_) | XValue::ExtIndex(_) => {
                     if !Self::is_dir(&resolved) {
-                        panic!(
+                        return Err(format!(
                             "Set: directory-kind value at non-directory key {:?}",
                             resolved
-                        );
+                        ));
                     }
                 }
                 _ => {}
@@ -405,7 +405,7 @@ impl<S: KVStore> KVSpace for Backend<S> {
                     if !local_exists {
                         let ext_nodes = self.read_dir_index(&ext_t);
                         if ext_nodes.iter().any(|n| n == &name) {
-                            panic!("{}: {}", ERR_EXT_WRITE, resolved);
+                            return Err(format!("{}: {}", ERR_EXT_WRITE, resolved));
                         }
                     }
                 }
@@ -538,7 +538,7 @@ impl<S: KVStore> KVSpace for Backend<S> {
                     if !local_exists {
                         let ext_nodes = self.read_dir_index(&ext_t);
                         if ext_nodes.iter().any(|n| n == &name) {
-                            panic!("{}: {}", ERR_EXT_DEL, resolved);
+                            return Err(format!("{}: {}", ERR_EXT_DEL, resolved));
                         }
                     }
                 }
