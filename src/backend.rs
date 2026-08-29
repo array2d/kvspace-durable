@@ -12,7 +12,7 @@ use crate::kvspace_common::{
 use crate::r#const::*;
 use crate::store::KVStore;
 use crate::xvalue::{decode_xvalue, decode_xvalue_head, is_none, is_ptr, ptr_target, XValue};
-use crate::xvalue_index::{new_ext_index, new_index, new_map_index};
+use crate::xvalue_index::{new_ext_index, new_index, new_map_index, new_obj_index};
 
 pub struct Backend<S: KVStore> {
     store: S,
@@ -36,26 +36,26 @@ impl<S: KVStore> Backend<S> {
     }
 
     fn parent_name(path: &str) -> (String, String) {
-        let mut path = path.to_string();
-        if Self::is_dir(&path) && path != PATH_SEP {
-            if path.ends_with(DIR_INDEX_SUF) {
-                path.pop();
-            } else if path.ends_with(OBJ_SEP) {
-                path.pop();
-            }
-        }
-        let (mut parent, last) = sep_path(&path);
-        if parent != PATH_SEP {
-            parent.push_str(DIR_INDEX_SUF);
-        }
-        (parent, last)
+        let clean = if Self::is_dir(path) && path != PATH_SEP {
+            strip_dir_suf(path)
+        } else {
+            path
+        };
+        let (parent, name, _) = split_index(clean);
+        (parent, name)
     }
 
-    fn suffix_for(path: &str) -> &'static str {
-        if path.ends_with(OBJ_SEP) && !path.ends_with(DIR_INDEX_SUF) {
-            OBJ_SEP
+    /// 确保父目录存在：成员目录（尾 ·）建 index，层级目录（尾 /）递归建。
+    fn ensure_parent_dir(&mut self, dir: &str) {
+        if dir == PATH_SEP {
+            return;
+        }
+        if dir.ends_with(OBJ_SEP) {
+            if self.store.get(dir).is_none() {
+                self.store.set(dir, &new_index(&[]).encode());
+            }
         } else {
-            DIR_INDEX_SUF
+            mk_index_recursive(self, dir);
         }
     }
 
@@ -342,17 +342,23 @@ impl<S: KVStore> KVSpace for Backend<S> {
                 self.store.set(&base, &bytes);
                 self.store.set(&mem, &new_index(&[]).encode());
                 let (parent, name) = Self::parent_name(&base);
-                mk_index_recursive(self, &parent);
-                children.push((parent, format!("{}{}", name, OBJ_SEP)));
+                self.ensure_parent_dir(&parent);
+                children.push((parent, name));
                 continue;
             }
 
             if Self::is_dir(&resolved) {
                 let (parent, name) = Self::parent_name(&resolved);
-                mk_index_recursive(self, &parent);
+                self.ensure_parent_dir(&parent);
                 let bytes = p.raw.clone().unwrap_or_else(|| p.val.encode());
                 self.store.set(&resolved, &bytes);
-                children.push((parent, format!("{}{}", name, Self::suffix_for(&resolved))));
+                // 成员目录（尾 ·）注册裸 name（memindex 与容器值同名）；层级目录（尾 /）注册 name/。
+                let child = if resolved.ends_with(OBJ_SEP) {
+                    name
+                } else {
+                    format!("{}{}", name, DIR_INDEX_SUF)
+                };
+                children.push((parent, child));
                 continue;
             }
 
@@ -361,15 +367,19 @@ impl<S: KVStore> KVSpace for Backend<S> {
                 if self.store.get(&parent).is_none() {
                     self.store.set(&parent, &new_index_for_member(&name).encode());
                 }
-                // 自动兜底：坐标段成员 + 容器值不存在 → 建 stringkeymap 值（dims 由坐标推导）。
+                // 自动兜底：容器值不存在 → 坐标段建 stringkeymap，命名成员建 object。
                 let base = strip_dir_suf(&parent);
-                if is_coord(&name) && self.store.get(base).is_none() {
-                    let dims = grow_coord_dims(&[], &[name.clone()]);
-                    self.store.set(base, &new_map_index(&dims).encode());
+                if self.store.get(base).is_none() {
+                    if is_coord(&name) {
+                        let dims = grow_coord_dims(&[], &[name.clone()]);
+                        self.store.set(base, &new_map_index(&dims).encode());
+                    } else {
+                        self.store.set(base, &new_obj_index().encode());
+                    }
                 }
                 let (dp, dn) = Self::parent_name(&parent);
-                mk_index_recursive(self, &dp);
-                children.push((dp, format!("{}{}", dn, OBJ_SEP)));
+                self.ensure_parent_dir(&dp);
+                children.push((dp, dn));
             } else {
                 mk_index_recursive(self, &parent);
             }
@@ -596,7 +606,7 @@ impl<S: KVStore> KVSpace for Backend<S> {
 
         let resolved = self.resolve_parent(path);
         let (parent, name) = Self::parent_name(&resolved);
-        mk_index_recursive(self, &parent);
+        self.ensure_parent_dir(&parent);
 
         let v = new_ext_index(&[], ext_path);
         self.store.set(&resolved, &v.encode());
