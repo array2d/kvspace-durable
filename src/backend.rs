@@ -59,6 +59,36 @@ impl<S: KVStore> Backend<S> {
         }
     }
 
+    /// 写成员时兜底容器值链：leaf base + 沿父链全部中间层（object/stringkeymap）。
+    /// parent 是尾 · 的成员父目录，name 是该成员名；逐层向上建容器值并注册成员到各自 memindex。
+    fn ensure_member_chain(&mut self, parent: &str, name: &str, children: &mut Vec<(String, String)>) {
+        let mut dir = parent.to_string();
+        let mut child = name.to_string();
+        loop {
+            let base = strip_dir_suf(&dir).to_string();
+            if self.store.get(&base).is_none() {
+                if is_coord(&child) {
+                    let dims = grow_coord_dims(&[], &[child.clone()]);
+                    self.store.set(&base, &new_map_index(&dims).encode());
+                } else {
+                    self.store.set(&base, &new_obj_index().encode());
+                }
+            }
+            self.ensure_parent_dir(&dir);
+            children.push((dir.clone(), child));
+            let (dp, dn) = Self::parent_name(&dir);
+            if dp == PATH_SEP {
+                children.push((PATH_SEP.to_string(), dn));
+                break;
+            }
+            if !dp.ends_with(OBJ_SEP) {
+                break;
+            }
+            dir = dp;
+            child = dn;
+        }
+    }
+
     // ── link 解析 ───────────────────────────────────────────────────
 
     fn resolve_path(&self, path: &str) -> String {
@@ -364,22 +394,8 @@ impl<S: KVStore> KVSpace for Backend<S> {
 
             let (parent, name, _) = split_index(&resolved);
             if parent.ends_with(OBJ_SEP) {
-                if self.store.get(&parent).is_none() {
-                    self.store.set(&parent, &new_index_for_member(&name).encode());
-                }
-                // 自动兜底：容器值不存在 → 坐标段建 stringkeymap，命名成员建 object。
-                let base = strip_dir_suf(&parent);
-                if self.store.get(base).is_none() {
-                    if is_coord(&name) {
-                        let dims = grow_coord_dims(&[], &[name.clone()]);
-                        self.store.set(base, &new_map_index(&dims).encode());
-                    } else {
-                        self.store.set(base, &new_obj_index().encode());
-                    }
-                }
-                let (dp, dn) = Self::parent_name(&parent);
-                self.ensure_parent_dir(&dp);
-                children.push((dp, dn));
+                // 沿父链逐层兜底容器值（leaf base + 全部中间层 object/stringkeymap）并注册成员。
+                self.ensure_member_chain(&parent, &name, &mut children);
             } else {
                 mk_index_recursive(self, &parent);
             }
