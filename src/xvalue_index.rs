@@ -1,23 +1,20 @@
 // xvalue_index.rs — 对齐 xvalue_index.go（Index、ObjIndex、ExtIndex）
 
 use crate::r#const::*;
-use crate::xvalue::{ExtIndex, MapIndex, XValue};
+use crate::xvalue::{ExtIndex, XValue};
 
 pub fn new_index(children: &[String]) -> XValue {
     XValue::Index(children.to_vec())
 }
-pub fn new_obj_index(children: &[String]) -> XValue {
-    XValue::Obj(children.to_vec())
+pub fn new_obj_index() -> XValue {
+    XValue::Obj
 }
-/// strkeymapindex 恒 ndim≥1；dims 为空即非法（无维度的字符串键容器是 objindex）。
-pub fn new_map_index(children: &[String], dims: &[i32]) -> XValue {
+/// stringkeymap 恒 ndim≥1；dims 为空即非法（无维度的字符串键容器是 object）。
+pub fn new_map_index(dims: &[i32]) -> XValue {
     if dims.is_empty() {
         panic!("{}", ERR_MAP_NDIM);
     }
-    XValue::Map(MapIndex {
-        childs: children.to_vec(),
-        dims: dims.to_vec(),
-    })
+    XValue::Map(dims.to_vec())
 }
 pub fn new_ext_index(children: &[String], ext_path: &str) -> XValue {
     XValue::ExtIndex(ExtIndex {
@@ -26,7 +23,7 @@ pub fn new_ext_index(children: &[String], ext_path: &str) -> XValue {
     })
 }
 
-/// index/objindex/strkeymapindex 三类 index body 一律前缀 [4B count LE]（成员数），
+/// index/object/stringkeymap 三类 index body 一律前缀 [4B count LE]（成员数），
 /// 后接成员名列表（INDEX_VALUE_SEP 连接）。count 使成员数 O(1) 可取，不再靠 split 现数。
 pub fn encode_index_raw(children: &[String]) -> Vec<u8> {
     let mut buf = (children.len() as u32).to_le_bytes().to_vec();

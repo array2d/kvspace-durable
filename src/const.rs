@@ -29,9 +29,9 @@ pub const ERR_EXT_CASCADE: &str = "kvspace: ExtIndex 不容许级联";
 pub const ERR_EXT_TARGET: &str = "kvspace: ExtIndex target must be an existing ordinary index";
 pub const ERR_EXT_COLLISION: &str = "kvspace: ExtIndex local and extension children overlap";
 pub const ERR_LINK_TYPE_MISMATCH: &str = "kvspace: Link target 和 linkpath 类型不一致";
-pub const ERR_MAP_NDIM: &str = "kvspace: strkeymapindex 恒 ndim>=1，无维度容器应为 objindex";
-pub const ERR_MAP_COORD: &str = "kvspace: strkeymapindex 成员名必须是坐标段 [s0,s1,...]";
-pub const ERR_MEMBER_NAME: &str = "kvspace: objindex 成员名含非法字符";
+pub const ERR_MAP_NDIM: &str = "kvspace: stringkeymap 恒 ndim>=1，无维度容器应为 object";
+pub const ERR_MAP_COORD: &str = "kvspace: stringkeymap 成员名必须是坐标段 [s0,s1,...]";
+pub const ERR_MEMBER_NAME: &str = "kvspace: object 成员名含非法字符";
 pub const ERR_LINK_PATH_EXISTS: &str = "kvspace: Link path already contains a non-link value";
 
 // ── XValueHead kind ─────────────────────────────────────────────────────────
@@ -56,7 +56,7 @@ pub const KIND_INT64: &str = "int64"; // → byte, 8B
 pub const KIND_UINT64: &str = "uint64"; // → byte, 8B
 pub const KIND_FLOAT64: &str = "float64"; // → byte, 8B
 
-pub const KIND_OBJ: &str = "objindex";
-pub const KIND_MAP: &str = "strkeymapindex";
+pub const KIND_OBJ: &str = "object";
+pub const KIND_MAP: &str = "stringkeymap";
 pub const KIND_INDEX: &str = "index";
 pub const KIND_EXT_INDEX: &str = "extindex"; // 扩展索引，写留在上层

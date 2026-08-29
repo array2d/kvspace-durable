@@ -136,17 +136,8 @@ impl XValueHead {
                 XValue::CharAscii(crate::xvalue_byte::decode_char_ascii(body, &dims))
             }
             KIND_CHAR => XValue::Char32(crate::xvalue_byte::decode_char32(body, &dims)),
-            KIND_OBJ => {
-                if body.is_empty() {
-                    XValue::Obj(Vec::new())
-                } else {
-                    XValue::Obj(crate::xvalue_index::decode_obj_index(body))
-                }
-            }
-            KIND_MAP => XValue::Map(MapIndex {
-                childs: crate::xvalue_index::decode_index(body),
-                dims: dims.clone(),
-            }),
+            KIND_OBJ => XValue::Obj,
+            KIND_MAP => XValue::Map(dims.clone()),
             KIND_INDEX => XValue::Index(crate::xvalue_index::decode_index(body)),
             KIND_EXT_INDEX => XValue::ExtIndex(crate::xvalue_index::decode_ext_index(body)),
             _ => XValue::Opaque(Opaque {
@@ -196,8 +187,8 @@ pub enum XValue {
     CharByte(Arr<u8>),  // char/utf8，1B×N
     CharAscii(Arr<u8>), // char/ascii，1B×N
     Char32(Arr<u32>),   // char/utf32，码点，4B×N
-    Obj(Vec<String>),   // objindex（命名成员对象：键为任意字符串，值 json）
-    Map(MapIndex), // strkeymapindex（散 key ndarray：键为坐标段 [s0,s1,...]，恒 ndim≥1）
+    Obj,   // object（命名成员对象）：成员列表在 memindex（p·）
+    Map(Vec<i32>), // stringkeymap（散 key ndarray）：dims 是逻辑形状，成员在 memindex（p·）
     Index(Vec<String>), // index
     ExtIndex(ExtIndex), // extindex
     Opaque(Opaque),     // 未知 kind（如 kvlang 的 rwir/rwfunc/scope），原样存取
@@ -222,7 +213,7 @@ impl XValue {
             XValue::CharByte(_) => KIND_CHAR_UTF8,
             XValue::CharAscii(_) => KIND_CHAR_ASCII,
             XValue::Char32(_) => KIND_CHAR,
-            XValue::Obj(_) => KIND_OBJ,
+            XValue::Obj => KIND_OBJ,
             XValue::Map(_) => KIND_MAP,
             XValue::Index(_) => KIND_INDEX,
             XValue::ExtIndex(_) => KIND_EXT_INDEX,
@@ -252,8 +243,8 @@ impl XValue {
             XValue::CharByte(d) => d.data.len() as i32,
             XValue::CharAscii(d) => d.data.len() as i32,
             XValue::Char32(d) => (d.data.len() * 4) as i32,
-            XValue::Obj(d) => crate::xvalue_index::encode_index_raw(d).len() as i32,
-            XValue::Map(m) => crate::xvalue_index::encode_index_raw(&m.childs).len() as i32,
+            XValue::Obj => 0,
+            XValue::Map(_) => 1,
             XValue::Index(d) => crate::xvalue_index::encode_index_raw(d).len() as i32,
             XValue::ExtIndex(e) => {
                 crate::xvalue_index::encode_ext_index_raw(&e.ext_path, &e.childs).len() as i32
@@ -280,8 +271,8 @@ impl XValue {
             XValue::CharByte(d) => d.data.len() as i32,
             XValue::CharAscii(d) => d.data.len() as i32,
             XValue::Char32(d) => d.data.len() as i32,
-            XValue::Obj(_) => 1,
-            XValue::Map(m) => m.dims.iter().product(),
+            XValue::Obj => 1,
+            XValue::Map(dims) => dims.iter().product(),
             XValue::Index(_) => 1,
             XValue::ExtIndex(_) => 1,
             XValue::Opaque(o) => o.array_len,
@@ -306,14 +297,8 @@ impl XValue {
             XValue::CharByte(d) => crate::xvalue_byte::encode_char_byte(&d.data, &d.dims),
             XValue::CharAscii(d) => crate::xvalue_byte::encode_char_ascii(&d.data, &d.dims),
             XValue::Char32(d) => crate::xvalue_byte::encode_char32(&d.data, &d.dims),
-            XValue::Obj(d) => {
-                let raw = crate::xvalue_index::encode_index_raw(d);
-                tlv_encode(KIND_OBJ, &raw, 1)
-            }
-            XValue::Map(m) => {
-                let raw = crate::xvalue_index::encode_index_raw(&m.childs);
-                encode_head(KIND_MAP, 0, &m.dims, &raw)
-            }
+            XValue::Obj => tlv_encode(KIND_OBJ, &[], 1),
+            XValue::Map(dims) => encode_head(KIND_MAP, 0, dims, &[]),
             XValue::Index(d) => {
                 let raw = crate::xvalue_index::encode_index_raw(d);
                 tlv_encode(KIND_INDEX, &raw, 1)
@@ -348,15 +333,14 @@ impl XValue {
                 .iter()
                 .map(|&c| char::from_u32(c).unwrap_or('\u{FFFD}'))
                 .collect(),
-            XValue::Obj(d) => obj_value_string(d),
-            XValue::Map(m) => format!(
-                "map[{}]{{{}}}",
-                m.dims
+            XValue::Obj => KIND_OBJ.to_string(),
+            XValue::Map(dims) => format!(
+                "map[{}]",
+                dims
                     .iter()
                     .map(|d| d.to_string())
                     .collect::<Vec<_>>()
-                    .join(","),
-                m.childs.len()
+                    .join(",")
             ),
             XValue::Index(d) => index_value_string(d),
             XValue::ExtIndex(e) => e.value_string(),
@@ -412,14 +396,6 @@ pub struct ExtIndex {
     pub ext_path: String,
 }
 
-/// strkeymapindex：散 key ndarray。dims 是逻辑形状（恒 ndim≥1），childs 是实际存在的坐标段成员。
-/// 二者可不一致：坐标可缺席，缺席坐标读为 None。
-#[derive(Clone, Debug, PartialEq)]
-pub struct MapIndex {
-    pub childs: Vec<String>,
-    pub dims: Vec<i32>,
-}
-
 impl ExtIndex {
     pub fn value_string(&self) -> String {
         if !self.ext_path.is_empty() {
@@ -438,16 +414,6 @@ pub struct Opaque {
     pub kind: String,
     pub body: Vec<u8>,
     pub array_len: i32,
-}
-
-fn obj_value_string(childs: &[String]) -> String {
-    if childs.len() == 1 && childs[0].is_empty() {
-        "{empty}".to_string()
-    } else if childs.is_empty() {
-        KIND_OBJ.to_string()
-    } else {
-        format!("{{{}}}", childs.len())
-    }
 }
 
 fn index_value_string(childs: &[String]) -> String {
@@ -658,7 +624,7 @@ mod tests {
             data: vec![1, 2, 3, 4, 5, 6],
             dims: vec![2, 3],
         }));
-        roundtrip(&XValue::Obj(vec!["a".to_string(), "b".to_string()]));
+        roundtrip(&XValue::Obj);
     }
 
     #[test]

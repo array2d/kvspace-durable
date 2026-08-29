@@ -42,7 +42,7 @@ pub fn sep_path(path: &str) -> (String, String) {
 }
 
 /// SepKind 统一 KV 路径中 index 目录分隔符的种类。
-/// / → SepDir（层级目录）；· → SepDict（成员目录，含 objindex 成员与 strkeymapindex 坐标段）。
+/// / → SepDir（层级目录）；· → SepDict（成员目录，含 object 成员与 stringkeymap 坐标段）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SepKind {
     SepDir,

@@ -18,7 +18,7 @@ use crate::xvalue_index::{new_ext_index, new_index, new_map_index, new_obj_index
 const EXTINDEX_MARKER: &str = "__extindex__";
 const SELF_MARKER: &str = "__self__";
 const ORDER_MARKER: &str = "__order__";
-/// strkeymapindex 成员目录标记，内容为 dims（逗号分隔）。readdir 派生不出 kind 与 dims，故显式落盘。
+/// stringkeymap 成员目录标记，内容为 dims（逗号分隔）。readdir 派生不出 kind 与 dims，故显式落盘。
 const MAP_MARKER: &str = "__map__";
 
 pub struct FsKVSpace {
@@ -328,25 +328,13 @@ impl FsKVSpace {
         children
     }
 
-    /// 目录 key 的 XValue：dict → ObjIndex，hierarchy → ExtIndex（有 marker）或 Index。
+    /// 目录 key 的 XValue：统一为 index（memindex）；ExtIndex 有 marker 时为 extindex。
     /// 不存在的目录返回 None（对齐 redis 后端：目录 key 不存在 → None）。
     fn dir_value(&self, dir_key: &str) -> XValue {
         if dir_key.contains("//") || !self.fs_path(dir_key).is_dir() {
             return XValue::None;
         }
-        let mut children = self.dir_children(dir_key);
-        if dir_key.ends_with(OBJ_SEP) {
-            if let Ok(b) = fs::read(self.fs_path(dir_key).join(MAP_MARKER)) {
-                let dims: Vec<i32> = String::from_utf8_lossy(&b)
-                    .split(',')
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.parse().unwrap_or(0))
-                    .collect();
-                children.sort_by(|a, b| cmp_coord(a, b));
-                return new_map_index(&children, &dims);
-            }
-            return new_obj_index(&children);
-        }
+        let children = self.dir_children(dir_key);
         let marker = self.fs_path(dir_key).join(EXTINDEX_MARKER);
         if let Ok(b) = fs::read(&marker) {
             let ext_path = String::from_utf8_lossy(&b).into_owned();
@@ -433,23 +421,28 @@ impl KVSpace for FsKVSpace {
                 self.add_order(&parent, &format!("{}{}", name, Self::suffix_for(&resolved)));
                 continue;
             }
-            if let XValue::Obj(_) = &p.val {
-                let (parent, name) = Self::parent_name(&resolved);
-                self.ensure_dir(&resolved);
+            if let XValue::Obj = &p.val {
+                let base = if resolved == PATH_SEP {
+                    resolved.clone()
+                } else {
+                    strip_dir_suf(&resolved).to_string()
+                };
+                let (parent, name) = Self::parent_name(&base);
+                self.write_leaf(&base, &p.raw.clone().unwrap_or_else(|| p.val.encode()));
+                self.ensure_dir(&format!("{}{}", base, OBJ_SEP));
                 self.add_order(&parent, &format!("{}{}", name, OBJ_SEP));
                 continue;
             }
-            // map 成员是 `m·[i,j]`，与 obj 同为 `·` 成员目录；dims 落 __map__ 标记。
-            if let XValue::Map(m) = &p.val {
-                let (parent, name) = Self::parent_name(&resolved);
-                self.ensure_dir(&resolved);
-                let dims = m
-                    .dims
-                    .iter()
-                    .map(|d| d.to_string())
-                    .collect::<Vec<_>>()
-                    .join(",");
-                let _ = fs::write(self.fs_path(&resolved).join(MAP_MARKER), dims.as_bytes());
+            if let XValue::Map(dims) = &p.val {
+                let base = if resolved == PATH_SEP {
+                    resolved.clone()
+                } else {
+                    strip_dir_suf(&resolved).to_string()
+                };
+                let (parent, name) = Self::parent_name(&base);
+                self.write_leaf(&base, &p.raw.clone().unwrap_or_else(|| p.val.encode()));
+                self.ensure_dir(&format!("{}{}", base, OBJ_SEP));
+                let _ = dims;
                 self.add_order(&parent, &format!("{}{}", name, OBJ_SEP));
                 continue;
             }
@@ -466,24 +459,17 @@ impl KVSpace for FsKVSpace {
             let bytes = p.raw.clone().unwrap_or_else(|| p.val.encode());
             self.write_leaf(&resolved, &bytes);
             self.add_order(&parent, &name);
-            // 坐标段成员写入未显式创建的成员目录 → 落 __map__ 标记，dir_value 才能还原 map。
-            if parent.ends_with(OBJ_SEP)
-                && is_coord(&name)
-                && !self.fs_path(&parent).join(MAP_MARKER).exists()
-            {
-                let mut names = self.dir_children(&parent);
-                if !names.contains(&name) {
-                    names.push(name.clone());
+            // 坐标段成员写入未显式创建容器 → 自动建 stringkeymap 值（dims 由坐标推导）。
+            if parent.ends_with(OBJ_SEP) && is_coord(&name) {
+                let base = strip_dir_suf(&parent);
+                if !self.fs_path(base).exists() {
+                    let mut names = self.dir_children(&parent);
+                    if !names.contains(&name) {
+                        names.push(name.clone());
+                    }
+                    let dims = grow_coord_dims(&[], &names);
+                    self.write_leaf(base, &new_map_index(&dims).encode());
                 }
-                let dims = grow_coord_dims(&[], &names);
-                let _ = fs::write(
-                    self.fs_path(&parent).join(MAP_MARKER),
-                    dims.iter()
-                        .map(|d| d.to_string())
-                        .collect::<Vec<_>>()
-                        .join(",")
-                        .as_bytes(),
-                );
             }
         }
         Ok(())
@@ -502,6 +488,16 @@ impl KVSpace for FsKVSpace {
             return Vec::new();
         }
         let mut members = self.dir_children(&resolved);
+
+        // stringkeymap：容器值（无后缀 p）的 kind 决定 row-major 升序。
+        if resolved.ends_with(OBJ_SEP) {
+            let base = strip_dir_suf(&resolved);
+            if let Some(data) = self.read_leaf(base) {
+                if decode_xvalue_head(&data).kind() == KIND_MAP {
+                    members.sort_by(|a, b| cmp_coord(a, b));
+                }
+            }
+        }
 
         if expand_ext {
             let ext_t = self.prefix_ext(&resolved);
