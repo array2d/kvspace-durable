@@ -77,15 +77,15 @@ impl<S: KVStore> Backend<S> {
             self.ensure_parent_dir(&dir);
             children.push((dir.clone(), child));
             let (dp, dn) = Self::parent_name(&dir);
-            if dp == PATH_SEP {
-                children.push((PATH_SEP.to_string(), dn));
-                break;
+            if dp.ends_with(OBJ_SEP) {
+                // 父仍是成员目录：继续沿链上溯（多级 ·）。
+                dir = dp;
+                child = dn;
+                continue;
             }
-            if !dp.ends_with(OBJ_SEP) {
-                break;
-            }
-            dir = dp;
-            child = dn;
+            // 父是目录（或根）：把成员名 dn 注册进父 index，链到此为止。
+            children.push((dp, dn));
+            break;
         }
     }
 
@@ -256,10 +256,9 @@ impl<S: KVStore> Backend<S> {
     }
 }
 
-/// 成员目录（memindex，`·` 结尾）新建时恒为 index；成员顺序/kind 由容器值 object/stringkeymap 决定。
+/// 成员目录（memindex，`·` 结尾）新建时注册首个成员；成员顺序/kind 由容器值 object/stringkeymap 决定。
 fn new_index_for_member(name: &str) -> XValue {
-    let _ = name;
-    new_index(&[])
+    new_index(&[name.to_string()])
 }
 
 fn normalize_children(children: Vec<String>) -> Vec<String> {

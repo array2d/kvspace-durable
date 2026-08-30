@@ -74,6 +74,8 @@ pub fn split_index(path: &str) -> (String, String, SepKind) {
 }
 
 /// MkIndexRecursive 递归创建目录，已存在的目录跳过。
+/// 用 split_index（而非 sep_path）切父目录，使 `·` 成员目录（如 /lib/math·sum/）按
+/// 其真实父 memindex `/lib/math·` 判定存在性，避免把已有成员目录误判为缺失而重建覆盖。
 pub fn mk_index_recursive(kv: &mut dyn KVSpace, path: &str) {
     if !path.ends_with(DIR_INDEX_SUF) {
         panic!("MkIndex: path must end with {}", DIR_INDEX_SUF);
@@ -85,10 +87,7 @@ pub fn mk_index_recursive(kv: &mut dyn KVSpace, path: &str) {
             Some(j) => {
                 i += j + 1;
                 let dir = &path[..i];
-                let (mut p, n) = sep_path(&dir[..dir.len() - 1]);
-                if p != PATH_SEP {
-                    p.push_str(DIR_INDEX_SUF);
-                }
+                let (p, n, _) = split_index(&dir[..dir.len() - 1]);
                 if !dir_exists(kv, &p, &n) {
                     let _ = kv.set(&[KVPair {
                         key: dir.to_string(),
