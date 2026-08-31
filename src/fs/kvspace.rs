@@ -386,8 +386,19 @@ impl KVSpace for FsKVSpace {
         if p != PATH_SEP {
             p.push_str(DIR_INDEX_SUF);
         }
-        let full = join_path(&self.resolve_path(&p), &l);
-        self.read_leaf(&full).unwrap_or_default()
+        let p = self.resolve_path(&p);
+        let full = join_path(&p, &l);
+        if let Some(data) = self.read_leaf(&full) {
+            return data;
+        }
+        let ext_t = self.prefix_ext(&p);
+        if !ext_t.is_empty() {
+            let ext_full = join_path(&ext_t, &l);
+            if let Some(data) = self.read_leaf(&ext_full) {
+                return data;
+            }
+        }
+        Vec::new()
     }
 
     fn set(&mut self, pairs: &[KVPair]) -> Result<(), String> {
