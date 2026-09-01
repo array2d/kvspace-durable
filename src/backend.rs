@@ -61,7 +61,12 @@ impl<S: KVStore> Backend<S> {
 
     /// 写成员时兜底容器值链：leaf base + 沿父链全部中间层（object/stringkeymap）。
     /// parent 是尾 · 的成员父目录，name 是该成员名；逐层向上建容器值并注册成员到各自 memindex。
-    fn ensure_member_chain(&mut self, parent: &str, name: &str, children: &mut Vec<(String, String)>) {
+    fn ensure_member_chain(
+        &mut self,
+        parent: &str,
+        name: &str,
+        children: &mut Vec<(String, String)>,
+    ) {
         let mut dir = parent.to_string();
         let mut child = name.to_string();
         loop {
@@ -104,11 +109,7 @@ impl<S: KVStore> Backend<S> {
 
     fn resolve_parent(&self, path: &str) -> String {
         let dir_suf = Self::is_dir(path) && path != PATH_SEP;
-        let clean = if dir_suf {
-            strip_dir_suf(path)
-        } else {
-            path
-        };
+        let clean = if dir_suf { strip_dir_suf(path) } else { path };
         let (parent, last) = sep_path(clean);
         if parent == clean {
             return path.to_string();
@@ -356,7 +357,7 @@ impl<S: KVStore> KVSpace for Backend<S> {
                 _ => {}
             }
             if let XValue::Ptr(ptr) = &p.val {
-                validate_ptr(self, &ptr.target, &ptr.kind, ptr.array_len)?;
+                validate_ptr(self, &ptr.target, &ptr.target_kindexpr)?;
             }
 
             // 容器值（object/stringkeymap）：值存 p（无后缀），memindex 存 p·（空 index，成员后续写入维护）。

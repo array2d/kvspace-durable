@@ -6,8 +6,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::coord::{cmp_coord, grow_coord_dims, is_coord, parse_coord};
 use crate::kvspace::{KVPair, KVSpace};
-use crate::coord::{cmp_coord, is_coord, parse_coord, grow_coord_dims};
 use crate::kvspace_common::{
     join_path, sep_path, split_index, strip_dir_suf, validate_ptr, watch_value, SepKind,
 };
@@ -209,11 +209,7 @@ impl FsKVSpace {
 
     fn resolve_parent(&self, path: &str) -> String {
         let dir_suf = Self::is_dir_key(path) && path != PATH_SEP;
-        let clean = if dir_suf {
-            strip_dir_suf(path)
-        } else {
-            path
-        };
+        let clean = if dir_suf { strip_dir_suf(path) } else { path };
         let (parent, last) = sep_path(clean);
         if parent == clean {
             return path.to_string();
@@ -419,7 +415,7 @@ impl KVSpace for FsKVSpace {
                 _ => {}
             }
             if let XValue::Ptr(ptr) = &p.val {
-                validate_ptr(self, &ptr.target, &ptr.kind, ptr.array_len)?;
+                validate_ptr(self, &ptr.target, &ptr.target_kindexpr)?;
             }
 
             // 目录 index 值：结构派生，无需存；ExtIndex 写 marker。

@@ -109,33 +109,22 @@ pub fn dir_exists(kv: &mut dyn KVSpace, parent_dir: &str, name: &str) -> bool {
     false
 }
 
-/// ValidatePtr 检查 Ptr 的 kind/arraylen 与目标值的匹配。
+/// ValidatePtr：指针只解引用一跳，目标的完整 kindexpr 必须与指针声明的 target_kindexpr 相等。
+/// 因此 *int 指向一个本身是 *int 的目标会被拒绝（声明 int ≠ 实际 *int）——不可连续解引用。
 pub fn validate_ptr(
     kv: &mut dyn KVSpace,
     target: &str,
-    ptr_kind: &str,
-    ptr_array_len: i32,
+    target_kindexpr: &str,
 ) -> Result<(), String> {
     let v = get_one(kv, target);
-    if is_none(&v) {
+    if is_none(&v) || target_kindexpr.is_empty() {
         return Ok(());
     }
-    if !ptr_kind.is_empty() && v.kind() != ptr_kind {
+    let actual = crate::xvalue::decode_xvalue_head(&v.encode()).kindexpr;
+    if actual != target_kindexpr {
         return Err(format!(
             "{}: ptr kind mismatch: target {} is {}, ptr expects {}",
-            ERR_LINK_TYPE_MISMATCH,
-            target,
-            v.kind(),
-            ptr_kind
-        ));
-    }
-    if ptr_array_len > 0 && v.array_len() != ptr_array_len {
-        return Err(format!(
-            "{}: ptr arraylen mismatch: target {} has {}, ptr expects {}",
-            ERR_INVALID_VALUE,
-            target,
-            v.array_len(),
-            ptr_array_len
+            ERR_LINK_TYPE_MISMATCH, target, actual, target_kindexpr
         ));
     }
     Ok(())

@@ -6,7 +6,7 @@ use crate::r#const::*;
 
 // ── XValueHead ─────────────────────────────────────────────────────────────
 // XValueHead = [1B kindexprlen][kindexpr 含 0x00 padding][1B ro][4B vid LE][4B body_len LE]
-//   kindexpr 串首字节 * =软链接 / @ =扩展句柄 / 无 =内联，其后 [d0,d1]kind 承载 ndim+dims：
+//   kindexpr 串首字节 * =指针 / @ =扩展句柄 / 无 =内联，其后 [d0,d1]kind 承载 ndim+dims：
 //   裸 kind=标量(ndim=0)、[n]kind=一维、[d0,d1]kind=多维。kindexprlen 为槽总长（含 padding），
 //   reshape 时新 kindexpr 不超过槽长即可原地改写不搬 body；内容以首个 NUL 终止。
 
@@ -112,9 +112,12 @@ impl XValueHead {
     pub fn decode(&self, body: &[u8]) -> XValue {
         if self.is_ptr() {
             return XValue::Ptr(Ptr {
-                kind: self.kind(),
+                target_kindexpr: self
+                    .kindexpr
+                    .strip_prefix('*')
+                    .unwrap_or(&self.kindexpr)
+                    .to_string(),
                 target: String::from_utf8_lossy(body).into_owned(),
-                array_len: self.array_len(),
             });
         }
         let kind = self.kind();
@@ -187,8 +190,8 @@ pub enum XValue {
     CharByte(Arr<u8>),  // char/utf8，1B×N
     CharAscii(Arr<u8>), // char/ascii，1B×N
     Char32(Arr<u32>),   // char/utf32，码点，4B×N
-    Obj,   // object（命名成员对象）：成员列表在 memindex（p·）
-    Map(Vec<i32>), // stringkeymap（散 key ndarray）：dims 是逻辑形状，成员在 memindex（p·）
+    Obj,                // object（命名成员对象）：成员列表在 memindex（p·）
+    Map(Vec<i32>),      // stringkeymap（散 key ndarray）：dims 是逻辑形状，成员在 memindex（p·）
     Index(Vec<String>), // index
     ExtIndex(ExtIndex), // extindex
     Opaque(Opaque),     // 未知 kind（如 kvlang 的 rwir/rwfunc/scope），原样存取
@@ -198,7 +201,7 @@ impl XValue {
     pub fn kind(&self) -> &str {
         match self {
             XValue::None => "",
-            XValue::Ptr(p) => p.kind.as_str(),
+            XValue::Ptr(p) => p.target_kindexpr.as_str(),
             XValue::Bool(_) => KIND_BOOL,
             XValue::Int8(_) => KIND_INT8,
             XValue::Int16(_) => KIND_INT16,
@@ -256,7 +259,7 @@ impl XValue {
     pub fn array_len(&self) -> i32 {
         match self {
             XValue::None => 0,
-            XValue::Ptr(p) => p.array_len,
+            XValue::Ptr(_) => 1,
             XValue::Bool(d) => d.data.len() as i32,
             XValue::Int8(d) => d.data.len() as i32,
             XValue::Int16(d) => d.data.len() as i32,
@@ -282,7 +285,7 @@ impl XValue {
     pub fn encode(&self) -> Vec<u8> {
         match self {
             XValue::None => Vec::new(),
-            XValue::Ptr(p) => tlv_encode_ptr(&p.kind, p.target.as_bytes(), p.array_len),
+            XValue::Ptr(p) => tlv_encode_ptr(&p.target_kindexpr, p.target.as_bytes()),
             XValue::Bool(d) => crate::xvalue_bool::encode_bool(&d.data, &d.dims),
             XValue::Int8(d) => crate::xvalue_int::encode_int8(&d.data, &d.dims),
             XValue::Int16(d) => crate::xvalue_int::encode_int16(&d.data, &d.dims),
@@ -336,8 +339,7 @@ impl XValue {
             XValue::Obj => KIND_OBJ.to_string(),
             XValue::Map(dims) => format!(
                 "map[{}]",
-                dims
-                    .iter()
+                dims.iter()
                     .map(|d| d.to_string())
                     .collect::<Vec<_>>()
                     .join(",")
@@ -351,7 +353,7 @@ impl XValue {
     pub fn code_string(&self) -> String {
         match self {
             XValue::None => KIND_NONE.to_string(),
-            XValue::Ptr(p) => format!("→{}:{}", p.target, p.kind),
+            XValue::Ptr(p) => format!("→{}:{}", p.target, p.target_kindexpr),
             _ => format!("{}:{}", self.kind(), self.value_string()),
         }
     }
@@ -367,16 +369,14 @@ impl std::fmt::Display for XValue {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Ptr {
-    pub kind: String,   // 目标类型
-    pub target: String, // 目标 key 路径
-    pub array_len: i32,
+    pub target_kindexpr: String, // 目标的完整 kindexpr（含其自身的 */@/[dims]）
+    pub target: String,          // 目标 key 路径
 }
 
-pub fn new_ptr(kind: &str, target: &str, array_len: i32) -> XValue {
+pub fn new_ptr(target_kindexpr: &str, target: &str) -> XValue {
     XValue::Ptr(Ptr {
-        kind: kind.to_string(),
+        target_kindexpr: target_kindexpr.to_string(),
         target: target.to_string(),
-        array_len,
     })
 }
 
@@ -456,15 +456,17 @@ fn bool_string(b: bool) -> String {
 // XValue = XValueHead + body。
 // XValueHead = [1B kind_len][kind][1B ref|ro][1B ndim][4B vid LE][ndim×4B dims][padding][4B raw_len]
 // body       = [raw]，offset = head_len()。
-// ref: 0=内联 1=软链接(*) 2=扩展句柄(@)；ref=1 时 body 为目标 key 路径。None 编码为 nil。
+// ref: 0=内联 1=指针(*) 2=扩展句柄(@)；ref=1 时 head kindexpr 去 * 即目标完整 kindexpr，
+// body 为目标 key 路径。None 编码为 nil。
 
 pub fn tlv_encode(kind: &str, raw: &[u8], array_len: i32) -> Vec<u8> {
     encode_head(kind, 0, &array_to_header(kind, array_len), raw)
 }
 
-pub fn tlv_encode_ptr(kind: &str, raw: &[u8], array_len: i32) -> Vec<u8> {
-    let array_len = if array_len <= 0 { 1 } else { array_len };
-    encode_head(kind, 1, &array_to_header(kind, array_len), raw)
+/// 指针编码：head kindexpr = "*" + 目标完整 kindexpr（不再从 array_len 派生 dims，
+/// 目标的形状/引用性都在 target_kindexpr 内），body = 目标 key 路径。
+pub fn tlv_encode_ptr(target_kindexpr: &str, raw: &[u8]) -> Vec<u8> {
+    encode_head(target_kindexpr, 1, &[], raw)
 }
 
 /// array_len → dims：char/* 恒一维（含空串/单字符）；其余标量(≤1)=0 维、多元素=1 维。
@@ -619,7 +621,7 @@ mod tests {
         roundtrip(&new_bool(&[true]));
         roundtrip(&new_char_byte(b"hello"));
         roundtrip(&new_char_byte(b""));
-        roundtrip(&new_ptr("int64", "/x/y", 1));
+        roundtrip(&new_ptr("int64", "/x/y"));
         roundtrip(&XValue::Int32(Arr {
             data: vec![1, 2, 3, 4, 5, 6],
             dims: vec![2, 3],

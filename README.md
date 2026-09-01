@@ -25,7 +25,7 @@ C ABI exported from the cdylib (`src/ffi.rs`):
 - KV ops: `kvspaceGet`, `kvspaceGetBatch`, `kvspaceSet`, `kvspaceList`, `kvspaceDel`, `kvspaceDelTree`
 - directories / extindex: `kvspaceMkindex`, `kvspaceMkindexExt`, `kvspaceRmindexExt`
 - watch / clear: `kvspaceWatch`, `kvspaceClear`
-- XValue codec: `kvspaceTlvEncode`, `kvspaceTlvEncodePtr`, `kvspaceTlvEncodeMode`, `kvspaceDecodeHead`, `kvspaceNewPtr`, `kvspaceNewChar`, `kvspaceNewCharByte`, `kvspaceNewBool`, `kvspaceNewInt64`, `kvspaceNewFloat64`
+- XValue codec: `kvspaceTlvEncode`, `kvspaceTlvEncodeMode`, `kvspaceDecodeHead`, `kvspaceNewPtr`, `kvspaceNewChar`, `kvspaceNewCharByte`, `kvspaceNewBool`, `kvspaceNewInt64`, `kvspaceNewFloat64`
 
 The same ABI is implemented by `kvspace-c` (`shm://`), so a consumer (e.g. the kvlang layout) switches backends by DSN only, with no code change.
 

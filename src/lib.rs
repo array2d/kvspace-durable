@@ -6,8 +6,8 @@
 // kvspace_common.go → kvspace_common.rs，conn.go → conn.rs，redis/kvspace.go → backend.rs + redis/store.rs。
 // 后端：redis、fs（goheap/shm 不属本项目）。
 
-pub mod coord;
 pub mod r#const;
+pub mod coord;
 pub mod xvalue;
 pub mod xvalue_bool;
 pub mod xvalue_byte;

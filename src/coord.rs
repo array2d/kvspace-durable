@@ -59,7 +59,11 @@ pub fn cmp_coord(a: &str, b: &str) -> Ordering {
 
 /// 坐标是否落在 dims 内（维数相符且逐维小于）。
 pub fn coord_in_dims(coords: &[i64], dims: &[i32]) -> bool {
-    coords.len() == dims.len() && coords.iter().zip(dims).all(|(&c, &d)| c >= 0 && c < d as i64)
+    coords.len() == dims.len()
+        && coords
+            .iter()
+            .zip(dims)
+            .all(|(&c, &d)| c >= 0 && c < d as i64)
 }
 
 /// 一维 dims 至少容纳坐标 v（max(dims[0], v+1)），dims 为空时起算为 1。

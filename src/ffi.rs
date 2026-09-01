@@ -335,7 +335,11 @@ pub extern "C" fn kvspaceDelTree(
         return 1;
     }
     let kv: &mut dyn KVSpace = unsafe { &mut **h };
-    result_to_code(catch_panic(|| kv.del_tree(unsafe { cstr(prefix) })), err, err_cap)
+    result_to_code(
+        catch_panic(|| kv.del_tree(unsafe { cstr(prefix) })),
+        err,
+        err_cap,
+    )
 }
 
 #[no_mangle]
@@ -349,7 +353,11 @@ pub extern "C" fn kvspaceMkindex(
         return 1;
     }
     let kv: &mut dyn KVSpace = unsafe { &mut **h };
-    result_to_code(catch_panic(|| kv.mkindex(unsafe { cstr(path) })), err, err_cap)
+    result_to_code(
+        catch_panic(|| kv.mkindex(unsafe { cstr(path) })),
+        err,
+        err_cap,
+    )
 }
 
 #[no_mangle]
@@ -382,7 +390,11 @@ pub extern "C" fn kvspaceRmindexExt(
         return 1;
     }
     let kv: &mut dyn KVSpace = unsafe { &mut **h };
-    result_to_code(catch_panic(|| kv.del_ext_index(unsafe { cstr(path) })), err, err_cap)
+    result_to_code(
+        catch_panic(|| kv.del_ext_index(unsafe { cstr(path) })),
+        err,
+        err_cap,
+    )
 }
 
 #[no_mangle]
@@ -450,26 +462,6 @@ pub extern "C" fn kvspaceTlvEncode(
     )
 }
 
-/// 通用 TLV 编码（软链接，ref=1），body 为目标 key 路径。
-#[no_mangle]
-pub extern "C" fn kvspaceTlvEncodePtr(
-    kind: *const c_char,
-    raw: *const u8,
-    raw_len: u32,
-    dims: *const i32,
-    ndim: i32,
-    out: *mut *mut u8,
-    out_len: *mut u32,
-) -> c_int {
-    let raw = unsafe { std::slice::from_raw_parts(raw, raw_len as usize) };
-    let dims = ffi_dims(dims, ndim);
-    alloc(
-        encode_head(unsafe { cstr(kind) }, 1, dims, raw),
-        out,
-        out_len,
-    )
-}
-
 /// 带权限编码：显式指定 ref（0/1/2）、ro（1=只读）、vid。用于权限位落盘。
 #[no_mangle]
 pub extern "C" fn kvspaceTlvEncodeMode(
@@ -521,13 +513,12 @@ pub extern "C" fn kvspaceDecodeHead(
 
 #[no_mangle]
 pub extern "C" fn kvspaceNewPtr(
-    kind: *const c_char,
+    target_kindexpr: *const c_char,
     target: *const c_char,
-    array_len: i32,
     out: *mut *mut u8,
     out_len: *mut u32,
 ) -> c_int {
-    let v = new_ptr(unsafe { cstr(kind) }, unsafe { cstr(target) }, array_len);
+    let v = new_ptr(unsafe { cstr(target_kindexpr) }, unsafe { cstr(target) });
     alloc(v.encode(), out, out_len)
 }
 

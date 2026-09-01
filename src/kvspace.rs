@@ -17,8 +17,9 @@ pub struct KVPair {
 /// 先自旋（无 sleep），随后轮询间隔按指数回退，封顶 tickDuration。
 /// 生产者只需 Set(key, targetValue)；无通知队列，跨进程/节点/后端通用。
 ///
-/// 软链接透明穿透：Set 写入 Ptr 值（*kind:target）后，访问 /linkpath/x 透明地访问 target/x。
-/// 删除语义例外（POSIX rm 式）：Del/DelTree 的最终组件作用于链接本体，不穿透 target。
+/// 路径寻址穿透：Set 写入 Ptr 值（*target_kindexpr，body=target）后，访问 /ptrpath/x 经目录前缀
+/// 解析定位到 target/x（仅寻址，单跳；解引用取值只一跳，不连续追 Ptr 链）。
+/// 删除语义例外（POSIX rm 式）：Del/DelTree 的最终组件作用于指针本体，不穿透 target。
 pub trait KVSpace {
     /// 校验目录前缀（/、或以 / 或 · 结尾）。非法返回 Err，供 C ABI 边界在调用前短路。
     fn validate_dir(&self, path: &str) -> Result<(), String> {
