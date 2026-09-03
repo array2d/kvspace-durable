@@ -51,6 +51,12 @@ pub trait KVSpace {
     /// 递归删除；prefix 本身是链接则只删链接。
     fn del_tree(&mut self, prefix: &str) -> Result<(), String>;
 
+    /// 单 key 拷贝（src → dst），XValue 原样，不含成员子树。对齐 unix cp。
+    fn cp(&mut self, src: &str, dst: &str) -> Result<(), String>;
+    /// 递归拷贝以 src 为根的整棵子树到 dst（含 memindex 与全部成员）。对齐 unix cp -r。
+    /// extindex 成员复制其扩展句柄 → dst 侧生成指向同一只读扩展的新 extindex。
+    fn cp_tree(&mut self, src: &str, dst: &str) -> Result<(), String>;
+
     /// 阻塞等待 Get(key)==targetValue。
     fn watch(&mut self, key: &str, target_value: &XValue, tick_duration: Duration) -> XValue;
 

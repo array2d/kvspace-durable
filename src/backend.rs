@@ -579,6 +579,66 @@ impl<S: KVStore> KVSpace for Backend<S> {
         Ok(())
     }
 
+    /// 单 key 拷贝：src 处 XValue（head+body 原样）写到 dst，并注册进 dst 父 index；不触碰 src·/成员。
+    fn cp(&mut self, src: &str, dst: &str) -> Result<(), String> {
+        let raw = self.get_raw(src);
+        if raw.is_empty() {
+            return Err(format!("Cp: source not found: {}", src));
+        }
+        let v = decode_xvalue(&raw);
+        self.set(&[KVPair {
+            key: dst.to_string(),
+            val: v,
+            raw: Some(raw),
+        }])
+    }
+
+    /// 递归子树拷贝：以 src 为根，把整棵物理子树（base + 所有 ·/ 后代 key）字节级重映射到 dst。
+    /// extindex 成员的 marker（含 ext_path）原样复制 → 在 dst 侧生成指向同一只读扩展的新 extindex。
+    fn cp_tree(&mut self, src: &str, dst: &str) -> Result<(), String> {
+        let src_res = self.resolve_path(src);
+        let dst_res = self.resolve_path(dst);
+        let mut src_scan = src_res.clone();
+        if Self::is_dir(&src_scan) && src_scan != PATH_SEP {
+            src_scan.pop();
+        }
+        let mut dst_base = dst_res.clone();
+        if Self::is_dir(&dst_base) && dst_base != PATH_SEP {
+            dst_base.pop();
+        }
+        if src_scan == dst_base {
+            return Ok(());
+        }
+        let keys = self.store.scan_keys(&src_scan);
+        if keys.is_empty() {
+            return Err(format!("CpTree: source not found: {}", src));
+        }
+        // 覆盖语义确定：先清 dst 既有子树（也从父 index 摘除，随后重新登记）。
+        let _ = self.del_tree(&dst_base);
+        for k in &keys {
+            let suffix = &k[src_scan.len()..];
+            let new_key = format!("{}{}", dst_base, suffix);
+            if let Some(data) = self.store.get(k) {
+                self.store.set(&new_key, &data);
+            }
+        }
+        // 按 dst 根物理形态登记进父 index（base 值 / 层级目录 / 成员目录）。
+        let (parent, name) = Self::parent_name(&dst_base);
+        self.ensure_parent_dir(&parent);
+        if self.store.get(&dst_base).is_some() {
+            self.add_child(&parent, &name);
+        } else if self
+            .store
+            .get(&format!("{}{}", dst_base, DIR_INDEX_SUF))
+            .is_some()
+        {
+            self.add_child(&parent, &format!("{}{}", name, DIR_INDEX_SUF));
+        } else if self.store.get(&format!("{}{}", dst_base, OBJ_SEP)).is_some() {
+            self.add_child(&parent, &format!("{}{}", name, OBJ_SEP));
+        }
+        Ok(())
+    }
+
     fn watch(&mut self, key: &str, target_value: &XValue, tick_duration: Duration) -> XValue {
         watch_value(self, key, target_value, tick_duration)
     }

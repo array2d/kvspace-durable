@@ -343,6 +343,44 @@ pub extern "C" fn kvspaceDelTree(
 }
 
 #[no_mangle]
+pub extern "C" fn kvspaceCp(
+    h: *mut Handle,
+    src: *const c_char,
+    dst: *const c_char,
+    err: *mut c_char,
+    err_cap: u32,
+) -> c_int {
+    if h.is_null() {
+        return 1;
+    }
+    let kv: &mut dyn KVSpace = unsafe { &mut **h };
+    result_to_code(
+        catch_panic(|| kv.cp(unsafe { cstr(src) }, unsafe { cstr(dst) })),
+        err,
+        err_cap,
+    )
+}
+
+#[no_mangle]
+pub extern "C" fn kvspaceCpTree(
+    h: *mut Handle,
+    src: *const c_char,
+    dst: *const c_char,
+    err: *mut c_char,
+    err_cap: u32,
+) -> c_int {
+    if h.is_null() {
+        return 1;
+    }
+    let kv: &mut dyn KVSpace = unsafe { &mut **h };
+    result_to_code(
+        catch_panic(|| kv.cp_tree(unsafe { cstr(src) }, unsafe { cstr(dst) })),
+        err,
+        err_cap,
+    )
+}
+
+#[no_mangle]
 pub extern "C" fn kvspaceMkindex(
     h: *mut Handle,
     path: *const c_char,

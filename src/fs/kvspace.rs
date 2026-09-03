@@ -338,6 +338,23 @@ impl FsKVSpace {
         }
         new_index(&children)
     }
+
+    /// 递归复制文件/目录（extindex/self/order/map marker 作普通文件一并复制）。
+    fn copy_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+        if src.is_dir() {
+            fs::create_dir_all(dst)?;
+            for e in fs::read_dir(src)? {
+                let e = e?;
+                Self::copy_recursive(&e.path(), &dst.join(e.file_name()))?;
+            }
+        } else {
+            if let Some(p) = dst.parent() {
+                fs::create_dir_all(p)?;
+            }
+            fs::copy(src, dst)?;
+        }
+        Ok(())
+    }
 }
 
 impl KVSpace for FsKVSpace {
@@ -556,6 +573,71 @@ impl KVSpace for FsKVSpace {
         let _ = fs::remove_dir_all(self.fs_path(&resolved));
         let (parent, name) = Self::parent_name(&resolved);
         self.remove_order(&parent, &format!("{}{}", name, Self::suffix_for(&resolved)));
+        Ok(())
+    }
+
+    fn cp(&mut self, src: &str, dst: &str) -> Result<(), String> {
+        let raw = self.get_raw(src);
+        if raw.is_empty() {
+            return Err(format!("Cp: source not found: {}", src));
+        }
+        let v = decode_xvalue(&raw);
+        self.set(&[KVPair {
+            key: dst.to_string(),
+            val: v,
+            raw: Some(raw),
+        }])
+    }
+
+    fn cp_tree(&mut self, src: &str, dst: &str) -> Result<(), String> {
+        let src_res = self.resolve_path(src);
+        let dst_res = self.resolve_path(dst);
+        let de_suffix = |k: &str| {
+            if Self::is_dir_key(k) && k != PATH_SEP {
+                strip_dir_suf(k).to_string()
+            } else {
+                k.to_string()
+            }
+        };
+        let src_base = de_suffix(&src_res);
+        let dst_base = de_suffix(&dst_res);
+        if src_base == dst_base {
+            return Ok(());
+        }
+        // 一个节点跨两条 fs 实体：base（值/层级子树）与兄弟成员目录 base·。
+        let sb = self.node_path(&src_base);
+        let smem = self.node_path(&format!("{}{}", src_base, OBJ_SEP));
+        if !sb.exists() && !smem.exists() {
+            return Err(format!("CpTree: source not found: {}", src));
+        }
+        let _ = self.del_tree(&dst_base);
+        let db = self.node_path(&dst_base);
+        let dmem = self.node_path(&format!("{}{}", dst_base, OBJ_SEP));
+        if sb.exists() {
+            Self::copy_recursive(&sb, &db).map_err(|e| format!("CpTree {}→{}: {}", src, dst, e))?;
+        }
+        if smem.exists() {
+            Self::copy_recursive(&smem, &dmem)
+                .map_err(|e| format!("CpTree {}→{}: {}", src, dst, e))?;
+        }
+        // 登记 dst 根进父 order：按 base 值 kind / 成员目录形态定后缀。
+        let (parent, name) = Self::parent_name(&dst_base);
+        self.ensure_dir(&parent);
+        let suffix = if let Some(data) = self.read_leaf(&dst_base) {
+            let k = decode_xvalue_head(&data).kind();
+            if k == KIND_OBJ || k == KIND_MAP {
+                OBJ_SEP
+            } else {
+                ""
+            }
+        } else if dmem.exists() {
+            OBJ_SEP
+        } else if db.is_dir() {
+            DIR_INDEX_SUF
+        } else {
+            ""
+        };
+        self.add_order(&parent, &format!("{}{}", name, suffix));
         Ok(())
     }
 
