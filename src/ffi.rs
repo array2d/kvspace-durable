@@ -35,7 +35,6 @@ pub struct Handle {
     kv: Box<dyn KVSpace>,
     read_buf: Vec<u8>,
     write_buf: Vec<u8>,
-    list_buf: Vec<u8>,
     pending_key: Option<String>,
 }
 
@@ -178,7 +177,6 @@ pub extern "C" fn kvspaceConnect(dsn: *const c_char) -> *mut Handle {
             kv,
             read_buf: Vec::new(),
             write_buf: Vec::new(),
-            list_buf: Vec::new(),
             pending_key: None,
         })),
         Err(_) => std::ptr::null_mut(),
@@ -343,9 +341,9 @@ pub extern "C" fn kvspaceListLen(
     }
 }
 
-/// 借用索引取项：返回前缀下第 idx 个直接子项名，*out 指向句柄内复用的 list_buf（活到下次
-/// 同句柄 ListAt），调用方不得 free。idx 越界 → *out=NULL、*out_len=0、返回非 0。配合
-/// kvspaceListLen 遍历，不再一次性返回整段名单缓冲。
+/// 索引取项：把前缀下第 idx 个直接子项名写进调用方自备缓冲 buf（容量 buf_cap），*out_len
+/// 置该名长度（不含 NUL）。库侧零状态、调用方不得 free。idx 越界或缓冲不足 → 返回非 0
+/// （缓冲不足时 *out_len 仍为所需长度，不静默截断）。配合 kvspaceListLen 遍历。
 #[no_mangle]
 pub extern "C" fn kvspaceListAt(
     h: *mut Handle,
@@ -353,7 +351,8 @@ pub extern "C" fn kvspaceListAt(
     expand_ext: c_int,
     resolve: c_int,
     idx: i32,
-    out: *mut *mut u8,
+    buf: *mut u8,
+    buf_cap: u32,
     out_len: *mut u32,
 ) -> c_int {
     let hd = match unsafe { h.as_mut() } {
@@ -361,7 +360,6 @@ pub extern "C" fn kvspaceListAt(
         None => return 1,
     };
     unsafe {
-        *out = std::ptr::null_mut();
         *out_len = 0;
     }
     let prefix = unsafe { cstr(prefix) }.to_string();
@@ -377,10 +375,15 @@ pub extern "C" fn kvspaceListAt(
     if idx < 0 || idx as usize >= names.len() {
         return 1;
     }
-    hd.list_buf = names[idx as usize].clone().into_bytes();
+    let name = names[idx as usize].as_bytes();
     unsafe {
-        *out = hd.list_buf.as_mut_ptr();
-        *out_len = hd.list_buf.len() as u32;
+        *out_len = name.len() as u32;
+    }
+    if buf.is_null() || name.len() as u32 > buf_cap {
+        return 1;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(name.as_ptr(), buf, name.len());
     }
     0
 }
@@ -466,6 +469,28 @@ pub extern "C" fn kvspaceCpTree(
     };
     result_to_code(
         catch_panic(|| kv.cp_tree(unsafe { cstr(src) }, unsafe { cstr(dst) })),
+        err,
+        err_cap,
+    )
+}
+
+#[no_mangle]
+pub extern "C" fn kvspaceCpList(
+    h: *mut Handle,
+    src: *const c_char,
+    dst: *const c_char,
+    err: *mut c_char,
+    err_cap: u32,
+) -> c_int {
+    let kv: &mut dyn KVSpace = match unsafe { kv_flush(h) } {
+        Ok(k) => k,
+        Err(e) => {
+            write_err(err, err_cap, &e);
+            return 1;
+        }
+    };
+    result_to_code(
+        catch_panic(|| kv.cp_list(unsafe { cstr(src) }, unsafe { cstr(dst) })),
         err,
         err_cap,
     )

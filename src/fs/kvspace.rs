@@ -643,6 +643,69 @@ impl KVSpace for FsKVSpace {
         Ok(())
     }
 
+    fn cp_list(&mut self, src: &str, dst: &str) -> Result<(), String> {
+        let src_res = self.resolve_path(src);
+        let dst_res = self.resolve_path(dst);
+        let de_suffix = |k: &str| {
+            if Self::is_dir_key(k) && k != PATH_SEP {
+                strip_dir_suf(k).to_string()
+            } else {
+                k.to_string()
+            }
+        };
+        let src_base = de_suffix(&src_res);
+        let dst_base = de_suffix(&dst_res);
+        if src_base == dst_base {
+            return Ok(());
+        }
+        let sb = self.node_path(&src_base);
+        let smem = self.node_path(&format!("{}{}", src_base, OBJ_SEP));
+        if !sb.exists() && !smem.exists() {
+            return Err(format!("CpList: source not found: {}", src));
+        }
+        let _ = self.del_tree(&dst_base);
+        if let Some(data) = self.read_leaf(&src_base) {
+            self.write_leaf(&dst_base, &data);
+        }
+        // 一层成员目录：只拷直接条目（marker + 直接成员值），子目录只取其 base 值 __self__，不递归。
+        if smem.is_dir() {
+            let dmem = self.node_path(&format!("{}{}", dst_base, OBJ_SEP));
+            let _ = fs::create_dir_all(&dmem);
+            if let Ok(rd) = fs::read_dir(&smem) {
+                for e in rd.flatten() {
+                    let sp = e.path();
+                    let dp = dmem.join(e.file_name());
+                    if sp.is_file() {
+                        let _ = fs::copy(&sp, &dp);
+                    } else if let Ok(c) = fs::read(sp.join(SELF_MARKER)) {
+                        let _ = fs::create_dir_all(&dp);
+                        let _ = fs::write(dp.join(SELF_MARKER), c);
+                    }
+                }
+            }
+        }
+        let (parent, name) = Self::parent_name(&dst_base);
+        self.ensure_dir(&parent);
+        let db = self.node_path(&dst_base);
+        let dmem = self.node_path(&format!("{}{}", dst_base, OBJ_SEP));
+        let suffix = if let Some(data) = self.read_leaf(&dst_base) {
+            let k = decode_xvalue_head(&data).kind();
+            if k == KIND_OBJ || k == KIND_MAP {
+                OBJ_SEP
+            } else {
+                ""
+            }
+        } else if dmem.exists() {
+            OBJ_SEP
+        } else if db.is_dir() {
+            DIR_INDEX_SUF
+        } else {
+            ""
+        };
+        self.add_order(&parent, &format!("{}{}", name, suffix));
+        Ok(())
+    }
+
     fn watch(&mut self, key: &str, target_value: &XValue, tick_duration: Duration) -> XValue {
         watch_value(self, key, target_value, tick_duration)
     }

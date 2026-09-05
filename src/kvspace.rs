@@ -56,6 +56,8 @@ pub trait KVSpace {
     /// 递归拷贝以 src 为根的整棵子树到 dst（含 memindex 与全部成员）。对齐 unix cp -r。
     /// extindex 成员复制其扩展句柄 → dst 侧生成指向同一只读扩展的新 extindex。
     fn cp_tree(&mut self, src: &str, dst: &str) -> Result<(), String>;
+    /// 浅拷贝：base 值 + 一层 · 成员（不递归成员子树）。用于单 struct/扁平容器的低开销复制。
+    fn cp_list(&mut self, src: &str, dst: &str) -> Result<(), String>;
 
     /// 阻塞等待 Get(key)==targetValue。
     fn watch(&mut self, key: &str, target_value: &XValue, tick_duration: Duration) -> XValue;

@@ -664,6 +664,50 @@ impl<S: KVStore> KVSpace for Backend<S> {
         Ok(())
     }
 
+    /// 浅拷贝：base 值 + 一层 · 成员（不递归成员子树、不遍历 / 子节点）。用于单 struct/扁平容器。
+    fn cp_list(&mut self, src: &str, dst: &str) -> Result<(), String> {
+        let mut src_base = self.resolve_path(src);
+        if Self::is_dir(&src_base) && src_base != PATH_SEP {
+            src_base.pop();
+        }
+        let mut dst_base = self.resolve_path(dst);
+        if Self::is_dir(&dst_base) && dst_base != PATH_SEP {
+            dst_base.pop();
+        }
+        if src_base == dst_base {
+            return Ok(());
+        }
+        let keys = self.store.scan_keys(&src_base);
+        if keys.is_empty() {
+            return Err(format!("CpList: source not found: {}", src));
+        }
+        let dst_mem = format!("{}{}", dst_base, OBJ_SEP);
+        let _ = self.del_tree(&dst_base);
+        for k in &keys {
+            let suffix = &k[src_base.len()..];
+            // 一层：base 自身、memindex 标记、无更深分隔的直接 · 成员；跳过 / 子节点与更深后代。
+            let one_level = suffix.is_empty()
+                || (suffix.starts_with(OBJ_SEP) && {
+                    let rest = &suffix[OBJ_SEP.len()..];
+                    !rest.contains(OBJ_SEP) && !rest.contains(PATH_SEP)
+                });
+            if !one_level {
+                continue;
+            }
+            if let Some(data) = self.store.get(k) {
+                self.store.set(&format!("{}{}", dst_base, suffix), &data);
+            }
+        }
+        let (parent, name) = Self::parent_name(&dst_base);
+        self.ensure_parent_dir(&parent);
+        if self.store.get(&dst_base).is_some() {
+            self.add_child(&parent, &name);
+        } else if self.store.get(&dst_mem).is_some() {
+            self.add_child(&parent, &format!("{}{}", name, OBJ_SEP));
+        }
+        Ok(())
+    }
+
     fn watch(&mut self, key: &str, target_value: &XValue, tick_duration: Duration) -> XValue {
         watch_value(self, key, target_value, tick_duration)
     }
