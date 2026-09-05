@@ -6,7 +6,8 @@
 // 约定：
 //   - 句柄：kvspaceConnect 返回 *mut Handle（Box<dyn KVSpace>），kvspaceClose 释放。
 //   - 输入字符串：*const c_char（NUL 终止）；输入字节：*const u8 + u32 len。
-//   - 输出字节：*mut *mut u8 + *mut u32，由 callee 分配，调用方用 kvspaceBytesFree(ptr, len) 释放。
+//   - 读出字节：kvspaceGet/ListAt 返回句柄内常驻/回收缓冲的借用偏移指针，调用方不得 free；
+//     codec（TlvEncode/New*）产出为 frontend malloc 缓冲，调用方以 libc free 释放。
 //   - 错误：返回 c_int（0=成功，1=失败），失败信息写入 err 缓冲（err_cap 上限）。
 //
 // 注意：本层函数不得 panic 跨边界（panic 会 abort 进程）；调用方保证入参合法。
