@@ -1,14 +1,14 @@
 // redis/store.rs — Redis 存储原语（最小 RESP 客户端，仅 GET/SET/DEL/SCAN/FLUSHDB）。
 
 use std::cell::RefCell;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 
 use crate::r#const::*;
 use crate::store::KVStore;
 
 pub struct RedisStore {
-    stream: RefCell<TcpStream>,
+    stream: RefCell<BufReader<TcpStream>>,
 }
 
 pub fn connect(addr: &str) -> RedisStore {
@@ -30,8 +30,9 @@ impl RedisStore {
         stream
             .set_write_timeout(Some(std::time::Duration::from_secs(3)))
             .ok();
+        stream.set_nodelay(true).ok(); // 请求/应答 ping-pong，禁 Nagle 避免与延迟 ACK 叠加卡顿
         RedisStore {
-            stream: RefCell::new(stream),
+            stream: RefCell::new(BufReader::new(stream)), // 缓冲读：RESP 逐字节 read_exact 曾致 syscall 风暴
         }
     }
 
@@ -44,7 +45,8 @@ impl RedisStore {
                 out.extend_from_slice(a);
                 out.extend_from_slice(b"\r\n");
             }
-            s.write_all(&out)
+            s.get_mut()
+                .write_all(&out)
                 .unwrap_or_else(|e| panic!("kvspace-redis: write: {}", e));
         }
         self.read_resp()
@@ -53,18 +55,15 @@ impl RedisStore {
     fn read_line(&self) -> Vec<u8> {
         let mut s = self.stream.borrow_mut();
         let mut line = Vec::new();
-        let mut prev = 0u8;
-        loop {
-            let mut b = [0u8; 1];
-            s.read_exact(&mut b)
-                .unwrap_or_else(|e| panic!("kvspace-redis: read: {}", e));
-            line.push(b[0]);
-            if prev == b'\r' && b[0] == b'\n' {
-                line.truncate(line.len() - 2);
-                return line;
-            }
-            prev = b[0];
+        s.read_until(b'\n', &mut line)
+            .unwrap_or_else(|e| panic!("kvspace-redis: read: {}", e));
+        if line.ends_with(b"\n") {
+            line.pop();
         }
+        if line.ends_with(b"\r") {
+            line.pop();
+        }
+        line
     }
 
     fn read_resp(&self) -> Resp {

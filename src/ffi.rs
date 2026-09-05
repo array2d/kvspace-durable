@@ -25,8 +25,57 @@ use crate::xvalue_float::new_float64;
 use crate::xvalue_int::new_int64;
 
 // ── 句柄 ─────────────────────────────────────────────────────────────
+//
+// durable 无常驻映射：0copy 适配下沉到句柄内。读复用 read_buf 返回借用指针（活到下一次
+// 读/写为止）；写把整条 TLV 攒进 write_buf、置 pending_key，在**下一个可观察操作前**惰性
+// flush（内部实现，不进公开 ABI）。调用方从不 free、从不 commit。
 
-type Handle = Box<dyn KVSpace>;
+pub struct Handle {
+    kv: Box<dyn KVSpace>,
+    read_buf: Vec<u8>,
+    write_buf: Vec<u8>,
+    list_buf: Vec<u8>,
+    pending_key: Option<String>,
+}
+
+impl Handle {
+    /// 落盘上一笔惰性写（调用方已把 body 填进 write_buf）。
+    fn flush(&mut self) -> Result<(), String> {
+        if let Some(key) = self.pending_key.take() {
+            let tlv = std::mem::take(&mut self.write_buf);
+            let val = decode_xvalue(&tlv);
+            self.kv.set(&[KVPair {
+                key,
+                val,
+                raw: Some(tlv),
+            }])?;
+        }
+        Ok(())
+    }
+}
+
+/// flush 上一笔惰性写后返回后端引用。任一步失败 → Err（调用方转 err/返回 1）。
+unsafe fn kv_flush<'a>(h: *mut Handle) -> Result<&'a mut dyn KVSpace, String> {
+    let hd = h.as_mut().ok_or("kvspace: null handle")?;
+    hd.flush()?;
+    Ok(&mut *hd.kv)
+}
+
+/// 由 kindexpr 串 + body_len 直接构造 head（ro=0 vid=0）并预留 body_len 零字节。
+/// 与 kvspace-c kvspaceXvalueWriteHead 逐字节一致。
+fn build_tlv(kindexpr: &str, body_len: usize) -> Vec<u8> {
+    let kx = kindexpr.as_bytes();
+    let slot = kx.len() + 1;
+    let mut v = Vec::with_capacity(1 + slot + 9 + body_len);
+    v.push(slot as u8);
+    v.extend_from_slice(kx);
+    v.push(0); // kindexpr NUL
+    v.push(0); // ro
+    v.extend_from_slice(&0u32.to_le_bytes()); // vid
+    v.extend_from_slice(&(body_len as u32).to_le_bytes()); // body_len
+    v.resize(1 + slot + 9 + body_len, 0); // body 占位
+    v
+}
 
 // ── 内部助手 ─────────────────────────────────────────────────────────
 
@@ -124,7 +173,13 @@ fn fill_head(head: &crate::xvalue::XValueHead, out: *mut kvspaceHead_t) {
 pub extern "C" fn kvspaceConnect(dsn: *const c_char) -> *mut Handle {
     let dsn = unsafe { cstr(dsn) };
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| conn(dsn))) {
-        Ok(kv) => Box::into_raw(Box::new(kv)),
+        Ok(kv) => Box::into_raw(Box::new(Handle {
+            kv,
+            read_buf: Vec::new(),
+            write_buf: Vec::new(),
+            list_buf: Vec::new(),
+            pending_key: None,
+        })),
         Err(_) => std::ptr::null_mut(),
     }
 }
@@ -132,142 +187,163 @@ pub extern "C" fn kvspaceConnect(dsn: *const c_char) -> *mut Handle {
 #[no_mangle]
 pub extern "C" fn kvspaceClose(h: *mut Handle) {
     if !h.is_null() {
-        unsafe { drop(Box::from_raw(h)) };
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn kvspaceBytesFree(p: *mut u8, len: u32) {
-    if !p.is_null() {
-        let slice = unsafe { std::ptr::slice_from_raw_parts_mut(p, len as usize) };
-        unsafe { drop(Box::from_raw(slice)) };
+        let mut hd = unsafe { Box::from_raw(h) };
+        let _ = hd.flush(); // 关闭前落盘未决写
+        drop(hd);
     }
 }
 
 // ── KVSpace 原语 ─────────────────────────────────────────────────────
 
-#[no_mangle]
-pub extern "C" fn kvspaceSet(
-    h: *mut Handle,
-    keys: *const *const c_char,
-    vals: *const u8,
-    lens: *const u32,
-    n: u32,
-    err: *mut c_char,
-    err_cap: u32,
-) -> c_int {
-    if h.is_null() {
-        return 1;
-    }
-    let kv: &mut dyn KVSpace = unsafe { &mut **h };
-    result_to_code(
-        catch_panic(|| {
-            let mut pairs = Vec::with_capacity(n as usize);
-            let mut off = 0usize;
-            for i in 0..n as usize {
-                let key = unsafe { cstr(*keys.add(i)) }.to_string();
-                let len = unsafe { *lens.add(i) } as usize;
-                let bytes = unsafe { std::slice::from_raw_parts(vals.add(off), len) };
-                off += len;
-                pairs.push(KVPair {
-                    key,
-                    val: decode_xvalue(bytes),
-                    raw: Some(bytes.to_vec()),
-                });
-            }
-            kv.set(&pairs)
-        }),
-        err,
-        err_cap,
-    )
-}
-
-/// 单点读（对齐 GetOne）：None 编码为空字节（out_len==0）。
+/// 借用读：*out 指向句柄内复用的 read_buf（活到下一次读/写），调用方不得 free。
+/// resolve 由 get_raw 内部按路径解析（durable 恒穿透父路径 link）；空值 → *out=NULL、out_len=0。
 #[no_mangle]
 pub extern "C" fn kvspaceGet(
     h: *mut Handle,
     key: *const c_char,
+    _resolve: c_int,
     out: *mut *mut u8,
     out_len: *mut u32,
 ) -> c_int {
-    if h.is_null() {
+    let hd = match unsafe { h.as_mut() } {
+        Some(x) => x,
+        None => return 1,
+    };
+    let key = unsafe { cstr(key) }.to_string();
+    if hd.flush().is_err() {
+        unsafe {
+            *out = std::ptr::null_mut();
+            *out_len = 0;
+        }
         return 1;
     }
-    let key = unsafe { cstr(key) }.to_string();
-    let kv: &mut dyn KVSpace = unsafe { &mut **h };
-    if catch_panic(|| {
-        let raw = kv.get_raw(&key);
-        if raw.is_empty() {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hd.kv.get_raw(&key))) {
+        Ok(raw) => {
+            if raw.is_empty() {
+                unsafe {
+                    *out = std::ptr::null_mut();
+                    *out_len = 0;
+                }
+            } else {
+                hd.read_buf = raw;
+                unsafe {
+                    *out = hd.read_buf.as_mut_ptr();
+                    *out_len = hd.read_buf.len() as u32;
+                }
+            }
+            0
+        }
+        Err(_) => {
             unsafe {
                 *out = std::ptr::null_mut();
                 *out_len = 0;
             }
-        } else {
-            alloc(raw, out, out_len);
+            1
         }
-        Ok(())
-    })
-    .is_err()
-    {
-        unsafe {
-            *out = std::ptr::null_mut();
-            *out_len = 0;
-        }
+    }
+}
+
+/// 就地写：key 必须已存在、body_len 必须等于原 body_len——把原 head+body 攒进 write_buf、
+/// 置 pending，返回 write_buf 内 body 偏移指针供直接写；违反前置条件 → 非 0 + err。
+#[no_mangle]
+pub extern "C" fn kvspaceWriteInPlace(
+    h: *mut Handle,
+    key: *const c_char,
+    _resolve: c_int,
+    body_len: u32,
+    body: *mut *mut u8,
+    err: *mut c_char,
+    err_cap: u32,
+) -> c_int {
+    let hd = match unsafe { h.as_mut() } {
+        Some(x) => x,
+        None => return 1,
+    };
+    if let Err(e) = hd.flush() {
+        write_err(err, err_cap, &e);
         return 1;
     }
+    let key = unsafe { cstr(key) }.to_string();
+    let existing = hd.kv.get_raw(&key);
+    if existing.is_empty() {
+        write_err(err, err_cap, "kvspace: write-in-place on missing key");
+        return 1;
+    }
+    let head = decode_xvalue_head(&existing);
+    let head_len = head.head_len() as usize;
+    if head.body_len as u32 != body_len || existing.len() != head_len + body_len as usize {
+        write_err(err, err_cap, "kvspace: write-in-place body_len mismatch");
+        return 1;
+    }
+    hd.write_buf = existing;
+    hd.pending_key = Some(key);
+    unsafe { *body = hd.write_buf.as_mut_ptr().add(head_len) };
     0
 }
 
-/// 批量读：prefix 下 names 一次 MGET，返回每个值的 [4B len LE][TLV] 拼接。
-/// None 编码为 len=0。names 数量须与 C 侧一致，按序对应。
+/// 新位置写：按 (kindexpr, body_len) 攒好 head 到 write_buf、置 pending，返回 body 偏移指针。
 #[no_mangle]
-pub extern "C" fn kvspaceGetBatch(
+pub extern "C" fn kvspaceWriteNewPlace(
+    h: *mut Handle,
+    key: *const c_char,
+    kindexpr: *const c_char,
+    body_len: u32,
+    body: *mut *mut u8,
+    err: *mut c_char,
+    err_cap: u32,
+) -> c_int {
+    let hd = match unsafe { h.as_mut() } {
+        Some(x) => x,
+        None => return 1,
+    };
+    if let Err(e) = hd.flush() {
+        write_err(err, err_cap, &e);
+        return 1;
+    }
+    let key = unsafe { cstr(key) }.to_string();
+    let kx = unsafe { cstr(kindexpr) };
+    let tlv = build_tlv(kx, body_len as usize);
+    let head_len = tlv.len() - body_len as usize;
+    hd.write_buf = tlv;
+    hd.pending_key = Some(key);
+    unsafe { *body = hd.write_buf.as_mut_ptr().add(head_len) };
+    0
+}
+
+/// 只返回前缀下子项计数，无缓冲、无需释放。
+#[no_mangle]
+pub extern "C" fn kvspaceListLen(
     h: *mut Handle,
     prefix: *const c_char,
-    names: *const *const c_char,
-    nnames: u32,
-    out: *mut *mut u8,
-    out_len: *mut u32,
+    expand_ext: c_int,
+    resolve: c_int,
+    out_count: *mut i32,
 ) -> c_int {
-    if h.is_null() {
-        return 1;
-    }
+    let hd = match unsafe { h.as_mut() } {
+        Some(x) => x,
+        None => return 1,
+    };
     let prefix = unsafe { cstr(prefix) }.to_string();
-    let kv: &mut dyn KVSpace = unsafe { &mut **h };
-    if let Err(e) = kv.validate_dir(&prefix) {
-        let _ = e;
-        unsafe {
-            *out = std::ptr::null_mut();
-            *out_len = 0;
-        }
+    if hd.flush().is_err() || hd.kv.validate_dir(&prefix).is_err() {
+        unsafe { *out_count = 0 };
         return 1;
     }
-    let names: Vec<String> = (0..nnames as usize)
-        .map(|i| unsafe { cstr(*names.add(i)) }.to_string())
-        .collect();
-    if catch_panic(|| {
-        let vals = kv.get(&prefix, &names, true);
-        let mut result = Vec::new();
-        for v in vals {
-            let bytes = v.encode();
-            result.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-            result.extend_from_slice(&bytes);
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        hd.kv.list(&prefix, expand_ext != 0, resolve != 0).len()
+    })) {
+        Ok(n) => {
+            unsafe { *out_count = n as i32 };
+            0
         }
-        alloc(result, out, out_len);
-        Ok(())
-    })
-    .is_err()
-    {
-        unsafe {
-            *out = std::ptr::null_mut();
-            *out_len = 0;
+        Err(_) => {
+            unsafe { *out_count = 0 };
+            1
         }
-        return 1;
     }
-    0
 }
 
-/// 列目录：子项以 \n 连接返回（子名不含 \n）。空目录返回 out_len==0。
+/// 借用枚举：*out 指向句柄内复用的 list_buf（\n 连接的直接子项名，活到下次同句柄 List），
+/// 调用方不得 free。空目录 → *out=NULL、*out_len=0。
 #[no_mangle]
 pub extern "C" fn kvspaceList(
     h: *mut Handle,
@@ -277,31 +353,31 @@ pub extern "C" fn kvspaceList(
     out: *mut *mut u8,
     out_len: *mut u32,
 ) -> c_int {
-    if h.is_null() {
-        return 1;
+    let hd = match unsafe { h.as_mut() } {
+        Some(x) => x,
+        None => return 1,
+    };
+    unsafe {
+        *out = std::ptr::null_mut();
+        *out_len = 0;
     }
     let prefix = unsafe { cstr(prefix) }.to_string();
-    let kv: &mut dyn KVSpace = unsafe { &mut **h };
-    if let Err(e) = kv.validate_dir(&prefix) {
-        let _ = e;
-        unsafe {
-            *out = std::ptr::null_mut();
-            *out_len = 0;
-        }
+    if hd.flush().is_err() || hd.kv.validate_dir(&prefix).is_err() {
         return 1;
     }
-    if catch_panic(|| {
-        let children = kv.list(&prefix, expand_ext != 0, resolve != 0);
-        alloc(children.join("\n").into_bytes(), out, out_len);
-        Ok(())
-    })
-    .is_err()
-    {
-        unsafe {
-            *out = std::ptr::null_mut();
-            *out_len = 0;
-        }
-        return 1;
+    let names = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        hd.kv.list(&prefix, expand_ext != 0, resolve != 0)
+    })) {
+        Ok(n) => n,
+        Err(_) => return 1,
+    };
+    if names.is_empty() {
+        return 0;
+    }
+    hd.list_buf = names.join("\n").into_bytes();
+    unsafe {
+        *out = hd.list_buf.as_mut_ptr();
+        *out_len = hd.list_buf.len() as u32;
     }
     0
 }
@@ -314,10 +390,13 @@ pub extern "C" fn kvspaceDel(
     err: *mut c_char,
     err_cap: u32,
 ) -> c_int {
-    if h.is_null() {
-        return 1;
-    }
-    let kv: &mut dyn KVSpace = unsafe { &mut **h };
+    let kv: &mut dyn KVSpace = match unsafe { kv_flush(h) } {
+        Ok(k) => k,
+        Err(e) => {
+            write_err(err, err_cap, &e);
+            return 1;
+        }
+    };
     let keys: Vec<String> = (0..nkeys as usize)
         .map(|i| unsafe { cstr(*keys.add(i)) }.to_string())
         .collect();
@@ -331,10 +410,13 @@ pub extern "C" fn kvspaceDelTree(
     err: *mut c_char,
     err_cap: u32,
 ) -> c_int {
-    if h.is_null() {
-        return 1;
-    }
-    let kv: &mut dyn KVSpace = unsafe { &mut **h };
+    let kv: &mut dyn KVSpace = match unsafe { kv_flush(h) } {
+        Ok(k) => k,
+        Err(e) => {
+            write_err(err, err_cap, &e);
+            return 1;
+        }
+    };
     result_to_code(
         catch_panic(|| kv.del_tree(unsafe { cstr(prefix) })),
         err,
@@ -350,10 +432,13 @@ pub extern "C" fn kvspaceCp(
     err: *mut c_char,
     err_cap: u32,
 ) -> c_int {
-    if h.is_null() {
-        return 1;
-    }
-    let kv: &mut dyn KVSpace = unsafe { &mut **h };
+    let kv: &mut dyn KVSpace = match unsafe { kv_flush(h) } {
+        Ok(k) => k,
+        Err(e) => {
+            write_err(err, err_cap, &e);
+            return 1;
+        }
+    };
     result_to_code(
         catch_panic(|| kv.cp(unsafe { cstr(src) }, unsafe { cstr(dst) })),
         err,
@@ -369,10 +454,13 @@ pub extern "C" fn kvspaceCpTree(
     err: *mut c_char,
     err_cap: u32,
 ) -> c_int {
-    if h.is_null() {
-        return 1;
-    }
-    let kv: &mut dyn KVSpace = unsafe { &mut **h };
+    let kv: &mut dyn KVSpace = match unsafe { kv_flush(h) } {
+        Ok(k) => k,
+        Err(e) => {
+            write_err(err, err_cap, &e);
+            return 1;
+        }
+    };
     result_to_code(
         catch_panic(|| kv.cp_tree(unsafe { cstr(src) }, unsafe { cstr(dst) })),
         err,
@@ -387,10 +475,13 @@ pub extern "C" fn kvspaceMkindex(
     err: *mut c_char,
     err_cap: u32,
 ) -> c_int {
-    if h.is_null() {
-        return 1;
-    }
-    let kv: &mut dyn KVSpace = unsafe { &mut **h };
+    let kv: &mut dyn KVSpace = match unsafe { kv_flush(h) } {
+        Ok(k) => k,
+        Err(e) => {
+            write_err(err, err_cap, &e);
+            return 1;
+        }
+    };
     result_to_code(
         catch_panic(|| kv.mkindex(unsafe { cstr(path) })),
         err,
@@ -406,10 +497,13 @@ pub extern "C" fn kvspaceMkindexExt(
     err: *mut c_char,
     err_cap: u32,
 ) -> c_int {
-    if h.is_null() {
-        return 1;
-    }
-    let kv: &mut dyn KVSpace = unsafe { &mut **h };
+    let kv: &mut dyn KVSpace = match unsafe { kv_flush(h) } {
+        Ok(k) => k,
+        Err(e) => {
+            write_err(err, err_cap, &e);
+            return 1;
+        }
+    };
     result_to_code(
         catch_panic(|| kv.ext_index(unsafe { cstr(path) }, unsafe { cstr(ext_path) })),
         err,
@@ -424,10 +518,13 @@ pub extern "C" fn kvspaceRmindexExt(
     err: *mut c_char,
     err_cap: u32,
 ) -> c_int {
-    if h.is_null() {
-        return 1;
-    }
-    let kv: &mut dyn KVSpace = unsafe { &mut **h };
+    let kv: &mut dyn KVSpace = match unsafe { kv_flush(h) } {
+        Ok(k) => k,
+        Err(e) => {
+            write_err(err, err_cap, &e);
+            return 1;
+        }
+    };
     result_to_code(
         catch_panic(|| kv.del_ext_index(unsafe { cstr(path) })),
         err,
@@ -445,35 +542,53 @@ pub extern "C" fn kvspaceWatch(
     out: *mut *mut u8,
     out_len: *mut u32,
 ) -> c_int {
-    if h.is_null() {
+    let hd = match unsafe { h.as_mut() } {
+        Some(x) => x,
+        None => return 1,
+    };
+    if hd.flush().is_err() {
+        unsafe {
+            *out = std::ptr::null_mut();
+            *out_len = 0;
+        }
         return 1;
     }
-    let kv: &mut dyn KVSpace = unsafe { &mut **h };
     let target_v =
         decode_xvalue(unsafe { std::slice::from_raw_parts(target, target_len as usize) });
-    let v = kv.watch(
+    let v = hd.kv.watch(
         unsafe { cstr(key) },
         &target_v,
         Duration::from_nanos(tick_ns),
     );
-    alloc(v.encode(), out, out_len)
+    hd.read_buf = v.encode();
+    unsafe {
+        *out = hd.read_buf.as_mut_ptr();
+        *out_len = hd.read_buf.len() as u32;
+    }
+    0
 }
 
 #[no_mangle]
 pub extern "C" fn kvspaceClear(h: *mut Handle, err: *mut c_char, err_cap: u32) -> c_int {
-    if h.is_null() {
-        return 1;
-    }
-    let kv: &mut dyn KVSpace = unsafe { &mut **h };
+    let kv: &mut dyn KVSpace = match unsafe { kv_flush(h) } {
+        Ok(k) => k,
+        Err(e) => {
+            write_err(err, err_cap, &e);
+            return 1;
+        }
+    };
     result_to_code(catch_panic(|| kv.clear()), err, err_cap)
 }
 
 #[no_mangle]
 pub extern "C" fn kvspaceDisconnect(h: *mut Handle, err: *mut c_char, err_cap: u32) -> c_int {
-    if h.is_null() {
-        return 1;
-    }
-    let kv: &mut dyn KVSpace = unsafe { &mut **h };
+    let kv: &mut dyn KVSpace = match unsafe { kv_flush(h) } {
+        Ok(k) => k,
+        Err(e) => {
+            write_err(err, err_cap, &e);
+            return 1;
+        }
+    };
     result_to_code(catch_panic(|| kv.dis_conn()), err, err_cap)
 }
 

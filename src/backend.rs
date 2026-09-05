@@ -132,11 +132,19 @@ impl<S: KVStore> Backend<S> {
         } else {
             trimmed.split('/').collect()
         };
+        // 一次 MGET 取所有祖先前缀——逐级 store.get 曾对每次读做 O(深度) 次网络往返，
+        // 是 durable 上循环性程序 syscall 风暴之源。语义不变：仍返回 root→leaf 最先遇到的 Ptr。
+        let mut prefixes: Vec<String> = Vec::with_capacity(parts.len());
         let mut cur = PATH_SEP.to_string();
-        for (i, p) in parts.iter().enumerate() {
+        for p in &parts {
             cur = join_path(&cur, p);
-            if let Some(data) = self.store.get(&cur) {
-                let v = decode_xvalue(&data);
+            prefixes.push(cur.clone());
+        }
+        let refs: Vec<&str> = prefixes.iter().map(|s| s.as_str()).collect();
+        let vals = self.store.get_many(&refs);
+        for (i, data) in vals.iter().enumerate() {
+            if let Some(data) = data {
+                let v = decode_xvalue(data);
                 if is_ptr(&v) {
                     let target = ptr_target(&v);
                     if i + 1 < parts.len() {
@@ -278,8 +286,6 @@ impl<S: KVStore> KVSpace for Backend<S> {
         } else {
             prefix.to_string()
         };
-        let ext_t = self.prefix_ext(&prefix);
-
         let mut results: Vec<Option<XValue>> = vec![None; keys.len()];
         let mut full_keys: Vec<(usize, String)> = Vec::new();
         for (i, k) in keys.iter().enumerate() {
@@ -292,14 +298,29 @@ impl<S: KVStore> KVSpace for Backend<S> {
         }
         let full_refs: Vec<&str> = full_keys.iter().map(|(_, f)| f.as_str()).collect();
         let full_vals = self.store.get_many(&full_refs);
-        let mut ext_keys: Vec<(usize, String)> = Vec::new();
+        // ext-index 仅是主存未命中键的回退目标：延迟到确有缺失键才查 prefix_ext——
+        // 否则每次读都为它多付一次 GET（frame 槽恒命中，曾是最热的一条无谓往返）。
+        let mut missing: Vec<usize> = Vec::new();
         for (idx, (i, _)) in full_keys.iter().enumerate() {
             if let Some(data) = &full_vals[idx] {
                 results[*i] = Some(decode_xvalue(data));
-            } else if !ext_t.is_empty() {
-                ext_keys.push((*i, join_path(&ext_t, &keys[*i])));
+            } else {
+                missing.push(*i);
             }
         }
+        let ext_t = if missing.is_empty() {
+            String::new()
+        } else {
+            self.prefix_ext(&prefix)
+        };
+        let ext_keys: Vec<(usize, String)> = if ext_t.is_empty() {
+            Vec::new()
+        } else {
+            missing
+                .iter()
+                .map(|&i| (i, join_path(&ext_t, &keys[i])))
+                .collect()
+        };
         if !ext_keys.is_empty() {
             let ext_refs: Vec<&str> = ext_keys.iter().map(|(_, t)| t.as_str()).collect();
             let ext_vals = self.store.get_many(&ext_refs);
@@ -633,7 +654,11 @@ impl<S: KVStore> KVSpace for Backend<S> {
             .is_some()
         {
             self.add_child(&parent, &format!("{}{}", name, DIR_INDEX_SUF));
-        } else if self.store.get(&format!("{}{}", dst_base, OBJ_SEP)).is_some() {
+        } else if self
+            .store
+            .get(&format!("{}{}", dst_base, OBJ_SEP))
+            .is_some()
+        {
             self.add_child(&parent, &format!("{}{}", name, OBJ_SEP));
         }
         Ok(())
