@@ -141,8 +141,8 @@ impl XValueHead {
             KIND_CHAR => XValue::Char32(crate::xvalue_byte::decode_char32(body, &dims)),
             KIND_OBJ => XValue::Obj,
             KIND_MAP => XValue::Map(dims.clone()),
-            KIND_INDEX => XValue::Index(crate::xvalue_index::decode_index(body)),
-            KIND_EXT_INDEX => XValue::ExtIndex(crate::xvalue_index::decode_ext_index(body)),
+            KIND_INDEX => XValue::Index(crate::xvalue_index::decode_index(body, &dims)),
+            KIND_EXT_INDEX => XValue::ExtIndex(crate::xvalue_index::decode_ext_index(body, &dims)),
             _ => XValue::Opaque(Opaque {
                 kind: kind.clone(),
                 body: body.to_vec(),
@@ -248,9 +248,9 @@ impl XValue {
             XValue::Char32(d) => (d.data.len() * 4) as i32,
             XValue::Obj => 0,
             XValue::Map(_) => 1,
-            XValue::Index(d) => crate::xvalue_index::encode_index_raw(d).len() as i32,
+            XValue::Index(d) => crate::xvalue_index::encode_index(d).1.len() as i32,
             XValue::ExtIndex(e) => {
-                crate::xvalue_index::encode_ext_index_raw(&e.ext_path, &e.childs).len() as i32
+                crate::xvalue_index::encode_ext_index(&e.ext_path, &e.childs).1.len() as i32
             }
             XValue::Opaque(o) => o.body.len() as i32,
         }
@@ -303,12 +303,12 @@ impl XValue {
             XValue::Obj => tlv_encode(KIND_OBJ, &[], 1),
             XValue::Map(dims) => encode_head(KIND_MAP, 0, dims, &[]),
             XValue::Index(d) => {
-                let raw = crate::xvalue_index::encode_index_raw(d);
-                tlv_encode(KIND_INDEX, &raw, 1)
+                let (dims, body) = crate::xvalue_index::encode_index(d);
+                encode_head(KIND_INDEX, 0, &dims, &body)
             }
             XValue::ExtIndex(e) => {
-                let raw = crate::xvalue_index::encode_ext_index_raw(&e.ext_path, &e.childs);
-                tlv_encode(KIND_EXT_INDEX, &raw, 1)
+                let (dims, body) = crate::xvalue_index::encode_ext_index(&e.ext_path, &e.childs);
+                encode_head(KIND_EXT_INDEX, 0, &dims, &body)
             }
             XValue::Opaque(o) => tlv_encode(&o.kind, &o.body, o.array_len),
         }
@@ -627,6 +627,60 @@ mod tests {
             dims: vec![2, 3],
         }));
         roundtrip(&XValue::Obj);
+    }
+
+    #[test]
+    fn index_matrix_roundtrip() {
+        use crate::xvalue_index::{matrix_at, matrix_count};
+        // 乱序输入 → encode 规范排序（坐标数值序，非字节序：[2] 在 [10] 前）。
+        let v = XValue::Index(vec![
+            "[10]".into(),
+            "[2]".into(),
+            "[1]".into(),
+        ]);
+        let bytes = v.encode();
+        let h = decode_xvalue_head(&bytes);
+        assert_eq!(h.kind(), KIND_INDEX);
+        assert_eq!(h.dims(), vec![3, 4]); // N=3, M=len("[10]")=4
+        let decoded = decode_xvalue(&bytes);
+        assert_eq!(
+            decoded,
+            XValue::Index(vec!["[1]".into(), "[2]".into(), "[10]".into()])
+        );
+        // O(1) 原语走 head+body。
+        let body = h.body(&bytes);
+        assert_eq!(matrix_count(&h.dims()), 3);
+        assert_eq!(matrix_at(body, 4, 0).as_deref(), Some("[1]"));
+        assert_eq!(matrix_at(body, 4, 2).as_deref(), Some("[10]"));
+        assert_eq!(matrix_at(body, 4, 3), None);
+    }
+
+    #[test]
+    fn index_empty() {
+        let bytes = XValue::Index(vec![]).encode();
+        let h = decode_xvalue_head(&bytes);
+        assert_eq!(h.dims(), vec![0, 0]);
+        assert_eq!(decode_xvalue(&bytes), XValue::Index(vec![]));
+    }
+
+    #[test]
+    fn ext_index_roundtrip() {
+        // ext_path 置 body 头部、childs 尾部矩阵（规范排序）。
+        let v = XValue::ExtIndex(ExtIndex {
+            childs: vec!["b".into(), "a".into()],
+            ext_path: "/lib/main·add/".into(),
+        });
+        let bytes = v.encode();
+        let h = decode_xvalue_head(&bytes);
+        assert_eq!(h.kind(), KIND_EXT_INDEX);
+        assert_eq!(h.dims(), vec![2, 1]); // N=2, M=1
+        assert_eq!(
+            decode_xvalue(&bytes),
+            XValue::ExtIndex(ExtIndex {
+                childs: vec!["a".into(), "b".into()],
+                ext_path: "/lib/main·add/".into(),
+            })
+        );
     }
 
     #[test]

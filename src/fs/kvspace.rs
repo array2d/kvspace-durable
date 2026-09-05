@@ -156,44 +156,6 @@ impl FsKVSpace {
         }
     }
 
-    fn read_order(&self, dir_key: &str) -> Vec<String> {
-        match fs::read(self.fs_path(dir_key).join(ORDER_MARKER)) {
-            Ok(b) => String::from_utf8_lossy(&b)
-                .split('\n')
-                .filter(|s| !s.is_empty())
-                .map(|s| s.to_string())
-                .collect(),
-            Err(_) => Vec::new(),
-        }
-    }
-
-    fn write_order(&self, dir_key: &str, order: &[String]) {
-        let p = self.fs_path(dir_key).join(ORDER_MARKER);
-        if order.is_empty() {
-            let _ = fs::remove_file(p);
-        } else {
-            let content = format!("{}\n", order.join("\n"));
-            let _ = fs::write(p, content);
-        }
-    }
-
-    fn add_order(&self, dir_key: &str, child: &str) {
-        let mut order = self.read_order(dir_key);
-        if !order.iter().any(|c| c == child) {
-            order.push(child.to_string());
-            self.write_order(dir_key, &order);
-        }
-    }
-
-    fn remove_order(&self, dir_key: &str, child: &str) {
-        let order: Vec<String> = self
-            .read_order(dir_key)
-            .into_iter()
-            .filter(|c| c != child)
-            .collect();
-        self.write_order(dir_key, &order);
-    }
-
     // ── link 解析（读叶值，同 backend.rs） ─────────────────────────────
 
     fn resolve_path(&self, path: &str) -> String {
@@ -254,7 +216,7 @@ impl FsKVSpace {
             let head = decode_xvalue_head(&data);
             if head.kind() == KIND_EXT_INDEX {
                 let body = head.body(&data);
-                return crate::xvalue_index::decode_ext_index(body).ext_path;
+                return crate::xvalue_index::decode_ext_index(body, &head.dims()).ext_path;
             }
         }
         // 结构感知：ext 也可能存在 marker 文件里
@@ -312,15 +274,8 @@ impl FsKVSpace {
                 }
             }
         }
-        // map 目录按坐标 row-major 数值升序；其余按 __order__ 还原插入顺序。
-        if self.fs_path(dir_key).join(MAP_MARKER).is_file() {
-            children.sort_by(|a, b| cmp_coord(a, b));
-        } else {
-            let order = self.read_order(dir_key);
-            if !order.is_empty() {
-                children.sort_by_key(|c| order.iter().position(|o| o == c).unwrap_or(usize::MAX));
-            }
-        }
+        // memindex 统一按 cmp_coord 规范排序（坐标 row-major 数值序、字符串键字典序），三后端一致。
+        children.sort_by(|a, b| cmp_coord(a, b));
         children
     }
 
@@ -437,12 +392,10 @@ impl KVSpace for FsKVSpace {
 
             // 目录 index 值：结构派生，无需存；ExtIndex 写 marker。
             if let XValue::ExtIndex(e) = &p.val {
-                let (parent, name) = Self::parent_name(&resolved);
                 self.ensure_dir(&resolved);
                 let marker = self.fs_path(&resolved).join(EXTINDEX_MARKER);
                 fs::write(&marker, e.ext_path.as_bytes())
                     .map_err(|e| format!("kvspace-fs: extindex {}: {}", resolved, e))?;
-                self.add_order(&parent, &format!("{}{}", name, Self::suffix_for(&resolved)));
                 continue;
             }
             if let XValue::Obj = &p.val {
@@ -451,11 +404,10 @@ impl KVSpace for FsKVSpace {
                 } else {
                     strip_dir_suf(&resolved).to_string()
                 };
-                let (parent, name) = Self::parent_name(&base);
+                let (parent, _name) = Self::parent_name(&base);
                 self.ensure_dir(&parent); // 父可能是同名叶文件（如 /lib/input defrwir）→ 提升为目录
                 self.write_leaf(&base, &p.raw.clone().unwrap_or_else(|| p.val.encode()));
                 self.ensure_dir(&format!("{}{}", base, OBJ_SEP));
-                self.add_order(&parent, &format!("{}{}", name, OBJ_SEP));
                 continue;
             }
             if let XValue::Map(dims) = &p.val {
@@ -464,18 +416,15 @@ impl KVSpace for FsKVSpace {
                 } else {
                     strip_dir_suf(&resolved).to_string()
                 };
-                let (parent, name) = Self::parent_name(&base);
+                let (parent, _name) = Self::parent_name(&base);
                 self.ensure_dir(&parent); // 父可能是同名叶文件（如 /lib/input defrwir）→ 提升为目录
                 self.write_leaf(&base, &p.raw.clone().unwrap_or_else(|| p.val.encode()));
                 self.ensure_dir(&format!("{}{}", base, OBJ_SEP));
                 let _ = dims;
-                self.add_order(&parent, &format!("{}{}", name, OBJ_SEP));
                 continue;
             }
             if let XValue::Index(_) = &p.val {
-                let (parent, name) = Self::parent_name(&resolved);
                 self.ensure_dir(&resolved);
-                self.add_order(&parent, &format!("{}{}", name, DIR_INDEX_SUF));
                 continue;
             }
 
@@ -484,7 +433,6 @@ impl KVSpace for FsKVSpace {
             self.ensure_dir(&parent);
             let bytes = p.raw.clone().unwrap_or_else(|| p.val.encode());
             self.write_leaf(&resolved, &bytes);
-            self.add_order(&parent, &name);
             // 坐标段成员写入未显式创建容器 → 自动建 stringkeymap 值（dims 由坐标推导）。
             if parent.ends_with(OBJ_SEP) && is_coord(&name) {
                 let base = strip_dir_suf(&parent);
@@ -515,16 +463,6 @@ impl KVSpace for FsKVSpace {
         }
         let mut members = self.dir_children(&resolved);
 
-        // stringkeymap：容器值（无后缀 p）的 kind 决定 row-major 升序。
-        if resolved.ends_with(OBJ_SEP) {
-            let base = strip_dir_suf(&resolved);
-            if let Some(data) = self.read_leaf(base) {
-                if decode_xvalue_head(&data).kind() == KIND_MAP {
-                    members.sort_by(|a, b| cmp_coord(a, b));
-                }
-            }
-        }
-
         if expand_ext {
             let ext_t = self.prefix_ext(&resolved);
             if !ext_t.is_empty() {
@@ -541,20 +479,11 @@ impl KVSpace for FsKVSpace {
     fn del(&mut self, keys: &[String]) -> Result<(), String> {
         for key in keys {
             let resolved = self.resolve_parent(key);
-            let is_dir = Self::is_dir_key(&resolved);
-            let (parent, name) = if is_dir {
-                let (p, n) = Self::parent_name(&resolved);
-                (p, format!("{}{}", n, Self::suffix_for(&resolved)))
-            } else {
-                let (p, n, _) = split_index(&resolved);
-                (p, n)
-            };
-            if is_dir {
+            if Self::is_dir_key(&resolved) {
                 let _ = fs::remove_dir_all(self.fs_path(&resolved));
             } else {
                 self.remove_leaf(&resolved);
             }
-            self.remove_order(&parent, &name);
         }
         Ok(())
     }
@@ -573,8 +502,6 @@ impl KVSpace for FsKVSpace {
             }
         }
         let _ = fs::remove_dir_all(self.fs_path(&resolved));
-        let (parent, name) = Self::parent_name(&resolved);
-        self.remove_order(&parent, &format!("{}{}", name, Self::suffix_for(&resolved)));
         Ok(())
     }
 
@@ -622,24 +549,9 @@ impl KVSpace for FsKVSpace {
             Self::copy_recursive(&smem, &dmem)
                 .map_err(|e| format!("CpTree {}→{}: {}", src, dst, e))?;
         }
-        // 登记 dst 根进父 order：按 base 值 kind / 成员目录形态定后缀。
-        let (parent, name) = Self::parent_name(&dst_base);
+        // 确保 dst 父目录存在（成员名单结构派生，无需登记）。
+        let (parent, _name) = Self::parent_name(&dst_base);
         self.ensure_dir(&parent);
-        let suffix = if let Some(data) = self.read_leaf(&dst_base) {
-            let k = decode_xvalue_head(&data).kind();
-            if k == KIND_OBJ || k == KIND_MAP {
-                OBJ_SEP
-            } else {
-                ""
-            }
-        } else if dmem.exists() {
-            OBJ_SEP
-        } else if db.is_dir() {
-            DIR_INDEX_SUF
-        } else {
-            ""
-        };
-        self.add_order(&parent, &format!("{}{}", name, suffix));
         Ok(())
     }
 
@@ -684,25 +596,8 @@ impl KVSpace for FsKVSpace {
                 }
             }
         }
-        let (parent, name) = Self::parent_name(&dst_base);
+        let (parent, _name) = Self::parent_name(&dst_base);
         self.ensure_dir(&parent);
-        let db = self.node_path(&dst_base);
-        let dmem = self.node_path(&format!("{}{}", dst_base, OBJ_SEP));
-        let suffix = if let Some(data) = self.read_leaf(&dst_base) {
-            let k = decode_xvalue_head(&data).kind();
-            if k == KIND_OBJ || k == KIND_MAP {
-                OBJ_SEP
-            } else {
-                ""
-            }
-        } else if dmem.exists() {
-            OBJ_SEP
-        } else if db.is_dir() {
-            DIR_INDEX_SUF
-        } else {
-            ""
-        };
-        self.add_order(&parent, &format!("{}{}", name, suffix));
         Ok(())
     }
 

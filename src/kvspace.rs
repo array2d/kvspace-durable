@@ -46,6 +46,25 @@ pub trait KVSpace {
 
     /// 列目录：resolve 是否穿透 link 列出 target 的子节点。
     fn list(&mut self, prefix: &str, expand_ext: bool, resolve: bool) -> Vec<String>;
+    /// 直接子项数（listlen）。默认回退全量 list().len()；blob 索引后端可覆写为 O(1) 读 count 头。
+    fn list_len(&mut self, prefix: &str, expand_ext: bool, resolve: bool) -> i32 {
+        self.list(prefix, expand_ext, resolve).len() as i32
+    }
+    /// 第 idx 个直接子项名（listat）。默认回退全量 list() 取 nth；blob 索引后端可覆写为 O(1) 借 offset 表切。
+    fn list_at(
+        &mut self,
+        prefix: &str,
+        idx: i32,
+        expand_ext: bool,
+        resolve: bool,
+    ) -> Option<String> {
+        if idx < 0 {
+            return None;
+        }
+        self.list(prefix, expand_ext, resolve)
+            .into_iter()
+            .nth(idx as usize)
+    }
     /// POSIX rm：最终组件是 link → 删 link 本体。
     fn del(&mut self, keys: &[String]) -> Result<(), String>;
     /// 递归删除；prefix 本身是链接则只删链接。

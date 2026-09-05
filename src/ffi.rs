@@ -328,10 +328,10 @@ pub extern "C" fn kvspaceListLen(
         return 1;
     }
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        hd.kv.list(&prefix, expand_ext != 0, resolve != 0).len()
+        hd.kv.list_len(&prefix, expand_ext != 0, resolve != 0)
     })) {
         Ok(n) => {
-            unsafe { *out_count = n as i32 };
+            unsafe { *out_count = n };
             0
         }
         Err(_) => {
@@ -366,16 +366,14 @@ pub extern "C" fn kvspaceListAt(
     if hd.flush().is_err() || hd.kv.validate_dir(&prefix).is_err() {
         return 1;
     }
-    let names = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        hd.kv.list(&prefix, expand_ext != 0, resolve != 0)
+    let name = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        hd.kv.list_at(&prefix, idx, expand_ext != 0, resolve != 0)
     })) {
-        Ok(n) => n,
+        Ok(Some(n)) => n,
+        Ok(None) => return 1,
         Err(_) => return 1,
     };
-    if idx < 0 || idx as usize >= names.len() {
-        return 1;
-    }
-    let name = names[idx as usize].as_bytes();
+    let name = name.as_bytes();
     unsafe {
         *out_len = name.len() as u32;
     }

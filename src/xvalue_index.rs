@@ -1,6 +1,7 @@
-// xvalue_index.rs — 对齐 xvalue_index.go（Index、ObjIndex、ExtIndex）
+// xvalue_index.rs — memindex 定宽排序矩阵（index / object / stringkeymap / extindex 共用）
 
-use crate::r#const::*;
+use crate::coord::cmp_coord;
+use crate::r#const::ERR_MAP_NDIM;
 use crate::xvalue::{ExtIndex, XValue};
 
 pub fn new_index(children: &[String]) -> XValue {
@@ -23,58 +24,72 @@ pub fn new_ext_index(children: &[String], ext_path: &str) -> XValue {
     })
 }
 
-/// index/object/stringkeymap 三类 index body 一律前缀 [4B count LE]（成员数），
-/// 后接成员名列表（INDEX_VALUE_SEP 连接）。count 使成员数 O(1) 可取，不再靠 split 现数。
-pub fn encode_index_raw(children: &[String]) -> Vec<u8> {
-    let mut buf = (children.len() as u32).to_le_bytes().to_vec();
-    buf.extend(children.join(INDEX_VALUE_SEP).into_bytes());
-    buf
+// 成员名单统一编码为定宽排序矩阵：几何 [N,M] 落 XValueHead 的 dims，body 纯 N×M。
+//   N = 成员数；M = 成员 UTF-8 字节最大长度（行宽）。
+//   每行 = 成员名 UTF-8 + NUL 补齐到 M（UTF-8 永不含 0x00，NUL 补齐/终止安全）。
+//   全表按 cmp_coord 规范排序 → 三后端 blob 逐字节一致，listat/listlen O(1)、成员二分 O(log N)。
+
+/// 成员名单 → (dims=[N,M], body)。encode 侧规范排序，调用方无需预排。
+pub fn encode_index(children: &[String]) -> (Vec<i32>, Vec<u8>) {
+    let mut c: Vec<&str> = children.iter().map(|s| s.as_str()).collect();
+    c.sort_by(|a, b| cmp_coord(a, b));
+    let n = c.len();
+    let m = c.iter().map(|s| s.len()).max().unwrap_or(0);
+    let mut body = vec![0u8; n * m];
+    for (i, s) in c.iter().enumerate() {
+        body[i * m..i * m + s.len()].copy_from_slice(s.as_bytes());
+    }
+    (vec![n as i32, m as i32], body)
 }
 
-/// 跳过 body 前 [4B count LE] 前缀，返回成员名段。
-fn body_names(body: &[u8]) -> &[u8] {
-    if body.len() < 4 {
-        return &[];
-    }
-    &body[4..]
+/// 定宽矩阵解码：N=dims[0]、M=dims[1]，每行去尾 NUL。
+pub fn decode_index(body: &[u8], dims: &[i32]) -> Vec<String> {
+    let m = matrix_width(dims);
+    (0..matrix_count(dims))
+        .filter_map(|i| matrix_at(body, m, i))
+        .collect()
 }
 
-pub fn decode_index(body: &[u8]) -> Vec<String> {
-    let s = String::from_utf8_lossy(body_names(body)).into_owned();
-    if s.is_empty() {
-        return Vec::new();
-    }
-    s.split('\n').map(|x| x.to_string()).collect()
-}
-pub fn decode_obj_index(body: &[u8]) -> Vec<String> {
-    decode_index(body)
-}
-pub fn decode_ext_index(body: &[u8]) -> ExtIndex {
-    let (ext_path, childs) = decode_ext_index_raw(body);
+pub fn decode_ext_index(body: &[u8], dims: &[i32]) -> ExtIndex {
+    let n = matrix_count(dims);
+    let m = matrix_width(dims);
+    let off = body.len().saturating_sub(n * m);
+    let ext_path = String::from_utf8_lossy(&body[..off]).into_owned();
+    let mat = &body[off..];
+    let childs = (0..n).filter_map(|i| matrix_at(mat, m, i)).collect();
     ExtIndex { childs, ext_path }
 }
 
-/// encodeExtIndexRaw：[4B count LE][…extpath\nname1\nname2...]，count = children.len()（extpath 不计入）。
-pub fn encode_ext_index_raw(ext_path: &str, children: &[String]) -> Vec<u8> {
-    let mut buf = (children.len() as u32).to_le_bytes().to_vec();
-    let mut parts = vec![format!("{}{}", EXT_INDEX_HEAD, ext_path)];
-    parts.extend(children.iter().cloned());
-    buf.extend(parts.join(INDEX_VALUE_SEP).into_bytes());
-    buf
+/// extindex → (dims=[N,M], body)。body = 头部变长 ext_path + 尾部 N×M 矩阵（childs，规范排序）。
+/// ext_path 置头部：帧生命周期内一次写定、childs 才 churn，矩阵起点 off=body_len−N*M 稳定。
+pub fn encode_ext_index(ext_path: &str, children: &[String]) -> (Vec<i32>, Vec<u8>) {
+    let (dims, mat) = encode_index(children);
+    let mut body = ext_path.as_bytes().to_vec();
+    body.extend(mat);
+    (dims, body)
 }
 
-/// decodeExtIndexRaw：跳过 [4B count LE]，首段（去 ExtIndexHead 前缀）= extpath，余段按 IndexValueSep 拆 children。
-pub fn decode_ext_index_raw(body: &[u8]) -> (String, Vec<String>) {
-    let s = String::from_utf8_lossy(body_names(body)).into_owned();
-    if s.is_empty() {
-        return (String::new(), Vec::new());
+/// 成员数 = head dims[0]（O(1)，不碰 body）。
+pub fn matrix_count(dims: &[i32]) -> usize {
+    dims.first().map(|&n| n.max(0) as usize).unwrap_or(0)
+}
+
+/// 行宽 M = head dims[1]。
+fn matrix_width(dims: &[i32]) -> usize {
+    dims.get(1).map(|&m| m.max(0) as usize).unwrap_or(0)
+}
+
+/// 第 idx 行（O(1)），去尾 NUL。越界返回 None。
+pub fn matrix_at(body: &[u8], m: usize, idx: usize) -> Option<String> {
+    if m == 0 {
+        return Some(String::new());
     }
-    let mut it = s.splitn(2, '\n');
-    let first = it.next().unwrap_or("");
-    let ext_path = first.trim_start_matches(EXT_INDEX_HEAD).to_string();
-    let children = match it.next() {
-        Some(rest) => rest.split('\n').map(|x| x.to_string()).collect(),
-        None => Vec::new(),
-    };
-    (ext_path, children)
+    let s = idx * m;
+    let e = s + m;
+    if e > body.len() {
+        return None;
+    }
+    let row = &body[s..e];
+    let end = row.iter().position(|&b| b == 0).unwrap_or(m);
+    Some(String::from_utf8_lossy(&row[..end]).into_owned())
 }

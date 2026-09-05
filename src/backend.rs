@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use crate::coord::{cmp_coord, grow_coord_dims, is_coord};
+use crate::coord::{grow_coord_dims, is_coord};
 use crate::kvspace::{KVPair, KVSpace};
 use crate::kvspace_common::{
     dir_exists, get_one, join_path, mk_index_recursive, sep_path, split_index, strip_dir_suf,
@@ -258,10 +258,30 @@ impl<S: KVStore> Backend<S> {
             let head = decode_xvalue_head(&data);
             if head.kind() == KIND_EXT_INDEX {
                 let body = head.body(&data);
-                return crate::xvalue_index::decode_ext_index(body).ext_path;
+                return crate::xvalue_index::decode_ext_index(body, &head.dims()).ext_path;
             }
         }
         String::new()
+    }
+
+    /// listlen/listat O(1) 快路径的取值口：仅纯 index memindex 返 (dims=[N,M], body=N×M 矩阵)。
+    /// ext_index（body 头部含 ext_path）与非目录/非 index 返 None，交回退全量 list()。
+    fn index_head_body(&mut self, prefix: &str, resolve: bool) -> Option<(Vec<i32>, Vec<u8>)> {
+        let resolved = if resolve {
+            self.resolve_path(prefix)
+        } else {
+            prefix.to_string()
+        };
+        if !Self::is_dir(&resolved) {
+            return None;
+        }
+        let data = self.store.get(&resolved)?;
+        let head = decode_xvalue_head(&data);
+        if head.kind() == KIND_INDEX {
+            Some((head.dims(), head.body(&data).to_vec()))
+        } else {
+            None
+        }
     }
 }
 
@@ -426,7 +446,7 @@ impl<S: KVStore> KVSpace for Backend<S> {
                 let head = decode_xvalue_head(&data);
                 if head.kind() == KIND_EXT_INDEX {
                     let body = head.body(&data);
-                    let ext_t = crate::xvalue_index::decode_ext_index(body).ext_path;
+                    let ext_t = crate::xvalue_index::decode_ext_index(body, &head.dims()).ext_path;
                     let local_nodes = self.read_dir_index(&parent);
                     let local_exists = local_nodes.iter().any(|n| n == &name);
                     if !local_exists {
@@ -467,14 +487,10 @@ impl<S: KVStore> KVSpace for Backend<S> {
                 }
             }
 
-            let mut seen = std::collections::HashSet::new();
-            for n in &nodes {
-                seen.insert(n.clone());
-            }
+            let mut seen: std::collections::HashSet<String> = nodes.iter().cloned().collect();
             for n in &names {
-                if !seen.contains(n) {
+                if seen.insert(n.clone()) {
                     nodes.push(n.clone());
-                    seen.insert(n.clone());
                 }
             }
 
@@ -500,17 +516,8 @@ impl<S: KVStore> KVSpace for Backend<S> {
             return Vec::new();
         }
 
-        let mut members = self.read_dir_index(&resolved);
-
-        // stringkeymap：容器值（无后缀 p）的 kind 决定 row-major 升序。
-        if resolved.ends_with(OBJ_SEP) {
-            let base = strip_dir_suf(&resolved);
-            if let Some(data) = self.store.get(base) {
-                if decode_xvalue_head(&data).kind() == KIND_MAP {
-                    members.sort_by(|a, b| cmp_coord(a, b));
-                }
-            }
-        }
+        // map 成员在 add_child 时已按坐标 row-major 有序存储，list/listat 一律信任存储序，无读时排序。
+        let members = self.read_dir_index(&resolved);
 
         let mut ext_members: Vec<String> = Vec::new();
         if expand_ext {
@@ -535,6 +542,40 @@ impl<S: KVStore> KVSpace for Backend<S> {
         result
     }
 
+    /// O(1) 覆写：无 ext 展开的 index memindex 直接读 head dims[0]=N；ext/其余回退全量。
+    fn list_len(&mut self, prefix: &str, expand_ext: bool, resolve: bool) -> i32 {
+        if !expand_ext {
+            if let Some((dims, _)) = self.index_head_body(prefix, resolve) {
+                return crate::xvalue_index::matrix_count(&dims) as i32;
+            }
+        }
+        self.list(prefix, expand_ext, resolve).len() as i32
+    }
+
+    /// O(1) 覆写：无 ext 展开的 index memindex 取矩阵第 idx 行；ext/其余回退全量。
+    fn list_at(
+        &mut self,
+        prefix: &str,
+        idx: i32,
+        expand_ext: bool,
+        resolve: bool,
+    ) -> Option<String> {
+        if idx < 0 {
+            return None;
+        }
+        if !expand_ext {
+            if let Some((dims, body)) = self.index_head_body(prefix, resolve) {
+                if idx as usize >= crate::xvalue_index::matrix_count(&dims) {
+                    return None;
+                }
+                return crate::xvalue_index::matrix_at(&body, dims.get(1).map_or(0, |&m| m as usize), idx as usize);
+            }
+        }
+        self.list(prefix, expand_ext, resolve)
+            .into_iter()
+            .nth(idx as usize)
+    }
+
     fn del(&mut self, keys: &[String]) -> Result<(), String> {
         for key in keys {
             let resolved = self.resolve_parent(key);
@@ -545,7 +586,7 @@ impl<S: KVStore> KVSpace for Backend<S> {
                 let head = decode_xvalue_head(&data);
                 if head.kind() == KIND_EXT_INDEX {
                     let body = head.body(&data);
-                    let ext_t = crate::xvalue_index::decode_ext_index(body).ext_path;
+                    let ext_t = crate::xvalue_index::decode_ext_index(body, &head.dims()).ext_path;
                     let local_nodes = self.read_dir_index(&parent);
                     let local_exists = local_nodes.iter().any(|n| n == &name);
                     if !local_exists {
