@@ -342,14 +342,16 @@ pub extern "C" fn kvspaceListLen(
     }
 }
 
-/// 借用枚举：*out 指向句柄内复用的 list_buf（\n 连接的直接子项名，活到下次同句柄 List），
-/// 调用方不得 free。空目录 → *out=NULL、*out_len=0。
+/// 借用索引取项：返回前缀下第 idx 个直接子项名，*out 指向句柄内复用的 list_buf（活到下次
+/// 同句柄 ListAt），调用方不得 free。idx 越界 → *out=NULL、*out_len=0、返回非 0。配合
+/// kvspaceListLen 遍历，不再一次性返回整段名单缓冲。
 #[no_mangle]
-pub extern "C" fn kvspaceList(
+pub extern "C" fn kvspaceListAt(
     h: *mut Handle,
     prefix: *const c_char,
     expand_ext: c_int,
     resolve: c_int,
+    idx: i32,
     out: *mut *mut u8,
     out_len: *mut u32,
 ) -> c_int {
@@ -371,10 +373,10 @@ pub extern "C" fn kvspaceList(
         Ok(n) => n,
         Err(_) => return 1,
     };
-    if names.is_empty() {
-        return 0;
+    if idx < 0 || idx as usize >= names.len() {
+        return 1;
     }
-    hd.list_buf = names.join("\n").into_bytes();
+    hd.list_buf = names[idx as usize].clone().into_bytes();
     unsafe {
         *out = hd.list_buf.as_mut_ptr();
         *out_len = hd.list_buf.len() as u32;
