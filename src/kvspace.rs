@@ -81,8 +81,8 @@ pub trait KVSpace {
     /// 阻塞等待 Get(key)==targetValue。
     fn watch(&mut self, key: &str, target_value: &XValue, tick_duration: Duration) -> XValue;
 
-    /// 递归创建目录，类似 mkdir -p；path 须以 / 结尾。
-    fn mkindex(&mut self, path: &str) -> Result<(), String>;
+    /// 递归创建目录，类似 mkdir -p；path 须以 / 结尾。capacity 预留叶 index 容量（减少扩容）。
+    fn mkindex(&mut self, path: &str, capacity: u32) -> Result<(), String>;
 
     /// 创建扩展索引，path 为写层，extpath 为只读扩展。
     fn ext_index(&mut self, path: &str, ext_path: &str) -> Result<(), String>;

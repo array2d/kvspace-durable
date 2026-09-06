@@ -498,6 +498,7 @@ pub extern "C" fn kvspaceCpList(
 pub extern "C" fn kvspaceMkindex(
     h: *mut Handle,
     path: *const c_char,
+    capacity: u32,
     err: *mut c_char,
     err_cap: u32,
 ) -> c_int {
@@ -509,7 +510,7 @@ pub extern "C" fn kvspaceMkindex(
         }
     };
     result_to_code(
-        catch_panic(|| kv.mkindex(unsafe { cstr(path) })),
+        catch_panic(|| kv.mkindex(unsafe { cstr(path) }, capacity)),
         err,
         err_cap,
     )

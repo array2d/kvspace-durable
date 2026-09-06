@@ -605,7 +605,8 @@ impl KVSpace for FsKVSpace {
         watch_value(self, key, target_value, tick_duration)
     }
 
-    fn mkindex(&mut self, path: &str) -> Result<(), String> {
+    fn mkindex(&mut self, path: &str, _capacity: u32) -> Result<(), String> {
+        // 目录原生后端：成员即真实文件，无定宽矩阵可预留，capacity 无意义。
         if !Self::is_dir_key(path) {
             return Err(format!("{}: Mkindex {}", ERR_DIR_MUST_END_WITH_SLASH, path));
         }

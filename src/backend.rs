@@ -11,8 +11,13 @@ use crate::kvspace_common::{
 };
 use crate::r#const::*;
 use crate::store::KVStore;
-use crate::xvalue::{decode_xvalue, decode_xvalue_head, is_none, is_ptr, ptr_target, XValue};
-use crate::xvalue_index::{new_ext_index, new_index, new_map_index, new_obj_index};
+use crate::xvalue::{
+    decode_xvalue, decode_xvalue_head, encode_head, is_none, is_ptr, ptr_target, XValue,
+};
+use crate::xvalue_index::{
+    encode_ext_index_grow, encode_index_grow, grow_cap, matrix_cap, matrix_width, new_ext_index,
+    new_index, new_map_index, new_obj_index,
+};
 
 pub struct Backend<S: KVStore> {
     store: S,
@@ -188,6 +193,9 @@ impl<S: KVStore> Backend<S> {
                 }
             }
             Some(data) => {
+                let dims = decode_xvalue_head(&data).dims();
+                let old_cap = matrix_cap(&dims);
+                let old_m = matrix_width(&dims);
                 let v = decode_xvalue(&data);
                 match v {
                     XValue::Index(nodes) => {
@@ -196,8 +204,9 @@ impl<S: KVStore> Backend<S> {
                             return;
                         }
                         nodes.push(name.to_string());
-                        let v = new_index(&nodes);
-                        self.store.set(parent, &v.encode());
+                        let cap = grow_cap(old_cap, nodes.len());
+                        let (d, b) = encode_index_grow(&nodes, cap, old_m);
+                        self.store.set(parent, &encode_head(KIND_INDEX, 0, &d, &b));
                     }
                     XValue::ExtIndex(e) => {
                         if e.childs.iter().any(|c| c == name) {
@@ -205,8 +214,9 @@ impl<S: KVStore> Backend<S> {
                         }
                         let mut childs = e.childs.clone();
                         childs.push(name.to_string());
-                        let v = new_ext_index(&childs, &e.ext_path);
-                        self.store.set(parent, &v.encode());
+                        let cap = grow_cap(old_cap, childs.len());
+                        let (d, b) = encode_ext_index_grow(&e.ext_path, &childs, cap, old_m);
+                        self.store.set(parent, &encode_head(KIND_EXT_INDEX, 0, &d, &b));
                     }
                     other => panic!("add_child: unexpected kind {}", other.kind()),
                 }
@@ -223,20 +233,23 @@ impl<S: KVStore> Backend<S> {
         match self.store.get(parent) {
             None => {}
             Some(data) => {
+                let dims = decode_xvalue_head(&data).dims();
+                let old_cap = matrix_cap(&dims); // 删除不缩 cap
+                let old_m = matrix_width(&dims);
                 let v = decode_xvalue(&data);
                 match v {
                     XValue::Index(nodes) => {
                         let nodes = normalize_children(nodes);
                         let filtered: Vec<String> =
                             nodes.into_iter().filter(|n| !is_removed(n)).collect();
-                        let v = new_index(&filtered);
-                        self.store.set(parent, &v.encode());
+                        let (d, b) = encode_index_grow(&filtered, old_cap, old_m);
+                        self.store.set(parent, &encode_head(KIND_INDEX, 0, &d, &b));
                     }
                     XValue::ExtIndex(e) => {
                         let filtered: Vec<String> =
                             e.childs.into_iter().filter(|n| !is_removed(n)).collect();
-                        let v = new_ext_index(&filtered, &e.ext_path);
-                        self.store.set(parent, &v.encode());
+                        let (d, b) = encode_ext_index_grow(&e.ext_path, &filtered, old_cap, old_m);
+                        self.store.set(parent, &encode_head(KIND_EXT_INDEX, 0, &d, &b));
                     }
                     other => panic!("remove_child: unexpected kind {}", other.kind()),
                 }
@@ -473,8 +486,13 @@ impl<S: KVStore> KVSpace for Backend<S> {
             let mut nodes: Vec<String> = Vec::new();
             let mut ext_path = String::new();
             let mut is_ext = false;
+            let mut old_cap = 0usize;
+            let mut old_m = 0usize;
 
             if let Some(data) = self.store.get(&parent) {
+                let dims = decode_xvalue_head(&data).dims();
+                old_cap = matrix_cap(&dims);
+                old_m = matrix_width(&dims);
                 let v = decode_xvalue(&data);
                 match v {
                     XValue::Index(c) => nodes = normalize_children(c),
@@ -494,12 +512,14 @@ impl<S: KVStore> KVSpace for Backend<S> {
                 }
             }
 
-            let v = if is_ext {
-                new_ext_index(&nodes, &ext_path)
+            let cap = grow_cap(old_cap, nodes.len());
+            if is_ext {
+                let (d, b) = encode_ext_index_grow(&ext_path, &nodes, cap, old_m);
+                self.store.set(&parent, &encode_head(KIND_EXT_INDEX, 0, &d, &b));
             } else {
-                new_index(&nodes)
-            };
-            self.store.set(&parent, &v.encode());
+                let (d, b) = encode_index_grow(&nodes, cap, old_m);
+                self.store.set(&parent, &encode_head(KIND_INDEX, 0, &d, &b));
+            }
         }
 
         Ok(())
@@ -568,7 +588,7 @@ impl<S: KVStore> KVSpace for Backend<S> {
                 if idx as usize >= crate::xvalue_index::matrix_count(&dims) {
                     return None;
                 }
-                return crate::xvalue_index::matrix_at(&body, dims.get(1).map_or(0, |&m| m as usize), idx as usize);
+                return crate::xvalue_index::matrix_at(&body, crate::xvalue_index::matrix_width(&dims), idx as usize);
             }
         }
         self.list(prefix, expand_ext, resolve)
@@ -753,7 +773,7 @@ impl<S: KVStore> KVSpace for Backend<S> {
         watch_value(self, key, target_value, tick_duration)
     }
 
-    fn mkindex(&mut self, path: &str) -> Result<(), String> {
+    fn mkindex(&mut self, path: &str, capacity: u32) -> Result<(), String> {
         if !Self::is_dir(path) {
             return Err(format!("{}: Mkindex {}", ERR_DIR_MUST_END_WITH_SLASH, path));
         }
@@ -772,6 +792,18 @@ impl<S: KVStore> KVSpace for Backend<S> {
                 let (parent, name) = Self::parent_name(&cur);
                 self.add_child(&parent, &format!("{}{}", name, DIR_INDEX_SUF));
             }
+        }
+        // 叶目录预留容量：存 [0,cap,0]，首成员插入时 grow_cap(cap,1)=cap 物化 cap×M，不重分配。
+        if capacity > 0 && cur != PATH_SEP {
+            let nodes = self.read_dir_index(&cur);
+            let old_m = self
+                .store
+                .get(&cur)
+                .map(|d| matrix_width(&decode_xvalue_head(&d).dims()))
+                .unwrap_or(0);
+            let cap = grow_cap(capacity as usize, nodes.len());
+            let (d, b) = encode_index_grow(&nodes, cap, old_m);
+            self.store.set(&cur, &encode_head(KIND_INDEX, 0, &d, &b));
         }
         Ok(())
     }

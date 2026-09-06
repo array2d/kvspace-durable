@@ -641,7 +641,7 @@ mod tests {
         let bytes = v.encode();
         let h = decode_xvalue_head(&bytes);
         assert_eq!(h.kind(), KIND_INDEX);
-        assert_eq!(h.dims(), vec![3, 4]); // N=3, M=len("[10]")=4
+        assert_eq!(h.dims(), vec![3, 3, 8]); // len=3, cap=3, M=align8(len("[10]")=4)=8
         let decoded = decode_xvalue(&bytes);
         assert_eq!(
             decoded,
@@ -650,16 +650,16 @@ mod tests {
         // O(1) 原语走 head+body。
         let body = h.body(&bytes);
         assert_eq!(matrix_count(&h.dims()), 3);
-        assert_eq!(matrix_at(body, 4, 0).as_deref(), Some("[1]"));
-        assert_eq!(matrix_at(body, 4, 2).as_deref(), Some("[10]"));
-        assert_eq!(matrix_at(body, 4, 3), None);
+        assert_eq!(matrix_at(body, 8, 0).as_deref(), Some("[1]"));
+        assert_eq!(matrix_at(body, 8, 2).as_deref(), Some("[10]"));
+        assert_eq!(matrix_at(body, 8, 3), None);
     }
 
     #[test]
     fn index_empty() {
         let bytes = XValue::Index(vec![]).encode();
         let h = decode_xvalue_head(&bytes);
-        assert_eq!(h.dims(), vec![0, 0]);
+        assert_eq!(h.dims(), vec![0, 0, 0]);
         assert_eq!(decode_xvalue(&bytes), XValue::Index(vec![]));
     }
 
@@ -673,7 +673,7 @@ mod tests {
         let bytes = v.encode();
         let h = decode_xvalue_head(&bytes);
         assert_eq!(h.kind(), KIND_EXT_INDEX);
-        assert_eq!(h.dims(), vec![2, 1]); // N=2, M=1
+        assert_eq!(h.dims(), vec![2, 2, 8]); // len=2, cap=2, M=align8(1)=8
         assert_eq!(
             decode_xvalue(&bytes),
             XValue::ExtIndex(ExtIndex {
