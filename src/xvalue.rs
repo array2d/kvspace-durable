@@ -5,19 +5,34 @@
 use crate::r#const::*;
 
 // ── XValueHead ─────────────────────────────────────────────────────────────
-// XValueHead = [1B kindexprlen][kindexpr 含 0x00 padding][1B ro][4B vid LE][4B body_len LE]
-//   kindexpr 串首字节 * =指针 / @ =扩展句柄 / 无 =内联，其后 [d0,d1]kind 承载 ndim+dims：
-//   裸 kind=标量(ndim=0)、[n]kind=一维、[d0,d1]kind=多维。kindexprlen 为槽总长（含 padding），
-//   reshape 时新 kindexpr 不超过槽长即可原地改写不搬 body；内容以首个 NUL 终止。
+// XValueHead = [1B xkind][1B kindexprlen][kindexpr 含 0x00 padding][1B ro][4B vid LE][4B body_len LE]
+//   xkind 五分类：0=None 1=Ptr 2=ExtValue 3=DefKindexpr(rwfunc/defrwir) 4=RealValue。
+//   kindexpr 无前缀，[d0,d1]kind 承载 ndim+dims：裸 kind=标量(ndim=0)、[n]kind=一维、[d0,d1]kind=多维。
+//   kindexprlen 为槽总长（含 padding），reshape 时新 kindexpr 不超槽长即原地改写不搬 body；内容以首个 NUL 终止。
 
-/// kindexpr 构建：ref 前缀(*/@) + [dims] + kind。
-fn kindexpr_string(kind: &str, r#ref: i32, dims: &[i32]) -> String {
-    let mut s = String::new();
-    if r#ref == 1 {
-        s.push('*');
-    } else if r#ref == 2 {
-        s.push('@');
+pub const XKIND_NONE: u8 = 0;
+pub const XKIND_PTR: u8 = 1;
+pub const XKIND_EXTVALUE: u8 = 2;
+pub const XKIND_DEFKINDEXPR: u8 = 3;
+pub const XKIND_REALVALUE: u8 = 4;
+
+fn is_def_kind(kind: &str) -> bool {
+    kind == "rwfunc" || kind == "defrwir"
+}
+
+/// (kind, ref) → xkind 五分类。
+fn xkind_of(kind: &str, r#ref: i32) -> u8 {
+    match r#ref {
+        1 => XKIND_PTR,
+        2 => XKIND_EXTVALUE,
+        _ if is_def_kind(kind) => XKIND_DEFKINDEXPR,
+        _ => XKIND_REALVALUE,
     }
+}
+
+/// kindexpr 构建：[dims] + kind（无前缀）。
+fn kindexpr_string(kind: &str, dims: &[i32]) -> String {
+    let mut s = String::new();
     if !dims.is_empty() {
         s.push('[');
         for (i, d) in dims.iter().enumerate() {
@@ -32,34 +47,29 @@ fn kindexpr_string(kind: &str, r#ref: i32, dims: &[i32]) -> String {
     s
 }
 
-/// kindexpr 解析 → (ref, dims, kind)：首字节 */@ 表 ref，[dims] 段表形状，其余为基 kind。
-fn parse_kindexpr(s: &str) -> (i32, Vec<i32>, String) {
-    let (r#ref, rest) = match s.as_bytes().first() {
-        Some(b'*') => (1, &s[1..]),
-        Some(b'@') => (2, &s[1..]),
-        _ => (0, s),
-    };
-    if rest.starts_with('[') {
-        match rest.find(']') {
+/// kindexpr 解析 → (dims, kind)：[dims] 段表形状，其余为基 kind。
+fn parse_kindexpr(s: &str) -> (Vec<i32>, String) {
+    if s.starts_with('[') {
+        match s.find(']') {
             Some(end) => (
-                r#ref,
-                rest[1..end]
+                s[1..end]
                     .split(',')
                     .filter(|d| !d.is_empty())
                     .map(|d| d.parse().unwrap_or(0))
                     .collect(),
-                rest[end + 1..].to_string(),
+                s[end + 1..].to_string(),
             ),
-            None => (r#ref, Vec::new(), rest.to_string()),
+            None => (Vec::new(), s.to_string()),
         }
     } else {
-        (r#ref, Vec::new(), rest.to_string())
+        (Vec::new(), s.to_string())
     }
 }
 
 #[derive(Default, Clone, Debug, PartialEq)]
 pub struct XValueHead {
-    pub kindexpr: String, // 内容（含 */@ 前缀与 [dims]，去 NUL/padding）
+    pub xkind: u8,        // 五分类：见 XKIND_*
+    pub kindexpr: String, // 内容（含 [dims]、无前缀，去 NUL/padding）
     pub kindexprlen: u8,  // wire 槽总长（内容 + NUL + padding）
     pub ro: bool,
     pub vid: u32,
@@ -67,26 +77,30 @@ pub struct XValueHead {
 }
 
 impl XValueHead {
-    fn parse(&self) -> (i32, Vec<i32>, String) {
+    fn parse(&self) -> (Vec<i32>, String) {
         parse_kindexpr(&self.kindexpr)
     }
     pub fn r#ref(&self) -> i32 {
-        self.parse().0
+        match self.xkind {
+            XKIND_PTR => 1,
+            XKIND_EXTVALUE => 2,
+            _ => 0,
+        }
     }
     pub fn is_ptr(&self) -> bool {
-        self.parse().0 == 1
+        self.xkind == XKIND_PTR
     }
     pub fn kind(&self) -> String {
-        self.parse().2
-    }
-    pub fn dims(&self) -> Vec<i32> {
         self.parse().1
     }
+    pub fn dims(&self) -> Vec<i32> {
+        self.parse().0
+    }
     pub fn ndim(&self) -> i32 {
-        self.parse().1.len() as i32
+        self.parse().0.len() as i32
     }
     pub fn array_len(&self) -> i32 {
-        let dims = self.parse().1;
+        let dims = self.parse().0;
         if dims.is_empty() {
             1
         } else {
@@ -96,7 +110,7 @@ impl XValueHead {
 
     /// 返回 XValueHead（元数据）字节数，不含 body。
     pub fn head_len(&self) -> i32 {
-        self.kindexprlen as i32 + 10
+        self.kindexprlen as i32 + 11
     }
 
     /// 从完整 XValue 字节 data 截取 body。
@@ -112,11 +126,7 @@ impl XValueHead {
     pub fn decode(&self, body: &[u8]) -> XValue {
         if self.is_ptr() {
             return XValue::Ptr(Ptr {
-                target_kindexpr: self
-                    .kindexpr
-                    .strip_prefix('*')
-                    .unwrap_or(&self.kindexpr)
-                    .to_string(),
+                target_kindexpr: self.kindexpr.clone(),
                 target: String::from_utf8_lossy(body).into_owned(),
             });
         }
@@ -492,12 +502,13 @@ pub fn encode_head_perm(
     ro: bool,
     vid: u32,
 ) -> Vec<u8> {
-    let kx = kindexpr_string(kind, r#ref, dims);
+    let kx = kindexpr_string(kind, dims);
     let slot = (kx.len() + 1) as u8; // 内容 + 1 NUL（当前无额外 padding）
-    let mut buf = vec![0u8; 1 + slot as usize + 1 + 4 + 4 + raw.len()];
-    buf[0] = slot;
-    buf[1..1 + kx.len()].copy_from_slice(kx.as_bytes());
-    let o = 1 + slot as usize;
+    let mut buf = vec![0u8; 2 + slot as usize + 1 + 4 + 4 + raw.len()];
+    buf[0] = xkind_of(kind, r#ref);
+    buf[1] = slot;
+    buf[2..2 + kx.len()].copy_from_slice(kx.as_bytes());
+    let o = 2 + slot as usize;
     buf[o] = ro as u8;
     buf[o + 1..o + 5].copy_from_slice(&vid.to_le_bytes());
     buf[o + 5..o + 9].copy_from_slice(&(raw.len() as u32).to_le_bytes());
@@ -506,15 +517,15 @@ pub fn encode_head_perm(
 }
 
 pub fn decode_xvalue_head(data: &[u8]) -> XValueHead {
-    if data.is_empty() {
+    if data.len() < 2 {
         return XValueHead::default();
     }
-    let slot = data[0] as usize;
-    let o = 1 + slot;
+    let slot = data[1] as usize;
+    let o = 2 + slot;
     if data.len() < o + 9 {
         return XValueHead::default();
     }
-    let kx_bytes = &data[1..o];
+    let kx_bytes = &data[2..o];
     let end = kx_bytes
         .iter()
         .position(|&b| b == 0)
@@ -524,6 +535,7 @@ pub fn decode_xvalue_head(data: &[u8]) -> XValueHead {
         return XValueHead::default();
     }
     XValueHead {
+        xkind: data[0],
         kindexpr: String::from_utf8_lossy(&kx_bytes[..end]).into_owned(),
         kindexprlen: slot as u8,
         ro: data[o] != 0,

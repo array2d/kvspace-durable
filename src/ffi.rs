@@ -61,19 +61,20 @@ unsafe fn kv_flush<'a>(h: *mut Handle) -> Result<&'a mut dyn KVSpace, String> {
     Ok(&mut *hd.kv)
 }
 
-/// 由 kindexpr 串 + body_len 直接构造 head（ro=0 vid=0）并预留 body_len 零字节。
+/// 由 xkind + kindexpr 串 + body_len 直接构造 head（ro=0 vid=0）并预留 body_len 零字节。
 /// 与 kvspace-c kvspaceXvalueWriteHead 逐字节一致。
-fn build_tlv(kindexpr: &str, body_len: usize) -> Vec<u8> {
+fn build_tlv(xkind: u8, kindexpr: &str, body_len: usize) -> Vec<u8> {
     let kx = kindexpr.as_bytes();
     let slot = kx.len() + 1;
-    let mut v = Vec::with_capacity(1 + slot + 9 + body_len);
+    let mut v = Vec::with_capacity(2 + slot + 9 + body_len);
+    v.push(xkind);
     v.push(slot as u8);
     v.extend_from_slice(kx);
     v.push(0); // kindexpr NUL
     v.push(0); // ro
     v.extend_from_slice(&0u32.to_le_bytes()); // vid
     v.extend_from_slice(&(body_len as u32).to_le_bytes()); // body_len
-    v.resize(1 + slot + 9 + body_len, 0); // body 占位
+    v.resize(2 + slot + 9 + body_len, 0); // body 占位
     v
 }
 
@@ -146,7 +147,11 @@ fn result_to_code(r: Result<(), String>, err: *mut c_char, err_cap: u32) -> c_in
 /// XValueHead 解码结果（repr(C)，供跨边界读取头元数据）。kindexpr 为唯一类型真相。
 #[repr(C)]
 pub struct kvspaceHead_t {
-    pub kindexpr: [u8; 256], // NUL 终止（含 */@ 前缀与 [dims]，去 padding）
+    pub xkind: u8,           // 五分类：0=None 1=Ptr 2=ExtValue 3=DefKindexpr 4=RealValue
+    pub kindexpr: [u8; 256], // NUL 终止（含 [dims]、无前缀，去 padding）
+    pub kind_off: i32,       // base 种类在 kindexpr 内的起始字节偏移（越过 [dims]）
+    pub ndim: i32,           // 维数（标量=0）
+    pub dims: [i32; 8],      // 各维长度（X_MAX_NDIM=8）
     pub ro: u8,              // 1=只读，0=可写
     pub vid: u32,            // vthread id
     pub body_len: i32,       // body 字节数
@@ -156,10 +161,17 @@ pub struct kvspaceHead_t {
 fn fill_head(head: &crate::xvalue::XValueHead, out: *mut kvspaceHead_t) {
     unsafe {
         let mut o = &mut *out;
+        o.xkind = head.xkind;
         let k = head.kindexpr.as_bytes();
         let n = k.len().min(255);
         o.kindexpr[..n].copy_from_slice(&k[..n]);
         o.kindexpr[n] = 0;
+        let dims = head.dims();
+        o.kind_off = (k.len() - head.kind().len()) as i32;
+        o.ndim = dims.len().min(8) as i32;
+        for (i, d) in dims.iter().take(8).enumerate() {
+            o.dims[i] = *d;
+        }
         o.ro = head.ro as u8;
         o.vid = head.vid;
         o.body_len = head.body_len;
@@ -280,11 +292,12 @@ pub extern "C" fn kvspaceWriteInPlace(
     0
 }
 
-/// 新位置写：按 (kindexpr, body_len) 攒好 head 到 write_buf、置 pending，返回 body 偏移指针。
+/// 新位置写：按 (xkind, kindexpr, body_len) 攒好 head 到 write_buf、置 pending，返回 body 偏移指针。
 #[no_mangle]
 pub extern "C" fn kvspaceWriteNewPlace(
     h: *mut Handle,
     key: *const c_char,
+    xkind: u8,
     kindexpr: *const c_char,
     body_len: u32,
     body: *mut *mut u8,
@@ -301,7 +314,7 @@ pub extern "C" fn kvspaceWriteNewPlace(
     }
     let key = unsafe { cstr(key) }.to_string();
     let kx = unsafe { cstr(kindexpr) };
-    let tlv = build_tlv(kx, body_len as usize);
+    let tlv = build_tlv(xkind, kx, body_len as usize);
     let head_len = tlv.len() - body_len as usize;
     hd.write_buf = tlv;
     hd.pending_key = Some(key);
