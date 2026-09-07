@@ -607,22 +607,16 @@ mod tests {
 
     #[test]
     fn kindexpr_build_parse() {
-        for (kind, r#ref, dims) in [
-            ("int64", 0, vec![]),
-            ("float32", 0, vec![5]),
-            ("float64", 0, vec![2, 3]),
-            ("char/utf32", 0, vec![0]),
-            ("int64", 1, vec![]),
-            ("rwir", 2, vec![]),
+        for (kind, dims) in [
+            ("int64", vec![]),
+            ("float32", vec![5]),
+            ("float64", vec![2, 3]),
+            ("char/utf32", vec![0]),
+            ("rwir", vec![]),
         ] {
-            let s = kindexpr_string(kind, r#ref, &dims);
-            let (r2, d2, k2) = parse_kindexpr(&s);
-            assert_eq!(
-                (r#ref, dims, kind.to_string()),
-                (r2, d2, k2),
-                "kindexpr {}",
-                s
-            );
+            let s = kindexpr_string(kind, &dims);
+            let (d2, k2) = parse_kindexpr(&s);
+            assert_eq!((dims, kind.to_string()), (d2, k2), "kindexpr {}", s);
         }
     }
 
