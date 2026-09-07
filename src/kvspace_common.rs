@@ -120,7 +120,7 @@ pub fn validate_ptr(
     if is_none(&v) || target_kindexpr.is_empty() {
         return Ok(());
     }
-    let actual = crate::xvalue::decode_xvalue_head(&v.encode()).kindexpr;
+    let actual = crate::xvalue::decode_xvalue_head(&v.encode()).langtype;
     if actual != target_kindexpr {
         return Err(format!(
             "{}: ptr kind mismatch: target {} is {}, ptr expects {}",

@@ -52,7 +52,11 @@ pub fn grow_cap(old_cap: usize, need: usize) -> usize {
 
 /// 成员名单 → (dims=[len,cap,M], body=cap×M)。cap_hint/m_hint 为下限（只增不减，用于保留预留容量
 /// 与既有行宽）；encode 侧规范排序，调用方无需预排。
-pub fn encode_index_grow(children: &[String], cap_hint: usize, m_hint: usize) -> (Vec<i32>, Vec<u8>) {
+pub fn encode_index_grow(
+    children: &[String],
+    cap_hint: usize,
+    m_hint: usize,
+) -> (Vec<i32>, Vec<u8>) {
     let mut c: Vec<&str> = children.iter().map(|s| s.as_str()).collect();
     c.sort_by(|a, b| cmp_coord(a, b));
     let len = c.len();

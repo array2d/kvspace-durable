@@ -4,36 +4,83 @@
 
 use crate::r#const::*;
 
-// ── XValueHead ─────────────────────────────────────────────────────────────
-// XValueHead = [1B xkind][1B kindexprlen][kindexpr 含 0x00 padding][1B ro][4B vid LE][4B body_len LE]
-//   xkind 五分类：0=None 1=Ptr 2=ExtValue 3=DefKindexpr(rwfunc/defrwir) 4=RealValue。
-//   kindexpr 无前缀，[d0,d1]kind 承载 ndim+dims：裸 kind=标量(ndim=0)、[n]kind=一维、[d0,d1]kind=多维。
-//   kindexprlen 为槽总长（含 padding），reshape 时新 kindexpr 不超槽长即原地改写不搬 body；内容以首个 NUL 终止。
+// ── XValueHead（三正交轴 ref × storetype × langtype，对齐 kvspace/frontend.c 黄金基准）────────────
+// head = [headlen u16 LE][ref u8][storetype u8][ro u8][vid u32 LE][body_len u32 LE]
+//        [storetype 物理字段][langtype kindexpr 串（占至 headlen）]
+// body = [body_len B raw]
+//   ref       0=inline（body=值本体）/1=ptr（body=目标 key）/2=@ext（body=扩展定位符）
+//   storetype 物理布局（codec 唯一分派）：NONE/ATOM/ARRAYND/index/extindex。
+//             物理字段：ARRAYND / index / extindex 为 ndim u8 + dims[ndim] u32 LE
+//             （index/extindex 的 dims=[len,cap,M]）；NONE / ATOM 无物理字段。
+//   langtype  完整 kindexpr 串（含 [dims]、无前缀），恒为 head 最后一段（长度 = headlen − 当前偏移）。
 
-pub const XKIND_NONE: u8 = 0;
-pub const XKIND_PTR: u8 = 1;
-pub const XKIND_EXTVALUE: u8 = 2;
-pub const XKIND_DEFKINDEXPR: u8 = 3;
-pub const XKIND_REALVALUE: u8 = 4;
+pub const HEAD_PREFIX: usize = 13; // headlen(2)+ref(1)+storetype(1)+ro(1)+vid(4)+body_len(4)
 
-fn is_def_kind(kind: &str) -> bool {
-    kind == "rwfunc" || kind == "defrwir"
+pub const REF_INLINE: u8 = 0;
+pub const REF_PTR: u8 = 1;
+pub const REF_EXT: u8 = 2;
+
+pub const STORETYPE_NONE: u8 = 0;
+pub const STORETYPE_ATOM: u8 = 1;
+pub const STORETYPE_ARRAYND: u8 = 2;
+pub const STORETYPE_INDEX: u8 = 3;
+pub const STORETYPE_EXTINDEX: u8 = 4;
+
+/// ARRAYND / index / extindex 携带 ndim+dims 物理字段。
+pub fn store_has_dims(st: u8) -> bool {
+    st == STORETYPE_ARRAYND || st == STORETYPE_INDEX || st == STORETYPE_EXTINDEX
 }
 
-/// (kind, ref) → xkind 五分类。
-fn xkind_of(kind: &str, r#ref: i32) -> u8 {
-    match r#ref {
-        1 => XKIND_PTR,
-        2 => XKIND_EXTVALUE,
-        _ if is_def_kind(kind) => XKIND_DEFKINDEXPR,
-        _ => XKIND_REALVALUE,
+fn is_index_kind(kind: &str) -> bool {
+    kind == KIND_INDEX || kind == KIND_EXT_INDEX || kind == "rwfunc" || kind == "defrwir"
+}
+
+/// 由 base 种类名（+ndim）推 storetype。
+fn storetype_of(kind: &str, ndim: i32) -> u8 {
+    if kind.is_empty() {
+        return STORETYPE_NONE;
     }
+    if kind == KIND_EXT_INDEX {
+        return STORETYPE_EXTINDEX;
+    }
+    if is_index_kind(kind) {
+        return STORETYPE_INDEX;
+    }
+    if ndim > 0 {
+        return STORETYPE_ARRAYND;
+    }
+    STORETYPE_ATOM
 }
 
-/// kindexpr 构建：[dims] + kind（无前缀）。
-fn kindexpr_string(kind: &str, dims: &[i32]) -> String {
+/// 指针 head 的 storetype = 目标语义 storetype（据目标完整 kindexpr 推；指针自身物理字段恒空）。
+fn storetype_from_kindexpr(kx: &str) -> u8 {
+    if kx.is_empty() {
+        return STORETYPE_NONE;
+    }
+    let (has_dims, base) = if kx.starts_with('[') {
+        match kx.find(']') {
+            Some(e) => (true, &kx[e + 1..]),
+            None => (false, kx),
+        }
+    } else {
+        (false, kx)
+    };
+    if base == KIND_EXT_INDEX {
+        return STORETYPE_EXTINDEX;
+    }
+    if is_index_kind(base) || base.starts_with('/') || base.contains(OBJ_SEP) {
+        return STORETYPE_INDEX;
+    }
+    if has_dims {
+        return STORETYPE_ARRAYND;
+    }
+    STORETYPE_ATOM
+}
+
+/// langtype 串（ARRAYND 含 [dims]，其余为裸种类名/路径）。
+fn build_langtype(kind: &str, storetype: u8, dims: &[i32]) -> String {
     let mut s = String::new();
-    if !dims.is_empty() {
+    if storetype == STORETYPE_ARRAYND && !dims.is_empty() {
         s.push('[');
         for (i, d) in dims.iter().enumerate() {
             if i > 0 {
@@ -47,7 +94,7 @@ fn kindexpr_string(kind: &str, dims: &[i32]) -> String {
     s
 }
 
-/// kindexpr 解析 → (dims, kind)：[dims] 段表形状，其余为基 kind。
+/// langtype 解析 → (dims, kind)：[dims] 段表形状，其余为基 kind。
 fn parse_kindexpr(s: &str) -> (Vec<i32>, String) {
     if s.starts_with('[') {
         match s.find(']') {
@@ -68,49 +115,43 @@ fn parse_kindexpr(s: &str) -> (Vec<i32>, String) {
 
 #[derive(Default, Clone, Debug, PartialEq)]
 pub struct XValueHead {
-    pub xkind: u8,        // 五分类：见 XKIND_*
-    pub kindexpr: String, // 内容（含 [dims]、无前缀，去 NUL/padding）
-    pub kindexprlen: u8,  // wire 槽总长（内容 + NUL + padding）
+    pub headlen: u16,
+    pub r#ref: u8,           // 存储位置：REF_*
+    pub storetype: u8,       // 物理布局：STORETYPE_*
+    pub langtype: String,    // 完整 kindexpr（含 [dims]、无前缀）
+    pub phys_dims: Vec<i32>, // 物理字段 dims：ARRAYND=形状、index/extindex=[len,cap,M]
     pub ro: bool,
     pub vid: u32,
     pub body_len: i32,
 }
 
 impl XValueHead {
-    fn parse(&self) -> (Vec<i32>, String) {
-        parse_kindexpr(&self.kindexpr)
-    }
     pub fn r#ref(&self) -> i32 {
-        match self.xkind {
-            XKIND_PTR => 1,
-            XKIND_EXTVALUE => 2,
-            _ => 0,
-        }
+        self.r#ref as i32
     }
     pub fn is_ptr(&self) -> bool {
-        self.xkind == XKIND_PTR
+        self.r#ref == REF_PTR
     }
     pub fn kind(&self) -> String {
-        self.parse().1
+        parse_kindexpr(&self.langtype).1
     }
     pub fn dims(&self) -> Vec<i32> {
-        self.parse().0
+        self.phys_dims.clone()
     }
     pub fn ndim(&self) -> i32 {
-        self.parse().0.len() as i32
+        self.phys_dims.len() as i32
     }
     pub fn array_len(&self) -> i32 {
-        let dims = self.parse().0;
-        if dims.is_empty() {
+        if self.phys_dims.is_empty() {
             1
         } else {
-            dims.iter().product()
+            self.phys_dims.iter().product()
         }
     }
 
     /// 返回 XValueHead（元数据）字节数，不含 body。
     pub fn head_len(&self) -> i32 {
-        self.kindexprlen as i32 + 11
+        self.headlen as i32
     }
 
     /// 从完整 XValue 字节 data 截取 body。
@@ -126,7 +167,7 @@ impl XValueHead {
     pub fn decode(&self, body: &[u8]) -> XValue {
         if self.is_ptr() {
             return XValue::Ptr(Ptr {
-                target_kindexpr: self.kindexpr.clone(),
+                target_kindexpr: self.langtype.clone(),
                 target: String::from_utf8_lossy(body).into_owned(),
             });
         }
@@ -259,9 +300,9 @@ impl XValue {
             XValue::Obj => 0,
             XValue::Map(_) => 1,
             XValue::Index(d) => crate::xvalue_index::encode_index(d).1.len() as i32,
-            XValue::ExtIndex(e) => {
-                crate::xvalue_index::encode_ext_index(&e.ext_path, &e.childs).1.len() as i32
-            }
+            XValue::ExtIndex(e) => crate::xvalue_index::encode_ext_index(&e.ext_path, &e.childs)
+                .1
+                .len() as i32,
             XValue::Opaque(o) => o.body.len() as i32,
         }
     }
@@ -462,19 +503,17 @@ fn bool_string(b: bool) -> String {
     }
 }
 
-// ── TLV 编解码 ─────────────────────────────────────────────────────────────
-// XValue = XValueHead + body。
-// XValueHead = [1B kind_len][kind][1B ref|ro][1B ndim][4B vid LE][ndim×4B dims][padding][4B raw_len]
-// body       = [raw]，offset = head_len()。
-// ref: 0=内联 1=指针(*) 2=扩展句柄(@)；ref=1 时 head kindexpr 去 * 即目标完整 kindexpr，
-// body 为目标 key 路径。None 编码为 nil。
+// ── 三正交轴编解码（byte-identical 于 kvspace/frontend.c）───────────────────────────────
+// head = [headlen u16 LE][ref u8][storetype u8][ro u8][vid u32 LE][body_len u32 LE]
+//        [storetype 物理字段（ARRAYND/index/extindex 为 ndim u8 + dims[ndim] u32 LE）][langtype]
+// body = [body_len B raw]，offset = headlen。None 编码为 nil。
 
 pub fn tlv_encode(kind: &str, raw: &[u8], array_len: i32) -> Vec<u8> {
     encode_head(kind, 0, &array_to_header(kind, array_len), raw)
 }
 
-/// 指针编码：head kindexpr = "*" + 目标完整 kindexpr（不再从 array_len 派生 dims，
-/// 目标的形状/引用性都在 target_kindexpr 内），body = 目标 key 路径。
+/// 指针编码：langtype = 目标完整 kindexpr（含其 [dims]/引用性），storetype = 目标语义 storetype，
+/// 物理字段恒空，body = 目标 key 路径。
 pub fn tlv_encode_ptr(target_kindexpr: &str, raw: &[u8]) -> Vec<u8> {
     encode_head(target_kindexpr, 1, &[], raw)
 }
@@ -502,44 +541,85 @@ pub fn encode_head_perm(
     ro: bool,
     vid: u32,
 ) -> Vec<u8> {
-    let kx = kindexpr_string(kind, dims);
-    let slot = (kx.len() + 1) as u8; // 内容 + 1 NUL（当前无额外 padding）
-    let mut buf = vec![0u8; 2 + slot as usize + 1 + 4 + 4 + raw.len()];
-    buf[0] = xkind_of(kind, r#ref);
-    buf[1] = slot;
-    buf[2..2 + kx.len()].copy_from_slice(kx.as_bytes());
-    let o = 2 + slot as usize;
-    buf[o] = ro as u8;
-    buf[o + 1..o + 5].copy_from_slice(&vid.to_le_bytes());
-    buf[o + 5..o + 9].copy_from_slice(&(raw.len() as u32).to_le_bytes());
-    buf[o + 9..].copy_from_slice(raw);
+    // ptr：kind 参数即目标完整 kindexpr，storetype 从其推、物理字段恒空、langtype 原样。
+    let (storetype, langtype, phys): (u8, String, Vec<i32>) = if r#ref == 1 {
+        (storetype_from_kindexpr(kind), kind.to_string(), Vec::new())
+    } else {
+        let st = storetype_of(kind, dims.len() as i32);
+        let lt = build_langtype(kind, st, dims);
+        let pd = if store_has_dims(st) {
+            dims.to_vec()
+        } else {
+            Vec::new()
+        };
+        (st, lt, pd)
+    };
+    let lt_bytes = langtype.as_bytes();
+    let phys_bytes = if store_has_dims(storetype) {
+        1 + 4 * phys.len()
+    } else {
+        0
+    };
+    let headlen = HEAD_PREFIX + phys_bytes + lt_bytes.len();
+    let mut buf = vec![0u8; headlen + raw.len()];
+    buf[0..2].copy_from_slice(&(headlen as u16).to_le_bytes());
+    buf[2] = r#ref as u8;
+    buf[3] = storetype;
+    buf[4] = ro as u8;
+    buf[5..9].copy_from_slice(&vid.to_le_bytes());
+    buf[9..13].copy_from_slice(&(raw.len() as u32).to_le_bytes());
+    let mut o = HEAD_PREFIX;
+    if store_has_dims(storetype) {
+        buf[o] = phys.len() as u8;
+        o += 1;
+        for d in &phys {
+            buf[o..o + 4].copy_from_slice(&(*d as u32).to_le_bytes());
+            o += 4;
+        }
+    }
+    buf[o..o + lt_bytes.len()].copy_from_slice(lt_bytes);
+    buf[headlen..].copy_from_slice(raw);
     buf
 }
 
 pub fn decode_xvalue_head(data: &[u8]) -> XValueHead {
-    if data.len() < 2 {
+    if data.len() < HEAD_PREFIX {
         return XValueHead::default();
     }
-    let slot = data[1] as usize;
-    let o = 2 + slot;
-    if data.len() < o + 9 {
+    let headlen = u16::from_le_bytes(data[0..2].try_into().unwrap()) as usize;
+    let r#ref = data[2];
+    let storetype = data[3];
+    let ro = data[4] != 0;
+    let vid = u32::from_le_bytes(data[5..9].try_into().unwrap());
+    let body_len = u32::from_le_bytes(data[9..13].try_into().unwrap()) as i32;
+    if headlen < HEAD_PREFIX || data.len() < headlen {
         return XValueHead::default();
     }
-    let kx_bytes = &data[2..o];
-    let end = kx_bytes
-        .iter()
-        .position(|&b| b == 0)
-        .unwrap_or(kx_bytes.len());
-    let body_len = u32::from_le_bytes(data[o + 5..o + 9].try_into().unwrap()) as i32;
-    if data.len() < o + 9 + body_len as usize {
+    let mut o = HEAD_PREFIX;
+    let mut phys_dims = Vec::new();
+    if store_has_dims(storetype) {
+        let ndim = data[o] as usize;
+        o += 1;
+        for _ in 0..ndim {
+            if o + 4 > headlen {
+                break;
+            }
+            phys_dims.push(i32::from_le_bytes(data[o..o + 4].try_into().unwrap()));
+            o += 4;
+        }
+    }
+    let langtype = String::from_utf8_lossy(&data[o..headlen]).into_owned();
+    if data.len() < headlen + body_len as usize {
         return XValueHead::default();
     }
     XValueHead {
-        xkind: data[0],
-        kindexpr: String::from_utf8_lossy(&kx_bytes[..end]).into_owned(),
-        kindexprlen: slot as u8,
-        ro: data[o] != 0,
-        vid: u32::from_le_bytes(data[o + 1..o + 5].try_into().unwrap()),
+        headlen: headlen as u16,
+        r#ref,
+        storetype,
+        langtype,
+        phys_dims,
+        ro,
+        vid,
         body_len,
     }
 }
@@ -547,7 +627,7 @@ pub fn decode_xvalue_head(data: &[u8]) -> XValueHead {
 /// 解析完整 XValue（head + body）为 XValue。
 pub fn decode_xvalue(data: &[u8]) -> XValue {
     let h = decode_xvalue_head(data);
-    if h.kindexpr.is_empty() {
+    if h.langtype.is_empty() {
         return XValue::None;
     }
     h.decode(h.body(data))
@@ -606,17 +686,17 @@ mod tests {
     }
 
     #[test]
-    fn kindexpr_build_parse() {
+    fn langtype_build_parse() {
         for (kind, dims) in [
             ("int64", vec![]),
             ("float32", vec![5]),
             ("float64", vec![2, 3]),
             ("char/utf32", vec![0]),
-            ("rwir", vec![]),
         ] {
-            let s = kindexpr_string(kind, &dims);
+            let st = storetype_of(kind, dims.len() as i32);
+            let s = build_langtype(kind, st, &dims);
             let (d2, k2) = parse_kindexpr(&s);
-            assert_eq!((dims, kind.to_string()), (d2, k2), "kindexpr {}", s);
+            assert_eq!((dims, kind.to_string()), (d2, k2), "langtype {}", s);
         }
     }
 
@@ -639,11 +719,7 @@ mod tests {
     fn index_matrix_roundtrip() {
         use crate::xvalue_index::{matrix_at, matrix_count};
         // 乱序输入 → encode 规范排序（坐标数值序，非字节序：[2] 在 [10] 前）。
-        let v = XValue::Index(vec![
-            "[10]".into(),
-            "[2]".into(),
-            "[1]".into(),
-        ]);
+        let v = XValue::Index(vec!["[10]".into(), "[2]".into(), "[1]".into()]);
         let bytes = v.encode();
         let h = decode_xvalue_head(&bytes);
         assert_eq!(h.kind(), KIND_INDEX);

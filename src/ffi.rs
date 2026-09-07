@@ -61,21 +61,54 @@ unsafe fn kv_flush<'a>(h: *mut Handle) -> Result<&'a mut dyn KVSpace, String> {
     Ok(&mut *hd.kv)
 }
 
-/// 由 xkind + kindexpr 串 + body_len 直接构造 head（ro=0 vid=0）并预留 body_len 零字节。
-/// 与 kvspace-c kvspaceXvalueWriteHead 逐字节一致。
-fn build_tlv(xkind: u8, kindexpr: &str, body_len: usize) -> Vec<u8> {
-    let kx = kindexpr.as_bytes();
-    let slot = kx.len() + 1;
-    let mut v = Vec::with_capacity(2 + slot + 9 + body_len);
-    v.push(xkind);
-    v.push(slot as u8);
-    v.extend_from_slice(kx);
-    v.push(0); // kindexpr NUL
-    v.push(0); // ro
-    v.extend_from_slice(&0u32.to_le_bytes()); // vid
-    v.extend_from_slice(&(body_len as u32).to_le_bytes()); // body_len
-    v.resize(2 + slot + 9 + body_len, 0); // body 占位
+/// 由 (ref, storetype, ro, vid, langtype) + body_len 直接构造三正交轴 head 并预留 body_len 零字节。
+/// 与 kvspace-c kvspaceXvalueWriteHead 逐字节一致：ARRAYND 从 langtype 的 [dims] 落物理字段，
+/// NONE/ATOM 无物理字段（index/extindex 不走本路径）。
+fn build_tlv(
+    r#ref: u8,
+    storetype: u8,
+    ro: u8,
+    vid: u32,
+    langtype: &str,
+    body_len: usize,
+) -> Vec<u8> {
+    let dims = parse_langtype_dims(langtype);
+    let lt = langtype.as_bytes();
+    let has_dims = crate::xvalue::store_has_dims(storetype);
+    let phys = if has_dims { 1 + 4 * dims.len() } else { 0 };
+    let headlen = crate::xvalue::HEAD_PREFIX + phys + lt.len();
+    let mut v = vec![0u8; headlen + body_len];
+    v[0..2].copy_from_slice(&(headlen as u16).to_le_bytes());
+    v[2] = r#ref;
+    v[3] = storetype;
+    v[4] = ro;
+    v[5..9].copy_from_slice(&vid.to_le_bytes());
+    v[9..13].copy_from_slice(&(body_len as u32).to_le_bytes());
+    let mut o = crate::xvalue::HEAD_PREFIX;
+    if has_dims {
+        v[o] = dims.len() as u8;
+        o += 1;
+        for d in &dims {
+            v[o..o + 4].copy_from_slice(&(*d as u32).to_le_bytes());
+            o += 4;
+        }
+    }
+    v[o..o + lt.len()].copy_from_slice(lt);
     v
+}
+
+/// 解析 langtype 前导 [dims]（仅 ARRAYND 携带；无则空）。
+fn parse_langtype_dims(lt: &str) -> Vec<i32> {
+    if lt.starts_with('[') {
+        if let Some(end) = lt.find(']') {
+            return lt[1..end]
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .map(|s| s.parse().unwrap_or(0))
+                .collect();
+        }
+    }
+    Vec::new()
 }
 
 // ── 内部助手 ─────────────────────────────────────────────────────────
@@ -144,31 +177,37 @@ fn result_to_code(r: Result<(), String>, err: *mut c_char, err_cap: u32) -> c_in
     }
 }
 
-/// XValueHead 解码结果（repr(C)，供跨边界读取头元数据）。kindexpr 为唯一类型真相。
+/// XValueHead 解码结果（repr(C)，供跨边界读取头元数据）。逐字段对齐 kvspace-c 三正交轴 kvspaceHead_t。
 #[repr(C)]
 pub struct kvspaceHead_t {
-    pub xkind: u8,           // 五分类：0=None 1=Ptr 2=ExtValue 3=DefKindexpr 4=RealValue
-    pub kindexpr: [u8; 256], // NUL 终止（含 [dims]、无前缀，去 padding）
-    pub kind_off: i32,       // base 种类在 kindexpr 内的起始字节偏移（越过 [dims]）
-    pub ndim: i32,           // 维数（标量=0）
-    pub dims: [i32; 8],      // 各维长度（X_MAX_NDIM=8）
+    pub headlen: u16,        // head 总字节数
+    pub r#ref: u8,           // 存储位置：0=inline 1=ptr 2=@ext
+    pub storetype: u8,       // 物理布局：NONE/ATOM/ARRAYND/index/extindex
     pub ro: u8,              // 1=只读，0=可写
     pub vid: u32,            // vthread id
     pub body_len: i32,       // body 字节数
+    pub ndim: i32,           // 物理维数（标量=0）
+    pub dims: [i32; 8],      // 物理字段 dims（X_MAX_NDIM=8）
+    pub langtype: [u8; 256], // 完整 kindexpr 串（含 [dims]、无前缀），NUL 终止
+    pub langtype_len: i32,   // langtype 字节数（不含 NUL）
     pub body_offset: i32,    // body 在 data 内的起始偏移（= head_len）
 }
 
 fn fill_head(head: &crate::xvalue::XValueHead, out: *mut kvspaceHead_t) {
     unsafe {
-        let mut o = &mut *out;
-        o.xkind = head.xkind;
-        let k = head.kindexpr.as_bytes();
-        let n = k.len().min(255);
-        o.kindexpr[..n].copy_from_slice(&k[..n]);
-        o.kindexpr[n] = 0;
+        let o = &mut *out;
+        o.headlen = head.headlen;
+        o.r#ref = head.r#ref;
+        o.storetype = head.storetype;
+        let lt = head.langtype.as_bytes();
+        let n = lt.len().min(255);
+        o.langtype = [0; 256];
+        o.langtype[..n].copy_from_slice(&lt[..n]);
+        o.langtype[n] = 0;
+        o.langtype_len = n as i32;
         let dims = head.dims();
-        o.kind_off = (k.len() - head.kind().len()) as i32;
         o.ndim = dims.len().min(8) as i32;
+        o.dims = [0; 8];
         for (i, d) in dims.iter().take(8).enumerate() {
             o.dims[i] = *d;
         }
@@ -292,13 +331,16 @@ pub extern "C" fn kvspaceWriteInPlace(
     0
 }
 
-/// 新位置写：按 (xkind, kindexpr, body_len) 攒好 head 到 write_buf、置 pending，返回 body 偏移指针。
+/// 新位置写：按 (ref, storetype, langtype, body_len) 攒好 head 到 write_buf、置 pending，返回 body 偏移指针。
 #[no_mangle]
 pub extern "C" fn kvspaceWriteNewPlace(
     h: *mut Handle,
     key: *const c_char,
-    xkind: u8,
-    kindexpr: *const c_char,
+    r#ref: u8,
+    storetype: u8,
+    ro: u8,
+    vid: u32,
+    langtype: *const c_char,
     body_len: u32,
     body: *mut *mut u8,
     err: *mut c_char,
@@ -313,8 +355,8 @@ pub extern "C" fn kvspaceWriteNewPlace(
         return 1;
     }
     let key = unsafe { cstr(key) }.to_string();
-    let kx = unsafe { cstr(kindexpr) };
-    let tlv = build_tlv(xkind, kx, body_len as usize);
+    let lt = unsafe { cstr(langtype) };
+    let tlv = build_tlv(r#ref, storetype, ro, vid, lt, body_len as usize);
     let head_len = tlv.len() - body_len as usize;
     hd.write_buf = tlv;
     hd.pending_key = Some(key);

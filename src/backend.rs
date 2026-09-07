@@ -216,7 +216,8 @@ impl<S: KVStore> Backend<S> {
                         childs.push(name.to_string());
                         let cap = grow_cap(old_cap, childs.len());
                         let (d, b) = encode_ext_index_grow(&e.ext_path, &childs, cap, old_m);
-                        self.store.set(parent, &encode_head(KIND_EXT_INDEX, 0, &d, &b));
+                        self.store
+                            .set(parent, &encode_head(KIND_EXT_INDEX, 0, &d, &b));
                     }
                     other => panic!("add_child: unexpected kind {}", other.kind()),
                 }
@@ -249,7 +250,8 @@ impl<S: KVStore> Backend<S> {
                         let filtered: Vec<String> =
                             e.childs.into_iter().filter(|n| !is_removed(n)).collect();
                         let (d, b) = encode_ext_index_grow(&e.ext_path, &filtered, old_cap, old_m);
-                        self.store.set(parent, &encode_head(KIND_EXT_INDEX, 0, &d, &b));
+                        self.store
+                            .set(parent, &encode_head(KIND_EXT_INDEX, 0, &d, &b));
                     }
                     other => panic!("remove_child: unexpected kind {}", other.kind()),
                 }
@@ -515,7 +517,8 @@ impl<S: KVStore> KVSpace for Backend<S> {
             let cap = grow_cap(old_cap, nodes.len());
             if is_ext {
                 let (d, b) = encode_ext_index_grow(&ext_path, &nodes, cap, old_m);
-                self.store.set(&parent, &encode_head(KIND_EXT_INDEX, 0, &d, &b));
+                self.store
+                    .set(&parent, &encode_head(KIND_EXT_INDEX, 0, &d, &b));
             } else {
                 let (d, b) = encode_index_grow(&nodes, cap, old_m);
                 self.store.set(&parent, &encode_head(KIND_INDEX, 0, &d, &b));
@@ -588,7 +591,11 @@ impl<S: KVStore> KVSpace for Backend<S> {
                 if idx as usize >= crate::xvalue_index::matrix_count(&dims) {
                     return None;
                 }
-                return crate::xvalue_index::matrix_at(&body, crate::xvalue_index::matrix_width(&dims), idx as usize);
+                return crate::xvalue_index::matrix_at(
+                    &body,
+                    crate::xvalue_index::matrix_width(&dims),
+                    idx as usize,
+                );
             }
         }
         self.list(prefix, expand_ext, resolve)
