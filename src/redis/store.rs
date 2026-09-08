@@ -145,6 +145,26 @@ impl KVStore for RedisStore {
         let _ = self.cmd(&[b"SET", key.as_bytes(), val]);
     }
 
+    fn exists(&self, key: &str) -> bool {
+        matches!(self.cmd(&[b"EXISTS", key.as_bytes()]), Resp::Integer(n) if n > 0)
+    }
+
+    fn get_part(&self, key: &str, off: u32, len: u32) -> Option<Vec<u8>> {
+        if len == 0 {
+            return Some(Vec::new());
+        }
+        let (o, e) = (off.to_string(), (off as u64 + len as u64 - 1).to_string());
+        match self.cmd(&[b"GETRANGE", key.as_bytes(), o.as_bytes(), e.as_bytes()]) {
+            Resp::Bulk(b) => b, // 不存在 key 也返回 ""，调用方先 exists 判定
+            _ => None,
+        }
+    }
+
+    fn set_part(&self, key: &str, off: u32, buf: &[u8]) {
+        let o = off.to_string();
+        let _ = self.cmd(&[b"SETRANGE", key.as_bytes(), o.as_bytes(), buf]);
+    }
+
     fn del(&self, keys: &[&str]) {
         if keys.is_empty() {
             return;

@@ -3,6 +3,7 @@
 // "/" 与 "·" 的 index 都从 readdir 派生；ExtIndex 用目录内 __extindex__ 文件存 ext_target_path（第一行）。
 
 use std::fs;
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -87,6 +88,37 @@ impl FsKVSpace {
         } else {
             fs::read(p).ok()
         }
+    }
+    /// 叶值实际所在文件（目录带值时为 __self__），供定位读写 pread/pwrite。存在才返回。
+    fn leaf_file(&self, key: &str) -> Option<PathBuf> {
+        if key.contains("//") {
+            return None;
+        }
+        let p = self.fs_path(key);
+        let f = if p.is_dir() { p.join(SELF_MARKER) } else { p };
+        if f.is_file() {
+            Some(f)
+        } else {
+            None
+        }
+    }
+    /// 解析逻辑 key 到叶文件（先 meta，再 ext 扩展存储）。
+    fn physical_file(&mut self, key: &str) -> Option<PathBuf> {
+        let (mut p, l) = sep_path(key);
+        if p != PATH_SEP {
+            p.push_str(DIR_INDEX_SUF);
+        }
+        let p = self.resolve_path(&p);
+        if let Some(f) = self.leaf_file(&join_path(&p, &l)) {
+            return Some(f);
+        }
+        let ext_t = self.prefix_ext(&p);
+        if !ext_t.is_empty() {
+            if let Some(f) = self.leaf_file(&join_path(&ext_t, &l)) {
+                return Some(f);
+            }
+        }
+        None
     }
 
     fn write_leaf(&self, key: &str, val: &[u8]) {
@@ -367,6 +399,36 @@ impl KVSpace for FsKVSpace {
             }
         }
         Vec::new()
+    }
+
+    fn get_part(&mut self, key: &str, off: u32, len: u32) -> Vec<u8> {
+        let Some(pf) = self.physical_file(key) else {
+            return Vec::new();
+        };
+        let Ok(f) = fs::File::open(&pf) else {
+            return Vec::new();
+        };
+        let mut buf = vec![0u8; len as usize];
+        match f.read_at(&mut buf, off as u64) {
+            Ok(n) => {
+                buf.truncate(n);
+                buf
+            }
+            Err(_) => Vec::new(),
+        }
+    }
+
+    fn set_part(&mut self, key: &str, off: u32, buf: &[u8]) -> Result<(), String> {
+        let pf = self
+            .physical_file(key)
+            .ok_or_else(|| format!("set_part: missing key {}", key))?;
+        let f = fs::OpenOptions::new()
+            .write(true)
+            .open(&pf)
+            .map_err(|e| format!("kvspace-fs: set_part open {:?}: {}", pf, e))?;
+        f.write_at(buf, off as u64)
+            .map_err(|e| format!("kvspace-fs: set_part write {:?}: {}", pf, e))?;
+        Ok(())
     }
 
     fn set(&mut self, pairs: &[KVPair]) -> Result<(), String> {

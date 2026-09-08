@@ -40,7 +40,8 @@ pub struct Handle {
 }
 
 impl Handle {
-    /// 落盘上一笔惰性写（调用方已把 body 填进 write_buf）；写即写边界，回收读借用池。
+    /// 落盘上一笔惰性写（调用方已把 body 填进 write_buf）。读借用池不在此清——
+    /// 借用生命周期同该槽、跨指令内的写仍有效；由 VM 在指令边界显式调 kvspaceReadReset 回收。
     fn flush(&mut self) -> Result<(), String> {
         if let Some(key) = self.pending_key.take() {
             let tlv = std::mem::take(&mut self.write_buf);
@@ -50,7 +51,6 @@ impl Handle {
                 val,
                 raw: Some(tlv),
             }])?;
-            self.read_bufs.clear();
         }
         Ok(())
     }
@@ -299,6 +299,119 @@ pub extern "C" fn kvspaceGet(
             1
         }
     }
+}
+
+/// 借指令边界回收读借用池：VM 每条指令执行完调用一次。durable 惰性写不再清池，
+/// 全部读借用在此统一失效（shm 常驻映射侧为 no-op）。
+#[no_mangle]
+pub extern "C" fn kvspaceReadReset(h: *mut Handle) {
+    if let Some(hd) = unsafe { h.as_mut() } {
+        hd.read_bufs.clear();
+    }
+}
+
+/// 定位读：借用读 key 值的 [offset, offset+len) 字节，*out 指向读借用池（活到 ReadReset，调用方不得 free）。
+/// 空/不存在/越界为空 → *out=NULL、out_len=0。
+#[no_mangle]
+pub extern "C" fn kvspaceGetPart(
+    h: *mut Handle,
+    key: *const c_char,
+    offset: u32,
+    len: u32,
+    out: *mut *mut u8,
+    out_len: *mut u32,
+) -> c_int {
+    let hd = match unsafe { h.as_mut() } {
+        Some(x) => x,
+        None => return 1,
+    };
+    let key = unsafe { cstr(key) }.to_string();
+    if hd.flush().is_err() {
+        unsafe {
+            *out = std::ptr::null_mut();
+            *out_len = 0;
+        }
+        return 1;
+    }
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        hd.kv.get_part(&key, offset, len)
+    })) {
+        Ok(buf) => {
+            if buf.is_empty() {
+                unsafe {
+                    *out = std::ptr::null_mut();
+                    *out_len = 0;
+                }
+            } else {
+                hd.lend(buf, out, out_len);
+            }
+            0
+        }
+        Err(_) => {
+            unsafe {
+                *out = std::ptr::null_mut();
+                *out_len = 0;
+            }
+            1
+        }
+    }
+}
+
+/// 定位写：就地写 buf 到 key 值的 [offset, offset+buf_len)（key 须已存在、不改结构）。立即持久，非惰性。
+#[no_mangle]
+pub extern "C" fn kvspaceSetPart(
+    h: *mut Handle,
+    key: *const c_char,
+    offset: u32,
+    buf: *const u8,
+    buf_len: u32,
+    err: *mut c_char,
+    err_cap: u32,
+) -> c_int {
+    let hd = match unsafe { h.as_mut() } {
+        Some(x) => x,
+        None => return 1,
+    };
+    if let Err(e) = hd.flush() {
+        write_err(err, err_cap, &e);
+        return 1;
+    }
+    let key = unsafe { cstr(key) }.to_string();
+    let data = unsafe { std::slice::from_raw_parts(buf, buf_len as usize) };
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        hd.kv.set_part(&key, offset, data)
+    }))
+    .map_err(panic_msg)
+    .and_then(|x| x);
+    result_to_code(r, err, err_cap)
+}
+
+/// 读 head：只读值前缀并解码三正交轴 head（不取 body）。空/不存在 → 返回 1。
+#[no_mangle]
+pub extern "C" fn kvspaceGetHead(
+    h: *mut Handle,
+    key: *const c_char,
+    out: *mut kvspaceHead_t,
+) -> c_int {
+    let hd = match unsafe { h.as_mut() } {
+        Some(x) => x,
+        None => return 1,
+    };
+    if out.is_null() || hd.flush().is_err() {
+        return 1;
+    }
+    let key = unsafe { cstr(key) }.to_string();
+    let prefix = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        hd.kv.get_part(&key, 0, 512)
+    })) {
+        Ok(p) => p,
+        Err(_) => return 1,
+    };
+    if prefix.is_empty() {
+        return 1;
+    }
+    fill_head(&decode_xvalue_head(&prefix), out);
+    0
 }
 
 /// 就地写：key 必须已存在、body_len 必须等于原 body_len——把原 head+body 攒进 write_buf、

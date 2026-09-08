@@ -393,6 +393,48 @@ impl<S: KVStore> KVSpace for Backend<S> {
         Vec::new()
     }
 
+    fn get_part(&mut self, key: &str, off: u32, len: u32) -> Vec<u8> {
+        let (mut p, l) = sep_path(key);
+        if p != PATH_SEP {
+            p.push_str(DIR_INDEX_SUF);
+        }
+        let p = self.resolve_path(&p);
+        let full = join_path(&p, &l);
+        if self.store.exists(&full) {
+            return self.store.get_part(&full, off, len).unwrap_or_default();
+        }
+        let ext_t = self.prefix_ext(&p);
+        if !ext_t.is_empty() {
+            let ext_full = join_path(&ext_t, &l);
+            if self.store.exists(&ext_full) {
+                return self.store.get_part(&ext_full, off, len).unwrap_or_default();
+            }
+        }
+        Vec::new()
+    }
+
+    fn set_part(&mut self, key: &str, off: u32, buf: &[u8]) -> Result<(), String> {
+        let (mut p, l) = sep_path(key);
+        if p != PATH_SEP {
+            p.push_str(DIR_INDEX_SUF);
+        }
+        let p = self.resolve_path(&p);
+        let full = join_path(&p, &l);
+        if self.store.exists(&full) {
+            self.store.set_part(&full, off, buf);
+            return Ok(());
+        }
+        let ext_t = self.prefix_ext(&p);
+        if !ext_t.is_empty() {
+            let ext_full = join_path(&ext_t, &l);
+            if self.store.exists(&ext_full) {
+                self.store.set_part(&ext_full, off, buf);
+                return Ok(());
+            }
+        }
+        Err(format!("set_part: missing key {}", key))
+    }
+
     fn set(&mut self, pairs: &[KVPair]) -> Result<(), String> {
         let mut children: Vec<(String, String)> = Vec::new();
 

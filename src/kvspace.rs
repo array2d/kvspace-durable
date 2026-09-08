@@ -44,6 +44,20 @@ pub trait KVSpace {
     /// 单点写：Set 写完整 XValue，并维护目录索引；总是穿透 link 写入 target。
     fn set(&mut self, pairs: &[KVPair]) -> Result<(), String>;
 
+    /// 定位读：借用读 key 值的 [off, off+len) 字节；空/不存在 → 空 Vec。
+    /// 默认整读后切片，后端应覆盖为真正定位读（GETRANGE/pread）以免整值传输。
+    fn get_part(&mut self, key: &str, off: u32, len: u32) -> Vec<u8> {
+        let v = self.get_raw(key);
+        let s = (off as usize).min(v.len());
+        let e = (s + len as usize).min(v.len());
+        v[s..e].to_vec()
+    }
+    /// 定位写：就地写 buf 到 key 值的 [off, off+buf.len())（key 须已存在、不改结构）。
+    /// 默认不支持；后端应覆盖为真正定位写（SETRANGE/pwrite）。
+    fn set_part(&mut self, key: &str, _off: u32, _buf: &[u8]) -> Result<(), String> {
+        Err(format!("set_part unsupported for key {}", key))
+    }
+
     /// 列目录：resolve 是否穿透 link 列出 target 的子节点。
     fn list(&mut self, prefix: &str, expand_ext: bool, resolve: bool) -> Vec<String>;
     /// 直接子项数（listlen）。默认回退全量 list().len()；blob 索引后端可覆写为 O(1) 读 count 头。
