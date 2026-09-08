@@ -27,19 +27,20 @@ use crate::xvalue_int::new_int64;
 
 // ── 句柄 ─────────────────────────────────────────────────────────────
 //
-// durable 无常驻映射：0copy 适配下沉到句柄内。读复用 read_buf 返回借用指针（活到下一次
-// 读/写为止）；写把整条 TLV 攒进 write_buf、置 pending_key，在**下一个可观察操作前**惰性
-// flush（内部实现，不进公开 ABI）。调用方从不 free、从不 commit。
+// durable 无常驻映射：0copy 适配下沉到句柄内。读把每笔结果单独存进 read_bufs 借用池并返回
+// 其指针，池内缓冲同时存活至下一次写 flush（履约 kvspace.h「借用生命周期同该槽」，令单条指令
+// 的多个读操作数可同时借用）；写把整条 TLV 攒进 write_buf、置 pending_key，在**下一个可观察
+// 操作前**惰性 flush（内部实现，不进公开 ABI）。调用方从不 free、从不 commit。
 
 pub struct Handle {
     kv: Box<dyn KVSpace>,
-    read_buf: Vec<u8>,
+    read_bufs: Vec<Vec<u8>>,
     write_buf: Vec<u8>,
     pending_key: Option<String>,
 }
 
 impl Handle {
-    /// 落盘上一笔惰性写（调用方已把 body 填进 write_buf）。
+    /// 落盘上一笔惰性写（调用方已把 body 填进 write_buf）；写即写边界，回收读借用池。
     fn flush(&mut self) -> Result<(), String> {
         if let Some(key) = self.pending_key.take() {
             let tlv = std::mem::take(&mut self.write_buf);
@@ -49,8 +50,19 @@ impl Handle {
                 val,
                 raw: Some(tlv),
             }])?;
+            self.read_bufs.clear();
         }
         Ok(())
+    }
+
+    /// 借入一段读缓冲：存进借用池、返回其常驻指针（活到下一次写 flush，调用方不得 free）。
+    fn lend(&mut self, buf: Vec<u8>, out: *mut *mut u8, out_len: *mut u32) {
+        self.read_bufs.push(buf);
+        let b = self.read_bufs.last_mut().unwrap();
+        unsafe {
+            *out = b.as_mut_ptr();
+            *out_len = b.len() as u32;
+        }
     }
 }
 
@@ -226,7 +238,7 @@ pub extern "C" fn kvspaceConnect(dsn: *const c_char) -> *mut Handle {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| conn(dsn))) {
         Ok(kv) => Box::into_raw(Box::new(Handle {
             kv,
-            read_buf: Vec::new(),
+            read_bufs: Vec::new(),
             write_buf: Vec::new(),
             pending_key: None,
         })),
@@ -245,7 +257,7 @@ pub extern "C" fn kvspaceClose(h: *mut Handle) {
 
 // ── KVSpace 原语 ─────────────────────────────────────────────────────
 
-/// 借用读：*out 指向句柄内复用的 read_buf（活到下一次读/写），调用方不得 free。
+/// 借用读：*out 指向读借用池内本笔缓冲（活到下一次写 flush），调用方不得 free。
 /// resolve 由 get_raw 内部按路径解析（durable 恒穿透父路径 link）；空值 → *out=NULL、out_len=0。
 #[no_mangle]
 pub extern "C" fn kvspaceGet(
@@ -275,11 +287,7 @@ pub extern "C" fn kvspaceGet(
                     *out_len = 0;
                 }
             } else {
-                hd.read_buf = raw;
-                unsafe {
-                    *out = hd.read_buf.as_mut_ptr();
-                    *out_len = hd.read_buf.len() as u32;
-                }
+                hd.lend(raw, out, out_len);
             }
             0
         }
@@ -642,11 +650,7 @@ pub extern "C" fn kvspaceWatch(
         &target_v,
         Duration::from_nanos(tick_ns),
     );
-    hd.read_buf = v.encode();
-    unsafe {
-        *out = hd.read_buf.as_mut_ptr();
-        *out_len = hd.read_buf.len() as u32;
-    }
+    hd.lend(v.encode(), out, out_len);
     0
 }
 
