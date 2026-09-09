@@ -54,8 +54,8 @@ fn run(dsn: &str) {
         other => panic!("自动兜底应为 stringkeymap: {:?}", other),
     }
 
-    // object 成员仍为裸名，与坐标段字面可分。
-    set(kv, "/h/", &new_obj_index());
+    // 命名成员仍为裸名，与坐标段字面可分。
+    set(kv, "/h/", &new_map_index(&[0]));
     set(kv, "/h·x", &new_int64(&[1]));
     set(kv, "/h·[0]", &new_int64(&[2]));
     let names = kv.list("/h·", false, true);

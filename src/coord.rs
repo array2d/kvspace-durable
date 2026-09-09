@@ -99,7 +99,7 @@ pub fn grow_coord_dims(dims: &[i32], names: &[String]) -> Vec<i32> {
     d
 }
 
-/// object 成员名字符约束：禁 / · [ ] \n \r \0 ‥ … 与 ASCII 控制字符，禁空串。
+/// 命名成员名字符约束：禁 / · [ ] \n \r \0 ‥ … 与 ASCII 控制字符，禁空串。
 /// '.' 已放开（小数/含点字符串可作 key），成员分隔符改为 ·（OBJ_SEP）。
 pub fn valid_member_name(name: &str) -> bool {
     !name.is_empty()

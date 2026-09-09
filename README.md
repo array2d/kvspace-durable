@@ -42,7 +42,7 @@ kindexpr TLV head, byte-identical to `kvspace-c`:
 - `[d0,d1]kind` carries ndim+dims; bare `kind` is a scalar; `char/*` is always a 1-D sequence (`[n]`).
 - `None` is encoded as NULL / length 0.
 
-Kinds: `bool`, `int8..int64`, `uint8..uint64`, `float32/64`, `char/utf32|utf8|ascii`, `objindex`, `strkeymapindex`, `index`, `extindex`, `rwir`, `rwfunc`, `defrwir`, `scope`, `time`, `duration`.
+Kinds: `bool`, `int8..int64`, `uint8..uint64`, `float32/64`, `char/utf32|utf8|ascii`, `stringkeymap`, `index`, `extindex`, `rwir`, `rwfunc`, `defrwir`, `scope`, `time`, `duration`.
 
 ## Tutorial
 

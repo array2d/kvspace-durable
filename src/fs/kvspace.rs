@@ -14,7 +14,7 @@ use crate::kvspace_common::{
 };
 use crate::r#const::*;
 use crate::xvalue::*;
-use crate::xvalue_index::{new_ext_index, new_index, new_map_index, new_obj_index};
+use crate::xvalue_index::{new_ext_index, new_index, new_map_index};
 
 const EXTINDEX_MARKER: &str = "__extindex__";
 const SELF_MARKER: &str = "__self__";
@@ -458,18 +458,6 @@ impl KVSpace for FsKVSpace {
                 let marker = self.fs_path(&resolved).join(EXTINDEX_MARKER);
                 fs::write(&marker, e.ext_path.as_bytes())
                     .map_err(|e| format!("kvspace-fs: extindex {}: {}", resolved, e))?;
-                continue;
-            }
-            if let XValue::Obj = &p.val {
-                let base = if resolved == PATH_SEP {
-                    resolved.clone()
-                } else {
-                    strip_dir_suf(&resolved).to_string()
-                };
-                let (parent, _name) = Self::parent_name(&base);
-                self.ensure_dir(&parent); // 父可能是同名叶文件（如 /lib/input def rwir）→ 提升为目录
-                self.write_leaf(&base, &p.raw.clone().unwrap_or_else(|| p.val.encode()));
-                self.ensure_dir(&format!("{}{}", base, OBJ_SEP));
                 continue;
             }
             if let XValue::Map(dims) = &p.val {

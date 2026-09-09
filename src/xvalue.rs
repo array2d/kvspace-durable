@@ -190,7 +190,6 @@ impl XValueHead {
                 XValue::CharAscii(crate::xvalue_byte::decode_char_ascii(body, &dims))
             }
             KIND_CHAR => XValue::Char32(crate::xvalue_byte::decode_char32(body, &dims)),
-            KIND_OBJ => XValue::Obj,
             KIND_MAP => XValue::Map(dims.clone()),
             KIND_INDEX => XValue::Index(crate::xvalue_index::decode_index(body, &dims)),
             KIND_EXT_INDEX => XValue::ExtIndex(crate::xvalue_index::decode_ext_index(body, &dims)),
@@ -241,7 +240,6 @@ pub enum XValue {
     CharByte(Arr<u8>),  // char/utf8，1B×N
     CharAscii(Arr<u8>), // char/ascii，1B×N
     Char32(Arr<u32>),   // char/utf32，码点，4B×N
-    Obj,                // object（命名成员对象）：成员列表在 memindex（p·）
     Map(Vec<i32>),      // stringkeymap（散 key ndarray）：dims 是逻辑形状，成员在 memindex（p·）
     Index(Vec<String>), // index
     ExtIndex(ExtIndex), // extindex
@@ -267,7 +265,6 @@ impl XValue {
             XValue::CharByte(_) => KIND_CHAR_UTF8,
             XValue::CharAscii(_) => KIND_CHAR_ASCII,
             XValue::Char32(_) => KIND_CHAR,
-            XValue::Obj => KIND_OBJ,
             XValue::Map(_) => KIND_MAP,
             XValue::Index(_) => KIND_INDEX,
             XValue::ExtIndex(_) => KIND_EXT_INDEX,
@@ -297,7 +294,6 @@ impl XValue {
             XValue::CharByte(d) => d.data.len() as i32,
             XValue::CharAscii(d) => d.data.len() as i32,
             XValue::Char32(d) => (d.data.len() * 4) as i32,
-            XValue::Obj => 0,
             XValue::Map(_) => 1,
             XValue::Index(d) => crate::xvalue_index::encode_index(d).1.len() as i32,
             XValue::ExtIndex(e) => crate::xvalue_index::encode_ext_index(&e.ext_path, &e.childs)
@@ -325,7 +321,6 @@ impl XValue {
             XValue::CharByte(d) => d.data.len() as i32,
             XValue::CharAscii(d) => d.data.len() as i32,
             XValue::Char32(d) => d.data.len() as i32,
-            XValue::Obj => 1,
             XValue::Map(dims) => dims.iter().product(),
             XValue::Index(_) => 1,
             XValue::ExtIndex(_) => 1,
@@ -351,7 +346,6 @@ impl XValue {
             XValue::CharByte(d) => crate::xvalue_byte::encode_char_byte(&d.data, &d.dims),
             XValue::CharAscii(d) => crate::xvalue_byte::encode_char_ascii(&d.data, &d.dims),
             XValue::Char32(d) => crate::xvalue_byte::encode_char32(&d.data, &d.dims),
-            XValue::Obj => tlv_encode(KIND_OBJ, &[], 1),
             XValue::Map(dims) => encode_head(KIND_MAP, 0, dims, &[]),
             XValue::Index(d) => {
                 let (dims, body) = crate::xvalue_index::encode_index(d);
@@ -387,7 +381,6 @@ impl XValue {
                 .iter()
                 .map(|&c| char::from_u32(c).unwrap_or('\u{FFFD}'))
                 .collect(),
-            XValue::Obj => KIND_OBJ.to_string(),
             XValue::Map(dims) => format!(
                 "map[{}]",
                 dims.iter()
@@ -712,7 +705,6 @@ mod tests {
             data: vec![1, 2, 3, 4, 5, 6],
             dims: vec![2, 3],
         }));
-        roundtrip(&XValue::Obj);
     }
 
     #[test]

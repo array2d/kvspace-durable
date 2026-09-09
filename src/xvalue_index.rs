@@ -7,9 +7,6 @@ use crate::xvalue::{ExtIndex, XValue};
 pub fn new_index(children: &[String]) -> XValue {
     XValue::Index(children.to_vec())
 }
-pub fn new_obj_index() -> XValue {
-    XValue::Obj
-}
 /// stringkeymap 恒 ndim≥1；dims 为空即非法（无维度的字符串键容器是 object）。
 pub fn new_map_index(dims: &[i32]) -> XValue {
     if dims.is_empty() {

@@ -25,15 +25,15 @@ fn run(dsn: &str) {
     let kv: &mut dyn KVSpace = kv.as_mut();
     kv.clear().unwrap();
 
-    // 原型 object 容器：两个叶成员 + 一个嵌套容器成员。
-    set(kv, "/proto", &XValue::Obj);
+    // 原型 stringkeymap 容器：两个叶成员 + 一个嵌套容器成员。
+    set(kv, "/proto", &XValue::Map(vec![0]));
     set(kv, "/proto·x", &new_int64(&[10]));
     set(kv, "/proto·y", &new_int64(&[20]));
-    set(kv, "/proto·sub", &XValue::Obj);
+    set(kv, "/proto·sub", &XValue::Map(vec![0]));
     set(kv, "/proto·sub·z", &new_int64(&[30]));
 
     // 只读扩展源 + 原型上的 extindex 成员 ov 覆盖 /ext·（extindex 节点落 `/` 目录键 /proto·ov/）。
-    set(kv, "/ext·", &new_obj_index());
+    set(kv, "/ext·", &new_map_index(&[0]));
     set(kv, "/ext·a", &new_int64(&[99]));
     kv.ext_index("/proto·ov·", "/ext·").unwrap();
 
@@ -51,7 +51,7 @@ fn run(dsn: &str) {
         "cp_tree 嵌套成员 z"
     );
     match get_one(kv, "/inst") {
-        XValue::Obj => {}
+        XValue::Map(_) => {}
         other => panic!("cp_tree 根值 kind 丢失: {:?}", other),
     }
 

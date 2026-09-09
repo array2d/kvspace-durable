@@ -16,7 +16,7 @@ use crate::xvalue::{
 };
 use crate::xvalue_index::{
     encode_ext_index_grow, encode_index_grow, grow_cap, matrix_cap, matrix_width, new_ext_index,
-    new_index, new_map_index, new_obj_index,
+    new_index, new_map_index,
 };
 
 pub struct Backend<S: KVStore> {
@@ -81,7 +81,7 @@ impl<S: KVStore> Backend<S> {
                     let dims = grow_coord_dims(&[], &[child.clone()]);
                     self.store.set(&base, &new_map_index(&dims).encode());
                 } else {
-                    self.store.set(&base, &new_obj_index().encode());
+                    self.store.set(&base, &new_map_index(&[0]).encode());
                 }
             }
             self.ensure_parent_dir(&dir);
@@ -459,7 +459,7 @@ impl<S: KVStore> KVSpace for Backend<S> {
             }
 
             // 容器值（object/stringkeymap）：值存 p（无后缀），memindex 存 p·（空 index，成员后续写入维护）。
-            if let XValue::Obj | XValue::Map(_) = &p.val {
+            if let XValue::Map(_) = &p.val {
                 let base = if resolved == PATH_SEP {
                     resolved.clone()
                 } else {
