@@ -467,7 +467,7 @@ impl KVSpace for FsKVSpace {
                     strip_dir_suf(&resolved).to_string()
                 };
                 let (parent, _name) = Self::parent_name(&base);
-                self.ensure_dir(&parent); // 父可能是同名叶文件（如 /lib/input defrwir）→ 提升为目录
+                self.ensure_dir(&parent); // 父可能是同名叶文件（如 /lib/input def rwir）→ 提升为目录
                 self.write_leaf(&base, &p.raw.clone().unwrap_or_else(|| p.val.encode()));
                 self.ensure_dir(&format!("{}{}", base, OBJ_SEP));
                 continue;
@@ -479,7 +479,7 @@ impl KVSpace for FsKVSpace {
                     strip_dir_suf(&resolved).to_string()
                 };
                 let (parent, _name) = Self::parent_name(&base);
-                self.ensure_dir(&parent); // 父可能是同名叶文件（如 /lib/input defrwir）→ 提升为目录
+                self.ensure_dir(&parent); // 父可能是同名叶文件（如 /lib/input def rwir）→ 提升为目录
                 self.write_leaf(&base, &p.raw.clone().unwrap_or_else(|| p.val.encode()));
                 self.ensure_dir(&format!("{}{}", base, OBJ_SEP));
                 let _ = dims;

@@ -32,7 +32,7 @@ pub fn store_has_dims(st: u8) -> bool {
 }
 
 fn is_index_kind(kind: &str) -> bool {
-    kind == KIND_INDEX || kind == KIND_EXT_INDEX || kind == "rwfunc" || kind == "defrwir"
+    kind == KIND_INDEX || kind == KIND_EXT_INDEX || kind == "rwfunc" || kind == "def rwir"
 }
 
 /// 由 base 种类名（+ndim）推 storetype。
