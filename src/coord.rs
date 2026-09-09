@@ -43,8 +43,8 @@ pub fn is_coord(name: &str) -> bool {
         && !name[1..name.len() - 1].contains(['[', ']'])
 }
 
-/// row-major 排序：坐标段恒排在非坐标段之前；两个坐标段若都能按整数解析则数值升序，
-/// 否则字典序（覆盖小数/字符串坐标）。
+/// row-major 排序（全序）：坐标段恒排在非坐标段之前；两坐标段中，可整数解析者恒排在
+/// 不可解析者之前，同类内分别按数值升序 / 字典序（后者覆盖小数/字符串坐标）。
 pub fn cmp_coord(a: &str, b: &str) -> Ordering {
     match (is_coord(a), is_coord(b)) {
         (false, false) => a.cmp(b),
@@ -52,7 +52,9 @@ pub fn cmp_coord(a: &str, b: &str) -> Ordering {
         (true, false) => Ordering::Less,
         (true, true) => match (parse_coord(a), parse_coord(b)) {
             (Some(x), Some(y)) => x.cmp(&y),
-            _ => a.cmp(b),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => a.cmp(b),
         },
     }
 }
