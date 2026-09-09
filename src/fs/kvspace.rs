@@ -493,6 +493,16 @@ impl KVSpace for FsKVSpace {
             // 叶值：确保父是目录（父可能是同名叶文件，如 /lib/println），写文件。
             let (parent, name, _) = split_index(&resolved);
             self.ensure_dir(&parent);
+            // extindex 写保护：只读扩展层上的同名节点禁止写入（对齐 backend.rs）。
+            let marker = self.fs_path(&parent).join(EXTINDEX_MARKER);
+            if let Ok(b) = fs::read(&marker) {
+                let ext_t = String::from_utf8_lossy(&b).into_owned();
+                if !self.dir_children(&parent).iter().any(|n| n == &name)
+                    && self.dir_children(&ext_t).iter().any(|n| n == &name)
+                {
+                    return Err(format!("{}: {}", ERR_EXT_WRITE, resolved));
+                }
+            }
             let bytes = p.raw.clone().unwrap_or_else(|| p.val.encode());
             self.write_leaf(&resolved, &bytes);
             // 坐标段成员写入未显式创建容器 → 自动建 stringkeymap 值（dims 由坐标推导）。
