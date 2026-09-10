@@ -17,9 +17,10 @@ pub struct KVPair {
 /// 先自旋（无 sleep），随后轮询间隔按指数回退，封顶 tickDuration。
 /// 生产者只需 Set(key, targetValue)；无通知队列，跨进程/节点/后端通用。
 ///
-/// 路径寻址穿透：Set 写入 Ptr 值（*target_kindexpr，body=target）后，访问 /ptrpath/x 经目录前缀
-/// 解析定位到 target/x（仅寻址，单跳；解引用取值只一跳，不连续追 Ptr 链）。
-/// 删除语义例外（POSIX rm 式）：Del/DelTree 的最终组件作用于指针本体，不穿透 target。
+/// 路径寻址穿透：只解析**父路径**里的 Ptr（单跳）——写 /ptrpath/x 时先解析 /ptrpath 的 link，
+/// 再拼 x。**整键永不穿透**：写/删一个 Ptr 键只作用该键本体（指向它的槽/变量），不重定向到
+/// target；Del/DelTree 同此（POSIX rm 式：删指针本身，不删被指向者）。解引用由调用方显式表达
+/// （kvlang runtime 的 `*` 前缀）——否则「写指针变量」会被重定向成写被指向的值。
 pub trait KVSpace {
     /// 校验目录前缀（/、或以 / 或 · 结尾）。非法返回 Err，供 C ABI 边界在调用前短路。
     fn validate_dir(&self, path: &str) -> Result<(), String> {
@@ -41,7 +42,7 @@ pub trait KVSpace {
     fn get(&mut self, prefix: &str, keys: &[String], resolve: bool) -> Vec<XValue>;
     /// 单点读原始字节（不 decode/re-encode，保 head 权限位 ro/vid）。无值返回空。
     fn get_raw(&mut self, key: &str) -> Vec<u8>;
-    /// 单点写：Set 写完整 XValue，并维护目录索引；总是穿透 link 写入 target。
+    /// 单点写：Set 写完整 XValue，并维护目录索引；只解析父路径 link，整键不穿透。
     fn set(&mut self, pairs: &[KVPair]) -> Result<(), String>;
 
     /// 定位读：借用读 key 值的 [off, off+len) 字节；空/不存在 → 空 Vec。
