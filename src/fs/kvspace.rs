@@ -433,7 +433,9 @@ impl KVSpace for FsKVSpace {
 
     fn set(&mut self, pairs: &[KVPair]) -> Result<(), String> {
         for p in pairs {
-            let resolved = self.resolve_path(&p.key);
+            // 只解析父路径，整键不穿透：写 Ptr 变量/帧槽时写的是指针本体（槽本身），
+            // 解引用由 runtime 显式 `*` 掌控（对齐 backend.rs / kvspace-c）。
+            let resolved = self.resolve_parent(&p.key);
             if resolved.contains("//") {
                 return Err(format!("Set: double-slash in key {:?}", resolved));
             }

@@ -116,8 +116,14 @@ pub fn validate_ptr(
     target: &str,
     target_kindexpr: &str,
 ) -> Result<(), String> {
+    // 空指针（target 空，如 `next:*Node=""` 的零值）：无目标可校验，直接放行。
+    // 注意须在 get_one 之前判——get_one("") 会落到根目录，解析出非 None 且 kind 不符，
+    // 误报 kind mismatch 而拒绝空指针写入（曾致 struct 空 Ptr 字段默认值整个丢失）。
+    if target.is_empty() || target_kindexpr.is_empty() {
+        return Ok(());
+    }
     let v = get_one(kv, target);
-    if is_none(&v) || target_kindexpr.is_empty() {
+    if is_none(&v) {
         return Ok(());
     }
     let actual = crate::xvalue::decode_xvalue_head(&v.encode()).langtype;
