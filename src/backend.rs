@@ -64,40 +64,6 @@ impl<S: KVStore> Backend<S> {
         }
     }
 
-    /// 写成员时兜底容器值链：leaf base + 沿父链全部中间层（object/stringkeymap）。
-    /// parent 是尾 · 的成员父目录，name 是该成员名；逐层向上建容器值并注册成员到各自 memindex。
-    fn ensure_member_chain(
-        &mut self,
-        parent: &str,
-        name: &str,
-        children: &mut Vec<(String, String)>,
-    ) {
-        let mut dir = parent.to_string();
-        let mut child = name.to_string();
-        loop {
-            let base = strip_dir_suf(&dir).to_string();
-            if self.store.get(&base).is_none() {
-                if is_coord(&child) {
-                    let dims = grow_coord_dims(&[], &[child.clone()]);
-                    self.store.set(&base, &new_map_index(&dims).encode());
-                } else {
-                    self.store.set(&base, &new_map_index(&[0]).encode());
-                }
-            }
-            self.ensure_parent_dir(&dir);
-            children.push((dir.clone(), child));
-            let (dp, dn) = Self::parent_name(&dir);
-            if dp.ends_with(OBJ_SEP) {
-                // 父仍是成员目录：继续沿链上溯（多级 ·）。
-                dir = dp;
-                child = dn;
-                continue;
-            }
-            // 父是目录（或根）：把成员名 dn 注册进父 index，链到此为止。
-            children.push((dp, dn));
-            break;
-        }
-    }
 
     // ── link 解析 ───────────────────────────────────────────────────
 
@@ -472,8 +438,22 @@ impl<S: KVStore> KVSpace for Backend<S> {
                 self.store.set(&base, &bytes);
                 self.store.set(&mem, &new_index(&[]).encode());
                 let (parent, name) = Self::parent_name(&base);
-                self.ensure_parent_dir(&parent);
-                children.push((parent, name));
+                // 成员目录与成员名都要注册进各自 index：redis 后端的目录成员是显式 index
+                // XValue，不像 fs 靠真实目录自动可见，故这趟链必须走完（只去掉「自动建容器」）。
+                let mut dir = parent.clone();
+                let mut child = name.clone();
+                loop {
+                    self.ensure_parent_dir(&dir);
+                    children.push((dir.clone(), child.clone()));
+                    let (dp, dn) = Self::parent_name(&dir);
+                    if dp.ends_with(OBJ_SEP) {
+                        dir = dp;
+                        child = dn;
+                        continue;
+                    }
+                    children.push((dp, dn));
+                    break;
+                }
                 continue;
             }
 
@@ -494,8 +474,34 @@ impl<S: KVStore> KVSpace for Backend<S> {
 
             let (parent, name, _) = split_index(&resolved);
             if parent.ends_with(OBJ_SEP) {
-                // 沿父链逐层兜底容器值（leaf base + 全部中间层 object/stringkeymap）并注册成员。
-                self.ensure_member_chain(&parent, &name, &mut children);
+                // 写成员前 memhead 必须已存在：容器值不在即**拒绝**，绝不兜底自动建。
+                // 「memhead 不存在则禁止写 memitem」是 kvspace 层的拦截（与 runtime 的
+                // kvlangBuiltinCheckMemhead 同一规则的两侧），自动建会把拼错的名字悄悄变成一个
+                // 新容器，且两个后端行为分叉（fs 无此兜底）。
+                // 同 fs：`/lib` 下的 `·` 是包·函数命名分隔符，不是 memindex 标记，豁免。
+                let base = strip_dir_suf(&parent).to_string();
+                if !base.starts_with("/lib") && self.store.get(&base).is_none() {
+                    return Err(format!(
+                        "{}: memhead {} does not exist — declare the container first",
+                        ERR_MEMHEAD_MISSING, base
+                    ));
+                }
+                // 成员目录与成员名都要注册进各自 index：redis 后端的目录成员是显式 index
+                // XValue，不像 fs 靠真实目录自动可见，故这趟链必须走完（只去掉「自动建容器」）。
+                let mut dir = parent.clone();
+                let mut child = name.clone();
+                loop {
+                    self.ensure_parent_dir(&dir);
+                    children.push((dir.clone(), child.clone()));
+                    let (dp, dn) = Self::parent_name(&dir);
+                    if dp.ends_with(OBJ_SEP) {
+                        dir = dp;
+                        child = dn;
+                        continue;
+                    }
+                    children.push((dp, dn));
+                    break;
+                }
             } else {
                 mk_index_recursive(self, &parent);
             }

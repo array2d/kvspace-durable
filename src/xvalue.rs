@@ -43,13 +43,19 @@ fn storetype_of(kind: &str, ndim: i32) -> u8 {
     if kind == KIND_EXT_INDEX {
         return STORETYPE_EXTINDEX;
     }
-    if is_index_kind(kind) {
+    if is_index_kind(kind) || is_map_langtype(kind) {
         return STORETYPE_INDEX;
     }
     if ndim > 0 {
         return STORETYPE_ARRAYND;
     }
     STORETYPE_ATOM
+}
+
+/// map langtype：`{memitemkeylangtype}·{memitemvaluelangtype}`。值容器的物理布局恒 index
+/// （成员名索引落兄弟槽 `{key}·`，见 [[map容器]]），与标量/张量截然不同。
+pub fn is_map_langtype(kind: &str) -> bool {
+    kind.contains(OBJ_SEP)
 }
 
 /// 指针 head 的 storetype = 目标语义 storetype（据目标完整 kindexpr 推；指针自身物理字段恒空）。
@@ -94,18 +100,34 @@ fn build_langtype(kind: &str, storetype: u8, dims: &[i32]) -> String {
     s
 }
 
-/// langtype 解析 → (dims, kind)：[dims] 段表形状，其余为基 kind。
-fn parse_kindexpr(s: &str) -> (Vec<i32>, String) {
+/// langtype 解析 → (dims, kind)：`[dims]` 段表形状，其余为基 kind。
+///
+/// **map langtype 无形状段**：`{memitemkeylangtype}·{memitemvaluelangtype}`（见 [[map容器]]）里
+/// `·` 之前的方括号是**键类型**，不是维度——`[int64]·[]char/utf32` 的键是 1 元坐标 `[int64]`，
+/// `[float64,float64]·int32` 的键是标量元组，与 `[2]float64`（数组形状）截然不同。故含 `·` 者整串
+/// 即基 kind，绝不剥前缀。非 map 串仍只把**纯数字/空/?**的方括号当形状。
+pub(crate) fn parse_kindexpr(s: &str) -> (Vec<i32>, String) {
+    if s.contains(OBJ_SEP) {
+        return (Vec::new(), s.to_string());
+    }
     if s.starts_with('[') {
         match s.find(']') {
-            Some(end) => (
-                s[1..end]
-                    .split(',')
-                    .filter(|d| !d.is_empty())
-                    .map(|d| d.parse().unwrap_or(0))
-                    .collect(),
-                s[end + 1..].to_string(),
-            ),
+            Some(end) => {
+                let inner = &s[1..end];
+                if inner.split(',').all(|d| {
+                    d.trim().is_empty() || d.trim() == "?" || d.trim().parse::<i32>().is_ok()
+                }) {
+                    return (
+                        inner
+                            .split(',')
+                            .filter(|d| !d.is_empty())
+                            .map(|d| d.parse().unwrap_or(0))
+                            .collect(),
+                        s[end + 1..].to_string(),
+                    );
+                }
+                (Vec::new(), s.to_string())
+            }
             None => (Vec::new(), s.to_string()),
         }
     } else {
@@ -173,6 +195,13 @@ impl XValueHead {
         }
         let kind = self.kind();
         let dims = self.dims();
+        // 值容器：langtype 即完整 map langtype（`{keylt}·{valt}lt`），storetype=index，主槽 body 空。
+        if is_map_langtype(&kind) {
+            return XValue::Map(MapValue {
+                langtype: kind,
+                dims,
+            });
+        }
         match kind.as_str() {
             KIND_BOOL => XValue::Bool(crate::xvalue_bool::decode_bool(body, &dims)),
             KIND_INT8 => XValue::Int8(crate::xvalue_int::decode_int8(body, &dims)),
@@ -190,7 +219,10 @@ impl XValueHead {
                 XValue::CharAscii(crate::xvalue_byte::decode_char_ascii(body, &dims))
             }
             KIND_CHAR => XValue::Char32(crate::xvalue_byte::decode_char32(body, &dims)),
-            KIND_MAP => XValue::Map(dims.clone()),
+            KIND_MAP => XValue::Map(MapValue {
+                langtype: kind.clone(),
+                dims: dims.clone(),
+            }),
             KIND_INDEX => XValue::Index(crate::xvalue_index::decode_index(body, &dims)),
             KIND_EXT_INDEX => XValue::ExtIndex(crate::xvalue_index::decode_ext_index(body, &dims)),
             _ => XValue::Opaque(Opaque {
@@ -240,7 +272,7 @@ pub enum XValue {
     CharByte(Arr<u8>),  // char/utf8，1B×N
     CharAscii(Arr<u8>), // char/ascii，1B×N
     Char32(Arr<u32>),   // char/utf32，码点，4B×N
-    Map(Vec<i32>),      // stringkeymap（散 key ndarray）：dims 是逻辑形状，成员在 memindex（p·）
+    Map(MapValue),      // stringkeymap 值容器：langtype 是完整 map langtype，成员在 memindex（p·）
     Index(Vec<String>), // index
     ExtIndex(ExtIndex), // extindex
     Opaque(Opaque),     // 未知 kind（如 kvlang 的 rwir/rwfunc/scope），原样存取
@@ -265,7 +297,7 @@ impl XValue {
             XValue::CharByte(_) => KIND_CHAR_UTF8,
             XValue::CharAscii(_) => KIND_CHAR_ASCII,
             XValue::Char32(_) => KIND_CHAR,
-            XValue::Map(_) => KIND_MAP,
+            XValue::Map(m) => m.langtype.as_str(),
             XValue::Index(_) => KIND_INDEX,
             XValue::ExtIndex(_) => KIND_EXT_INDEX,
             XValue::Opaque(o) => o.kind.as_str(),
@@ -321,7 +353,7 @@ impl XValue {
             XValue::CharByte(d) => d.data.len() as i32,
             XValue::CharAscii(d) => d.data.len() as i32,
             XValue::Char32(d) => d.data.len() as i32,
-            XValue::Map(dims) => dims.iter().product(),
+            XValue::Map(m) => m.dims.iter().product(),
             XValue::Index(_) => 1,
             XValue::ExtIndex(_) => 1,
             XValue::Opaque(o) => o.array_len,
@@ -346,7 +378,7 @@ impl XValue {
             XValue::CharByte(d) => crate::xvalue_byte::encode_char_byte(&d.data, &d.dims),
             XValue::CharAscii(d) => crate::xvalue_byte::encode_char_ascii(&d.data, &d.dims),
             XValue::Char32(d) => crate::xvalue_byte::encode_char32(&d.data, &d.dims),
-            XValue::Map(dims) => encode_head(KIND_MAP, 0, dims, &[]),
+            XValue::Map(m) => encode_head(&m.langtype, 0, &m.dims, &[]),
             XValue::Index(d) => {
                 let (dims, body) = crate::xvalue_index::encode_index(d);
                 encode_head(KIND_INDEX, 0, &dims, &body)
@@ -381,9 +413,10 @@ impl XValue {
                 .iter()
                 .map(|&c| char::from_u32(c).unwrap_or('\u{FFFD}'))
                 .collect(),
-            XValue::Map(dims) => format!(
+            XValue::Map(m) => format!(
                 "map[{}]",
-                dims.iter()
+                m.dims
+                    .iter()
                     .map(|d| d.to_string())
                     .collect::<Vec<_>>()
                     .join(",")
@@ -407,6 +440,15 @@ impl std::fmt::Display for XValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.code_string())
     }
+}
+
+// ── Map 值容器 ─────────────────────────────────────────────────────────────
+/// stringkeymap 值容器：`langtype` = 完整 map langtype（`{memitemkeylangtype}·{memitemvaluelangtype}`，
+/// 见 [[map容器]]），恒非空；`dims` = 逻辑形状（无形状的空容器为 [0]），成员名索引落兄弟槽 `{key}·`。
+#[derive(Clone, Debug, PartialEq)]
+pub struct MapValue {
+    pub langtype: String,
+    pub dims: Vec<i32>,
 }
 
 // ── Ptr ────────────────────────────────────────────────────────────────────
@@ -620,7 +662,10 @@ pub fn decode_xvalue_head(data: &[u8]) -> XValueHead {
 /// 解析完整 XValue（head + body）为 XValue。
 pub fn decode_xvalue(data: &[u8]) -> XValue {
     let h = decode_xvalue_head(data);
-    if h.langtype.is_empty() {
+    // 空 TLV / 空 langtype 的**非指针**值 = None（写 None 落 1 字节空 kind TLV）。
+    // 指针（ref=1）例外：它的 langtype 可能为空（如实参为无值容器时 runtime 推不出类型），
+    // 但空 langtype 的 Ptr 仍是 Ptr——引用一个键，不是"无值"。否则指针会被读成 None。
+    if h.langtype.is_empty() && !h.is_ptr() {
         return XValue::None;
     }
     h.decode(h.body(data))

@@ -109,6 +109,26 @@ pub fn dir_exists(kv: &mut dyn KVSpace, parent_dir: &str, name: &str) -> bool {
     false
 }
 
+/// langtype 归一：**只**剥「数组形状前缀」（`[5]`、`[]`、`[?]`——方括号内是维度数字/空）。
+/// `[int64]·int64`、`[float64,float64]·int32` 里的方括号是**元组/标量键类型**，不是形状
+/// （见 [[map容器]]：`[float64,float64]` ≠ `[2]float64`），一律原样保留——剥掉会让 map 的
+/// 键类型整个丢失，Ptr 类型检查随即误判。
+fn norm_langtype(s: &str) -> String {
+    if let Some(rest) = s.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            let inner = &rest[..end];
+            let is_shape = inner.is_empty()
+                || inner.split(',').all(|d| {
+                    d.trim().is_empty() || d.trim() == "?" || d.trim().parse::<i32>().is_ok()
+                });
+            if is_shape {
+                return rest[end + 1..].to_string();
+            }
+        }
+    }
+    s.to_string()
+}
+
 /// ValidatePtr：指针只解引用一跳，目标的完整 kindexpr 必须与指针声明的 target_kindexpr 相等。
 /// 因此 *int 指向一个本身是 *int 的目标会被拒绝（声明 int ≠ 实际 *int）——不可连续解引用。
 pub fn validate_ptr(
@@ -122,15 +142,24 @@ pub fn validate_ptr(
     if target.is_empty() || target_kindexpr.is_empty() {
         return Ok(());
     }
+    // `any` 是通配：声明 any 的形参接受任意类型实参（见 [[文法与合法性]]）。逐字比较会把
+    // 一切都判为不符——曾致 `rwfunc f(a:any)` 的实参 Ptr 全被拒写、帧槽丢参数直接 panic。
+    if target_kindexpr == "any" {
+        return Ok(());
+    }
     let v = get_one(kv, target);
     if is_none(&v) {
         return Ok(());
     }
-    let actual = crate::xvalue::decode_xvalue_head(&v.encode()).langtype;
-    if actual != target_kindexpr {
+    // 比 **kind 层**（剥 `[dims]`），不比整串：`[5]char/utf32` 与声明 `[]char/utf32`
+    // 是同一个 kind 的不同形状，语义兼容。整串相等曾把「定长实参传给变长形参」
+    // 这类合法场景误判为类型不符而拒绝写入。
+    let actual = norm_langtype(&crate::xvalue::decode_xvalue_head(&v.encode()).langtype);
+    let expect = norm_langtype(target_kindexpr);
+    if actual != expect {
         return Err(format!(
             "{}: ptr kind mismatch: target {} is {}, ptr expects {}",
-            ERR_LINK_TYPE_MISMATCH, target, actual, target_kindexpr
+            ERR_LINK_TYPE_MISMATCH, target, actual, expect
         ));
     }
     Ok(())

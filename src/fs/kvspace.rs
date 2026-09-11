@@ -462,7 +462,7 @@ impl KVSpace for FsKVSpace {
                     .map_err(|e| format!("kvspace-fs: extindex {}: {}", resolved, e))?;
                 continue;
             }
-            if let XValue::Map(dims) = &p.val {
+            if let XValue::Map(_) = &p.val {
                 let base = if resolved == PATH_SEP {
                     resolved.clone()
                 } else {
@@ -472,7 +472,6 @@ impl KVSpace for FsKVSpace {
                 self.ensure_dir(&parent); // 父可能是同名叶文件（如 /lib/input def rwir）→ 提升为目录
                 self.write_leaf(&base, &p.raw.clone().unwrap_or_else(|| p.val.encode()));
                 self.ensure_dir(&format!("{}{}", base, OBJ_SEP));
-                let _ = dims;
                 continue;
             }
             if let XValue::Index(_) = &p.val {
@@ -482,6 +481,20 @@ impl KVSpace for FsKVSpace {
 
             // 叶值：确保父是目录（父可能是同名叶文件，如 /lib/println），写文件。
             let (parent, name, _) = split_index(&resolved);
+            // 成员写（父为尾 `·` 的成员目录）：memhead 必须已存在，容器值不在即拒绝——
+            // 与 backend.rs / runtime 的 kvlangBuiltinCheckMemhead 同一规则，绝不兜底自动建。
+            // `/lib` 下的 `·` 是**包·函数命名分隔符**（`/lib/pkg·func`），不是 memindex 标记，
+            // 与 runtime 的 kvlangBuiltinCheckMemhead 同款豁免——不豁免会把 `/lib/json·to`
+            // 当成「在容器 /lib/json 上写成员 to」，把扩展算子的注册整个拒掉。
+            if parent.ends_with(OBJ_SEP) && !strip_dir_suf(&parent).starts_with("/lib") {
+                let base = strip_dir_suf(&parent);
+                if !self.fs_path(base).exists() && !Self::is_dir_key(base) {
+                    return Err(format!(
+                        "{}: memhead {} does not exist — declare the container first",
+                        ERR_MEMHEAD_MISSING, base
+                    ));
+                }
+            }
             self.ensure_dir(&parent);
             // extindex 写保护：只读扩展层上的同名节点禁止写入（对齐 backend.rs）。
             let marker = self.fs_path(&parent).join(EXTINDEX_MARKER);
@@ -495,18 +508,6 @@ impl KVSpace for FsKVSpace {
             }
             let bytes = p.raw.clone().unwrap_or_else(|| p.val.encode());
             self.write_leaf(&resolved, &bytes);
-            // 坐标段成员写入未显式创建容器 → 自动建 stringkeymap 值（dims 由坐标推导）。
-            if parent.ends_with(OBJ_SEP) && is_coord(&name) {
-                let base = strip_dir_suf(&parent);
-                if !self.fs_path(base).exists() {
-                    let mut names = self.dir_children(&parent);
-                    if !names.contains(&name) {
-                        names.push(name.clone());
-                    }
-                    let dims = grow_coord_dims(&[], &names);
-                    self.write_leaf(base, &new_map_index(&dims).encode());
-                }
-            }
         }
         Ok(())
     }
