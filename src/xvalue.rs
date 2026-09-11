@@ -308,33 +308,6 @@ impl XValue {
         matches!(self, XValue::Ptr(_))
     }
 
-    pub fn byte_len(&self) -> i32 {
-        match self {
-            XValue::None => 0,
-            XValue::Ptr(p) => p.target.len() as i32,
-            XValue::Bool(d) => d.data.len() as i32,
-            XValue::Int8(d) => d.data.len() as i32,
-            XValue::Int16(d) => (d.data.len() * 2) as i32,
-            XValue::Int32(d) => (d.data.len() * 4) as i32,
-            XValue::Int64(d) => (d.data.len() * 8) as i32,
-            XValue::Uint8(d) => d.data.len() as i32,
-            XValue::Uint16(d) => (d.data.len() * 2) as i32,
-            XValue::Uint32(d) => (d.data.len() * 4) as i32,
-            XValue::Uint64(d) => (d.data.len() * 8) as i32,
-            XValue::Float32(d) => (d.data.len() * 4) as i32,
-            XValue::Float64(d) => (d.data.len() * 8) as i32,
-            XValue::CharByte(d) => d.data.len() as i32,
-            XValue::CharAscii(d) => d.data.len() as i32,
-            XValue::Char32(d) => (d.data.len() * 4) as i32,
-            XValue::Map(_) => 1,
-            XValue::Index(d) => crate::xvalue_index::encode_index(d).1.len() as i32,
-            XValue::ExtIndex(e) => crate::xvalue_index::encode_ext_index(&e.ext_path, &e.childs)
-                .1
-                .len() as i32,
-            XValue::Opaque(o) => o.body.len() as i32,
-        }
-    }
-
     pub fn array_len(&self) -> i32 {
         match self {
             XValue::None => 0,

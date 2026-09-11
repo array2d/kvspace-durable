@@ -1,6 +1,5 @@
-// const.rs — 对齐 const.go
-// 路径与成员分隔符统一管理。所有构造 KV 路径、解析限定名、成员访问的地方
-// 均须使用这些常量，禁止硬编码 "·" 等裸字符串。
+// const.rs — 路径/分隔符/错误消息/kind 常量。
+// 所有构造 KV 路径、解析限定名、成员访问的地方均须使用这些常量，禁止硬编码 "·" 等裸字符串。
 
 // ── 路径结构 ──────────────────────────────────────────────────────────────
 
@@ -10,30 +9,17 @@ pub const RUNTIME_MEMBER_SEP: &str = "‥"; // 运行时保留字段前缀（U+2
 pub const INDEX_VALUE_SEP: &str = "\n"; // index XValueHead 中的路径分隔符
 pub const EXT_INDEX_HEAD: &str = "…"; // extindex XValueHead bytes 首元素前缀，如 …/lib/init/
 
-// ── 错误（对齐 const.go 的 error 变量） ──────────────────────────────────
+// ── 错误消息 ────────────────────────────────────────────────────────────
 
 pub const ERR_DIR_MUST_END_WITH_SLASH: &str = "kvspace: index must end with /";
 pub const ERR_INVALID_PATH: &str = "kvspace: path must be absolute and canonical";
-pub const ERR_INVALID_DIR_VALUE: &str = "kvspace: directory value must be kind=index";
-pub const ERR_INVALID_VALUE: &str = "kvspace: value cannot be encoded and decoded losslessly";
-pub const ERR_DISCONNECTED: &str = "kvspace: connection is disconnected";
-pub const ERR_GET: &str = "kvspace: GET";
-pub const ERR_PIPE_EXEC: &str = "kvspace: pipeline exec";
-pub const ERR_RESOLVE: &str = "kvspace: 路径解析 GET";
-pub const ERR_SCAN: &str = "kvspace: SCAN";
 pub const ERR_EXT_WRITE: &str = "kvspace: 禁止对 extindex 只读路径执行写操作";
 pub const ERR_EXT_DEL: &str = "kvspace: 禁止删除 extindex 只读路径";
-pub const ERR_NOT_DIR: &str = "kvspace: 父路径不是目录";
-pub const ERR_PARENT_NOT_FOUND: &str = "kvspace: 父目录不存在";
 pub const ERR_EXT_CASCADE: &str = "kvspace: ExtIndex 不容许级联";
-pub const ERR_EXT_TARGET: &str = "kvspace: ExtIndex target must be an existing ordinary index";
-pub const ERR_EXT_COLLISION: &str = "kvspace: ExtIndex local and extension children overlap";
 pub const ERR_LINK_TYPE_MISMATCH: &str = "kvspace: Link target 和 linkpath 类型不一致";
 pub const ERR_MAP_NDIM: &str = "kvspace: stringkeymap 恒 ndim>=1，dims 不可为空";
 pub const ERR_MAP_COORD: &str = "kvspace: stringkeymap 成员名必须是坐标段 [s0,s1,...]";
-pub const ERR_MEMBER_NAME: &str = "kvspace: 命名成员名含非法字符";
 pub const ERR_MEMHEAD_MISSING: &str = "kvspace: memhead 不存在，禁止写 memitem";
-pub const ERR_LINK_PATH_EXISTS: &str = "kvspace: Link path already contains a non-link value";
 
 // ── XValueHead kind ─────────────────────────────────────────────────────────
 

@@ -105,5 +105,4 @@ pub trait KVSpace {
     fn del_ext_index(&mut self, path: &str) -> Result<(), String>;
 
     fn clear(&mut self) -> Result<(), String>;
-    fn dis_conn(&mut self) -> Result<(), String>;
 }

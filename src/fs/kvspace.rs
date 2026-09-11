@@ -7,14 +7,14 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::coord::{cmp_coord, grow_coord_dims, is_coord, parse_coord};
+use crate::coord::cmp_coord;
 use crate::kvspace::{KVPair, KVSpace};
 use crate::kvspace_common::{
-    join_path, sep_path, split_index, strip_dir_suf, validate_ptr, watch_value, SepKind,
+    join_path, sep_path, split_index, strip_dir_suf, validate_ptr, watch_value,
 };
 use crate::r#const::*;
 use crate::xvalue::*;
-use crate::xvalue_index::{new_ext_index, new_index, new_map_index};
+use crate::xvalue_index::{new_ext_index, new_index};
 
 const EXTINDEX_MARKER: &str = "__extindex__";
 const SELF_MARKER: &str = "__self__";
@@ -59,18 +59,6 @@ impl FsKVSpace {
             prev = c;
         }
         self.root.join(rel.trim_start_matches('/'))
-    }
-
-    /// fs 路径 → kvspace key：'·/' → '·'
-    fn key_of(&self, path: &Path) -> String {
-        let rel = path.strip_prefix(&self.root).unwrap_or(path);
-        let pat = [OBJ_SEP, "/"].concat();
-        let s = rel.to_string_lossy().replace(pat.as_str(), OBJ_SEP);
-        if s.is_empty() {
-            PATH_SEP.to_string()
-        } else {
-            format!("/{}", s)
-        }
     }
 
     fn is_dir_key(key: &str) -> bool {
@@ -140,14 +128,6 @@ impl FsKVSpace {
             let _ = fs::remove_file(p.join(SELF_MARKER));
         } else {
             let _ = fs::remove_file(p);
-        }
-    }
-
-    fn suffix_for(key: &str) -> &'static str {
-        if key.ends_with(OBJ_SEP) && !key.ends_with(DIR_INDEX_SUF) {
-            OBJ_SEP
-        } else {
-            DIR_INDEX_SUF
         }
     }
 
@@ -710,13 +690,4 @@ impl KVSpace for FsKVSpace {
         let _ = fs::create_dir_all(&self.root);
         Ok(())
     }
-
-    fn dis_conn(&mut self) -> Result<(), String> {
-        Ok(())
-    }
-}
-
-// 供测试用：返回 root 下的顶层条目数。
-pub fn top_level_count(kv: &FsKVSpace) -> usize {
-    fs::read_dir(&kv.root).map(|d| d.count()).unwrap_or(0)
 }

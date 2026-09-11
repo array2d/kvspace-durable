@@ -1,9 +1,4 @@
-#![allow(unused)]
-#![allow(non_snake_case)]
-
-// kvspace-durable — 严格翻译 kvspace-go。
-// 文件对应：const.go → const.rs，xvalue*.go → xvalue*.rs，kvspace.go → kvspace.rs，
-// kvspace_common.go → kvspace_common.rs，conn.go → conn.rs，redis/kvspace.go → backend.rs + redis/store.rs。
+// kvspace-durable — 可嵌入的 KVSpace（Rust），对齐 kvspace ABI 与线格式。
 // 后端：redis、fs（goheap/shm 不属本项目）。
 
 pub mod r#const;

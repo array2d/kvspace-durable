@@ -3,24 +3,6 @@
 use crate::r#const::*;
 use crate::xvalue::{dims_from_len, encode_head, Arr, XValue};
 
-pub fn new_int8(v: &[i8]) -> XValue {
-    XValue::Int8(Arr {
-        data: v.to_vec(),
-        dims: dims_from_len(v.len()),
-    })
-}
-pub fn new_int16(v: &[i16]) -> XValue {
-    XValue::Int16(Arr {
-        data: v.to_vec(),
-        dims: dims_from_len(v.len()),
-    })
-}
-pub fn new_int32(v: &[i32]) -> XValue {
-    XValue::Int32(Arr {
-        data: v.to_vec(),
-        dims: dims_from_len(v.len()),
-    })
-}
 pub fn new_int64(v: &[i64]) -> XValue {
     XValue::Int64(Arr {
         data: v.to_vec(),
