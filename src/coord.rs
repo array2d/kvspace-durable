@@ -59,24 +59,6 @@ pub fn cmp_coord(a: &str, b: &str) -> Ordering {
     }
 }
 
-/// 坐标是否落在 dims 内（维数相符且逐维小于）。
-pub fn coord_in_dims(coords: &[i64], dims: &[i32]) -> bool {
-    coords.len() == dims.len()
-        && coords
-            .iter()
-            .zip(dims)
-            .all(|(&c, &d)| c >= 0 && c < d as i64)
-}
-
-/// 一维 dims 至少容纳坐标 v（max(dims[0], v+1)），dims 为空时起算为 1。
-pub fn grow_dim(dims: &[i32], v: i64) -> Vec<i32> {
-    if dims.is_empty() {
-        vec![v as i32 + 1]
-    } else {
-        vec![dims[0].max(v as i32 + 1)]
-    }
-}
-
 /// 一组坐标段的维数：逐段取最大整数坐标，dims 为空时按首个整数坐标段长度起算；
 /// 无任何整数坐标（纯小数/字符串坐标）时退化为 1 维、长度为成员数。
 pub fn grow_coord_dims(dims: &[i32], names: &[String]) -> Vec<i32> {
@@ -97,17 +79,4 @@ pub fn grow_coord_dims(dims: &[i32], names: &[String]) -> Vec<i32> {
         d = vec![names.len() as i32];
     }
     d
-}
-
-/// 命名成员名字符约束：禁 / · [ ] \n \r \0 ‥ … 与 ASCII 控制字符，禁空串。
-/// '.' 已放开（小数/含点字符串可作 key），成员分隔符改为 ·（OBJ_SEP）。
-pub fn valid_member_name(name: &str) -> bool {
-    !name.is_empty()
-        && !name.contains(crate::r#const::OBJ_SEP)
-        && !name.chars().any(|c| {
-            matches!(
-                c,
-                '/' | '[' | ']' | '\n' | '\r' | '\0' | '\u{2025}' | '\u{2026}'
-            ) || (c as u32) < 0x20
-        })
 }

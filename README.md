@@ -21,7 +21,7 @@ Crate types: `rlib`, `staticlib`, `cdylib` (`libkvspace_durable.so`).
 
 C ABI exported from the cdylib (`src/ffi.rs`):
 
-- lifecycle: `kvspaceConnect`, `kvspaceClose`, `kvspaceDisconnect`
+- lifecycle: `kvspaceConnect`, `kvspaceClose`
 - KV read/write (zero-copy borrow model, no free): `kvspaceGet` (borrow), `kvspaceWriteInPlace`, `kvspaceWriteNewPlace`
 - enumerate / delete / copy: `kvspaceListLen`, `kvspaceListAt`, `kvspaceDel`, `kvspaceDelTree`, `kvspaceCp`, `kvspaceCpTree`
 - directories / extindex: `kvspaceMkindex`, `kvspaceMkindexExt`, `kvspaceRmindexExt`

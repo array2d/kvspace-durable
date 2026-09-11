@@ -18,7 +18,6 @@ use std::time::Duration;
 
 use crate::conn::conn;
 use crate::kvspace::{KVPair, KVSpace};
-use crate::kvspace_common::get_one;
 use crate::xvalue::{decode_xvalue, decode_xvalue_head, encode_head, encode_head_perm, new_ptr};
 use crate::xvalue_bool::new_bool;
 use crate::xvalue_byte::new_char_byte;
@@ -783,18 +782,6 @@ pub extern "C" fn kvspaceClear(h: *mut Handle, err: *mut c_char, err_cap: u32) -
         }
     };
     result_to_code(catch_panic(|| kv.clear()), err, err_cap)
-}
-
-#[no_mangle]
-pub extern "C" fn kvspaceDisconnect(h: *mut Handle, err: *mut c_char, err_cap: u32) -> c_int {
-    let kv: &mut dyn KVSpace = match unsafe { kv_flush(h) } {
-        Ok(k) => k,
-        Err(e) => {
-            write_err(err, err_cap, &e);
-            return 1;
-        }
-    };
-    result_to_code(catch_panic(|| kv.dis_conn()), err, err_cap)
 }
 
 // ── XValue 编解码（head/TLV + 标准标量构造器） ─────────────────────────

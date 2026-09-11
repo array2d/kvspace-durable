@@ -106,7 +106,11 @@ impl RedisStore {
 }
 
 enum Resp {
+    // 字段 0 暂未被读取——Redis 错误文本当前被静默丢弃，待接入 Result 错误传播后启用（见 todo）
+    #[allow(dead_code)]
     Simple(String),
+    // 同上
+    #[allow(dead_code)]
     Error(String),
     Integer(i64),
     Bulk(Option<Vec<u8>>),

@@ -3,11 +3,9 @@
 
 use std::time::Duration;
 
-use crate::coord::{grow_coord_dims, is_coord};
 use crate::kvspace::{KVPair, KVSpace};
 use crate::kvspace_common::{
-    dir_exists, get_one, join_path, mk_index_recursive, sep_path, split_index, strip_dir_suf,
-    validate_ptr, watch_value,
+    join_path, mk_index_recursive, sep_path, split_index, strip_dir_suf, validate_ptr, watch_value,
 };
 use crate::r#const::*;
 use crate::store::KVStore;
@@ -16,7 +14,7 @@ use crate::xvalue::{
 };
 use crate::xvalue_index::{
     encode_ext_index_grow, encode_index_grow, grow_cap, matrix_cap, matrix_width, new_ext_index,
-    new_index, new_map_index,
+    new_index,
 };
 
 pub struct Backend<S: KVStore> {
@@ -63,7 +61,6 @@ impl<S: KVStore> Backend<S> {
             mk_index_recursive(self, dir);
         }
     }
-
 
     // ── link 解析 ───────────────────────────────────────────────────
 
@@ -914,10 +911,6 @@ impl<S: KVStore> KVSpace for Backend<S> {
 
     fn clear(&mut self) -> Result<(), String> {
         self.store.flush();
-        Ok(())
-    }
-
-    fn dis_conn(&mut self) -> Result<(), String> {
         Ok(())
     }
 }

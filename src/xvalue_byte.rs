@@ -14,12 +14,6 @@ pub fn new_char_byte(v: &[u8]) -> XValue {
         dims: char_dims(v.len()),
     })
 }
-pub fn new_char_ascii(v: &[u8]) -> XValue {
-    XValue::CharAscii(Arr {
-        data: v.to_vec(),
-        dims: char_dims(v.len()),
-    })
-}
 pub fn new_char32(v: &[u32]) -> XValue {
     XValue::Char32(Arr {
         data: v.to_vec(),
