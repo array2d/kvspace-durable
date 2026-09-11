@@ -410,7 +410,13 @@ pub extern "C" fn kvspaceGetHead(
     if prefix.is_empty() {
         return 1;
     }
-    fill_head(&decode_xvalue_head(&prefix), out);
+    // head 只需前缀即可解（body 不在手上，不能走整值校验）；head 长于已读前缀说明前缀太小，
+    // 报错而非给出空 head——绝不静默返回一个"看起来合法"的默认值。
+    let head = crate::xvalue::decode_xvalue_head_prefix(&prefix);
+    if head.headlen == 0 {
+        return 1;
+    }
+    fill_head(&head, out);
     0
 }
 
