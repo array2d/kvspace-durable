@@ -1,18 +1,22 @@
 // xvalue_index.rs — memindex 定宽排序矩阵（index / object / stringkeymap / extindex 共用）
 
 use crate::coord::cmp_coord;
-use crate::r#const::ERR_MAP_NDIM;
-use crate::xvalue::{ExtIndex, XValue};
+use crate::r#const::KIND_MAP;
+use crate::xvalue::{ExtIndex, MapValue, XValue};
 
 pub fn new_index(children: &[String]) -> XValue {
     XValue::Index(children.to_vec())
 }
-/// stringkeymap 恒 ndim≥1；dims 为空即非法（无维度的字符串键容器是 object）。
+/// stringkeymap 值容器：langtype 为完整 map langtype（逐字，见 [[map容器]]）。
+pub fn new_map_langtype(langtype: &str, dims: &[i32]) -> XValue {
+    XValue::Map(MapValue {
+        langtype: langtype.to_string(),
+        dims: dims.to_vec(),
+    })
+}
+/// 无类型标注的散 key 字面量（`{v0,v1,…}`）：容器值 langtype 退化为种类名 `stringkeymap`。
 pub fn new_map_index(dims: &[i32]) -> XValue {
-    if dims.is_empty() {
-        panic!("{}", ERR_MAP_NDIM);
-    }
-    XValue::Map(dims.to_vec())
+    new_map_langtype(KIND_MAP, dims)
 }
 pub fn new_ext_index(children: &[String], ext_path: &str) -> XValue {
     XValue::ExtIndex(ExtIndex {

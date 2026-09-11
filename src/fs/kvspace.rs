@@ -462,7 +462,7 @@ impl KVSpace for FsKVSpace {
                     .map_err(|e| format!("kvspace-fs: extindex {}: {}", resolved, e))?;
                 continue;
             }
-            if let XValue::Map(dims) = &p.val {
+            if let XValue::Map(_) = &p.val {
                 let base = if resolved == PATH_SEP {
                     resolved.clone()
                 } else {
@@ -472,7 +472,6 @@ impl KVSpace for FsKVSpace {
                 self.ensure_dir(&parent); // 父可能是同名叶文件（如 /lib/input def rwir）→ 提升为目录
                 self.write_leaf(&base, &p.raw.clone().unwrap_or_else(|| p.val.encode()));
                 self.ensure_dir(&format!("{}{}", base, OBJ_SEP));
-                let _ = dims;
                 continue;
             }
             if let XValue::Index(_) = &p.val {
@@ -495,18 +494,6 @@ impl KVSpace for FsKVSpace {
             }
             let bytes = p.raw.clone().unwrap_or_else(|| p.val.encode());
             self.write_leaf(&resolved, &bytes);
-            // 坐标段成员写入未显式创建容器 → 自动建 stringkeymap 值（dims 由坐标推导）。
-            if parent.ends_with(OBJ_SEP) && is_coord(&name) {
-                let base = strip_dir_suf(&parent);
-                if !self.fs_path(base).exists() {
-                    let mut names = self.dir_children(&parent);
-                    if !names.contains(&name) {
-                        names.push(name.clone());
-                    }
-                    let dims = grow_coord_dims(&[], &names);
-                    self.write_leaf(base, &new_map_index(&dims).encode());
-                }
-            }
         }
         Ok(())
     }
