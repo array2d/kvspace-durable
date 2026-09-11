@@ -617,6 +617,48 @@ pub fn encode_head_perm(
     buf
 }
 
+/// 只解 head、**不要求 body 到齐**：供 `kvspaceGetHead` 这类只读值前缀的调用点用
+/// （它按约定只取前若干字节，body 本就不在手上）。整值调用点仍走 [`decode_xvalue_head`]，
+/// 那里的「headlen + body_len ≤ data.len()」是防截断校验。
+pub fn decode_xvalue_head_prefix(data: &[u8]) -> XValueHead {
+    if data.len() < HEAD_PREFIX {
+        return XValueHead::default();
+    }
+    let headlen = u16::from_le_bytes(data[0..2].try_into().unwrap()) as usize;
+    let r#ref = data[2];
+    let storetype = data[3];
+    let ro = data[4] != 0;
+    let vid = u32::from_le_bytes(data[5..9].try_into().unwrap());
+    let body_len = u32::from_le_bytes(data[9..13].try_into().unwrap()) as i32;
+    if headlen < HEAD_PREFIX || data.len() < headlen {
+        return XValueHead::default();
+    }
+    let mut o = HEAD_PREFIX;
+    let mut phys_dims = Vec::new();
+    if store_has_dims(storetype) {
+        let ndim = data[o] as usize;
+        o += 1;
+        for _ in 0..ndim {
+            if o + 4 > headlen {
+                break;
+            }
+            phys_dims.push(i32::from_le_bytes(data[o..o + 4].try_into().unwrap()));
+            o += 4;
+        }
+    }
+    let langtype = String::from_utf8_lossy(&data[o..headlen]).into_owned();
+    XValueHead {
+        headlen: headlen as u16,
+        r#ref,
+        storetype,
+        langtype,
+        phys_dims,
+        ro,
+        vid,
+        body_len,
+    }
+}
+
 pub fn decode_xvalue_head(data: &[u8]) -> XValueHead {
     if data.len() < HEAD_PREFIX {
         return XValueHead::default();
