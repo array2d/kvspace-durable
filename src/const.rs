@@ -32,6 +32,7 @@ pub const ERR_LINK_TYPE_MISMATCH: &str = "kvspace: Link target 和 linkpath 类�
 pub const ERR_MAP_NDIM: &str = "kvspace: stringkeymap 恒 ndim>=1，dims 不可为空";
 pub const ERR_MAP_COORD: &str = "kvspace: stringkeymap 成员名必须是坐标段 [s0,s1,...]";
 pub const ERR_MEMBER_NAME: &str = "kvspace: 命名成员名含非法字符";
+pub const ERR_MEMHEAD_MISSING: &str = "kvspace: memhead 不存在，禁止写 memitem";
 pub const ERR_LINK_PATH_EXISTS: &str = "kvspace: Link path already contains a non-link value";
 
 // ── XValueHead kind ─────────────────────────────────────────────────────────

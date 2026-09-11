@@ -35,7 +35,7 @@ fn run(dsn: &str) {
 
     // 容器值 round-trip：kind + dims 保留（值在 /m，成员在 memindex /m·）。
     match get_one(kv, "/m") {
-        XValue::Map(dims) => assert_eq!(dims, vec![2, 3], "dims round-trip"),
+        XValue::Map(m) => assert_eq!(m.dims, vec![2, 3], "dims round-trip"),
         other => panic!("容器值 kind 丢失: {:?}", other),
     }
 
@@ -47,12 +47,16 @@ fn run(dsn: &str) {
     assert_eq!(get_one(kv, "/m·[1,2]"), new_float32(&[6.28]));
     assert!(is_none(&get_one(kv, "/m·[9,9]")));
 
-    // 未显式创建容器，直接写坐标成员 → 自动兜底为 stringkeymap（维度由坐标推导）。
-    set(kv, "/n·[2,3]", &new_int64(&[7]));
-    match get_one(kv, "/n") {
-        XValue::Map(dims) => assert_eq!(dims, vec![3, 4], "auto map dims"),
-        other => panic!("自动兜底应为 stringkeymap: {:?}", other),
-    }
+    // 未声明容器直接写坐标成员 → **拒绝**：memhead 不存在则禁止写 memitem。
+    // 这条规则两侧同源——kvspace（本处）与 runtime 的 kvlangBuiltinCheckMemhead；
+    // 曾经只有 redis 后端会兜底自动建容器，fs 不会，同一份代码两后端分叉，故铲掉兜底。
+    let e = kv.set(&[KVPair {
+        key: "/n·[2,3]".to_string(),
+        val: new_int64(&[7]),
+        raw: None,
+    }]);
+    assert!(e.is_err(), "未声明 memhead 的成员写必须被拒: {e:?}");
+    assert!(is_none(&get_one(kv, "/n")), "被拒后不应留下容器值");
 
     // 命名成员仍为裸名，与坐标段字面可分。
     set(kv, "/h/", &new_map_index(&[0]));

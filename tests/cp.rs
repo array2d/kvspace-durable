@@ -26,10 +26,10 @@ fn run(dsn: &str) {
     kv.clear().unwrap();
 
     // 原型 stringkeymap 容器：两个叶成员 + 一个嵌套容器成员。
-    set(kv, "/proto", &XValue::Map(vec![0]));
+    set(kv, "/proto", &new_map_index(&[0]));
     set(kv, "/proto·x", &new_int64(&[10]));
     set(kv, "/proto·y", &new_int64(&[20]));
-    set(kv, "/proto·sub", &XValue::Map(vec![0]));
+    set(kv, "/proto·sub", &new_map_index(&[0]));
     set(kv, "/proto·sub·z", &new_int64(&[30]));
 
     // 只读扩展源 + 原型上的 extindex 成员 ov 覆盖 /ext·（extindex 节点落 `/` 目录键 /proto·ov/）。

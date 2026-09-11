@@ -481,6 +481,20 @@ impl KVSpace for FsKVSpace {
 
             // 叶值：确保父是目录（父可能是同名叶文件，如 /lib/println），写文件。
             let (parent, name, _) = split_index(&resolved);
+            // 成员写（父为尾 `·` 的成员目录）：memhead 必须已存在，容器值不在即拒绝——
+            // 与 backend.rs / runtime 的 kvlangBuiltinCheckMemhead 同一规则，绝不兜底自动建。
+            // `/lib` 下的 `·` 是**包·函数命名分隔符**（`/lib/pkg·func`），不是 memindex 标记，
+            // 与 runtime 的 kvlangBuiltinCheckMemhead 同款豁免——不豁免会把 `/lib/json·to`
+            // 当成「在容器 /lib/json 上写成员 to」，把扩展算子的注册整个拒掉。
+            if parent.ends_with(OBJ_SEP) && !strip_dir_suf(&parent).starts_with("/lib") {
+                let base = strip_dir_suf(&parent);
+                if !self.fs_path(base).exists() && !Self::is_dir_key(base) {
+                    return Err(format!(
+                        "{}: memhead {} does not exist — declare the container first",
+                        ERR_MEMHEAD_MISSING, base
+                    ));
+                }
+            }
             self.ensure_dir(&parent);
             // extindex 写保护：只读扩展层上的同名节点禁止写入（对齐 backend.rs）。
             let marker = self.fs_path(&parent).join(EXTINDEX_MARKER);
