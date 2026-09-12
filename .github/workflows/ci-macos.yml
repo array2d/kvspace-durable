@@ -1,0 +1,16 @@
+name: ci-macos
+on: [push, pull_request]
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 构建
+        run: cargo build --release
+      - name: 测试（macOS runner 无 service container，用 brew 起 redis）
+        run: |
+          brew install redis
+          redis-server --daemonize yes
+          for i in $(seq 1 30); do redis-cli ping >/dev/null 2>&1 && break; sleep 1; done
+          redis-cli ping
+          cargo test
