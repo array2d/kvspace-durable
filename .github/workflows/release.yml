@@ -18,7 +18,10 @@ jobs:
           set -euo pipefail
           v="${GITHUB_REF_NAME}"
           d="kvspace-durable-abi-$v-linux-x86_64"
-          mkdir -p "$d/lib"
+          mkdir -p "$d/include" "$d/lib"
+          # 本仓为 Rust（无 C 头），权威 ABI 头定义在 kvspace 仓，随实现一并发布
+          git clone --depth 1 https://github.com/array2d/kvspace.git /tmp/kvspace-hdr
+          cp -r /tmp/kvspace-hdr/include/kvspace "$d/include/"
           cp target/release/libkvspace_durable.so "$d/lib/"
           ln -sf libkvspace_durable.so "$d/lib/libkvspace_durable.so.1"
           printf '{"abi":"%s"}\n' "$v" > "$d/abi-manifest.json"
