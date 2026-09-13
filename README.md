@@ -11,11 +11,14 @@ Backends: `redis://` (default when no scheme is given), `fs://` — selected by 
 ## Build
 
 ```bash
-make build       # cargo build --release --bin kvspace → ~/.local/bin/kvspace (CLI)
+make build       # cargo build --release → libkvspace_durable.so
 make test        # build + tutorial/test.py
 ```
 
 Crate types: `rlib`, `staticlib`, `cdylib` (`libkvspace_durable.so`).
+
+> The `kvspace` CLI is **not** part of this crate — it lives in the [kvspace](../kvspace) repo
+> (`cli/`, drives the dispatch front end so the backend is chosen by DSN).
 
 ## ABI
 
