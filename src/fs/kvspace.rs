@@ -269,11 +269,11 @@ impl FsKVSpace {
                         // 成员目录内：obj 是完整 key，发射为 "init."
                         children.push(fname);
                     } else {
-                        // 普通目录内：成员前缀目录（"math."）扁平化展开为 "math.<成员>"
-                        let sub_key = format!("{}{}/", dir_key, fname);
-                        for sub in self.dir_children(&sub_key) {
-                            children.push(format!("{}{}", fname, sub));
-                        }
+                        // 普通目录内：成员前缀目录（"string·"）→ **裸成员名** "string"。
+                        // 对齐 redis 后端（存储索引把成员前缀节点登记为去 · 的裸名）：
+                        // 扁平展开会让父目录列出全部后代（如 "string·upper.src"），
+                        // 递归遍历/重建（layout dump、walk_lib）就再也对不上父子层级。
+                        children.push(fname.trim_end_matches(OBJ_SEP).to_string());
                     }
                 } else if e.path().is_dir() {
                     children.push(format!("{}/", fname));
@@ -362,6 +362,14 @@ impl KVSpace for FsKVSpace {
     }
 
     fn get_raw(&mut self, key: &str) -> Vec<u8> {
+        // 目录 key 无落盘索引（FS 自身即索引）：按需派生 index XValue 再返回，
+        // 对齐 redis 后端「目录 key get 返回容器 XValue」（issue #250）。
+        if Self::is_dir_key(key) {
+            let resolved = self.resolve_path(key);
+            if Self::is_dir_key(&resolved) && self.fs_path(&resolved).is_dir() {
+                return self.dir_value(&resolved).encode();
+            }
+        }
         let (mut p, l) = sep_path(key);
         if p != PATH_SEP {
             p.push_str(DIR_INDEX_SUF);
@@ -382,6 +390,17 @@ impl KVSpace for FsKVSpace {
     }
 
     fn get_part(&mut self, key: &str, off: u32, len: u32) -> Vec<u8> {
+        // 目录 key：索引是派生物（FS 自身即索引），先在内存里拼出 index XValue 再切片，
+        // 否则 head 读前缀会拿到空（issue #250：fs 目录 key head → nil）。
+        if Self::is_dir_key(key) {
+            let resolved = self.resolve_path(key);
+            if Self::is_dir_key(&resolved) && self.fs_path(&resolved).is_dir() {
+                let v = self.dir_value(&resolved).encode();
+                let s = (off as usize).min(v.len());
+                let e = (s + len as usize).min(v.len());
+                return v[s..e].to_vec();
+            }
+        }
         let Some(pf) = self.physical_file(key) else {
             return Vec::new();
         };
