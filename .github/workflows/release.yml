@@ -19,11 +19,14 @@ jobs:
           v="${GITHUB_REF_NAME}"
           d="kvspace-durable-abi-$v-linux-x86_64"
           mkdir -p "$d/include" "$d/lib"
-          # 本仓为 Rust（无 C 头），权威 ABI 头定义在 kvspace 仓，随实现一并发布
+          # 头：本仓为 Rust（无 C 头），权威 ABI 头在 kvspace 仓 → 递归整目录
           git clone --depth 1 https://github.com/array2d/kvspace.git /tmp/kvspace-hdr
-          cp -r /tmp/kvspace-hdr/include/kvspace "$d/include/"
-          cp target/release/libkvspace_durable.so "$d/lib/"
-          ln -sf libkvspace_durable.so "$d/lib/libkvspace_durable.so.1"
+          cp -R /tmp/kvspace-hdr/include/. "$d/include/"
+          # 库：扫 target/release 的 .so*/.dylib（-P 保符号链接）
+          find target/release -maxdepth 2 \( -name 'lib*.so*' -o -name 'lib*.dylib' \) -exec cp -P {} "$d/lib/" \;
+          # soname 兼容软链
+          [ -f "$d/lib/libkvspace_durable.so" ] && ln -sf libkvspace_durable.so "$d/lib/libkvspace_durable.so.1"
+          # 本仓无可执行产物（CLI 已迁至 kvspace 仓），故不带 bin/
           printf '{"abi":"%s"}\n' "$v" > "$d/abi-manifest.json"
           tar czf "$d.tar.gz" "$d"
           sha256sum "$d.tar.gz" > SHA256SUMS
