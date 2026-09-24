@@ -13,6 +13,7 @@
 // 注意：本层函数不得 panic 跨边界（panic 会 abort 进程）；调用方保证入参合法。
 
 use std::ffi::CStr;
+use std::io::Write;
 use std::os::raw::{c_char, c_int};
 use std::time::Duration;
 
@@ -29,7 +30,9 @@ use crate::xvalue_int::new_int64;
 // durable 无常驻映射：0copy 适配下沉到句柄内。读把每笔结果单独存进 read_bufs 借用池并返回
 // 其指针，池内缓冲同时存活至下一次写 flush（履约 kvspace.h「借用生命周期同该槽」，令单条指令
 // 的多个读操作数可同时借用）；写把整条 TLV 攒进 write_buf、置 pending_key，在**下一个可观察
-// 操作前**惰性 flush（内部实现，不进公开 ABI）。调用方从不 free、从不 commit。
+// 操作前**惰性 flush——body 由调用方在返回后填，返回前无法落盘，故落盘点恒为「下一次 op 或
+// Close」；漏 Close 的兜底由前端 atexit 兑现（见 kvspace.h 写原语注释、spec [[CABI]] 写侧落盘
+// 时机）。调用方从不 free、从不 commit。
 
 pub struct Handle {
     kv: Box<dyn KVSpace>,
@@ -249,7 +252,10 @@ pub extern "C" fn kvspaceConnect(dsn: *const c_char) -> *mut Handle {
 pub extern "C" fn kvspaceClose(h: *mut Handle) {
     if !h.is_null() {
         let mut hd = unsafe { Box::from_raw(h) };
-        let _ = hd.flush(); // 关闭前落盘未决写
+        // 关闭前落盘未决写：本层不得 panic 跨边界，故写 stderr 而非 eprintln!（管道断裂会 panic）。
+        if let Err(e) = hd.flush() {
+            let _ = writeln!(std::io::stderr(), "kvspace: close: pending write lost: {e}");
+        }
         drop(hd);
     }
 }
