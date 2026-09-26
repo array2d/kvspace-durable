@@ -4,7 +4,6 @@ use std::cell::RefCell;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 
-use crate::r#const::*;
 use crate::store::KVStore;
 
 pub struct RedisStore {
@@ -178,43 +177,6 @@ impl KVStore for RedisStore {
             args.push(k.as_bytes());
         }
         let _ = self.cmd(&args);
-    }
-
-    fn scan_keys(&self, prefix: &str) -> Vec<String> {
-        // SCAN 全库后客户端按 prefix 过滤，避免 Redis glob 对 [ ] 等元字符的误匹配。
-        let mut keys = Vec::new();
-        let mut cursor: i64 = 0;
-        loop {
-            let cur_str = cursor.to_string();
-            match self.cmd(&[b"SCAN", cur_str.as_bytes(), b"COUNT", b"1000"]) {
-                Resp::Array(arr) if arr.len() == 2 => {
-                    cursor = match &arr[0] {
-                        Resp::Bulk(Some(b)) => String::from_utf8_lossy(b).parse().unwrap_or(0),
-                        _ => 0,
-                    };
-                    if let Resp::Array(items) = &arr[1] {
-                        for it in items {
-                            if let Resp::Bulk(Some(b)) = it {
-                                let k = String::from_utf8_lossy(b).into_owned();
-                                if k == prefix
-                                    || (k.len() > prefix.len() && k.starts_with(prefix) && {
-                                        let rest = &k[prefix.len()..];
-                                        rest.starts_with(PATH_SEP) || rest.starts_with(OBJ_SEP)
-                                    })
-                                {
-                                    keys.push(k);
-                                }
-                            }
-                        }
-                    }
-                    if cursor == 0 {
-                        break;
-                    }
-                }
-                _ => break,
-            }
-        }
-        keys
     }
 
     fn flush(&self) {
