@@ -4,10 +4,10 @@
 // ── 路径结构 ──────────────────────────────────────────────────────────────
 
 pub const PATH_SEP: &str = "/"; // 路径分隔符
+pub const META_ROOT_NAME: &str = ".kvspace-meta";
 pub const DIR_INDEX_SUF: &str = "/"; // 目录索引键后缀（尾斜杠 = 目录，必须以 / 开头的 key 保证不冲突）
 pub const RUNTIME_MEMBER_SEP: &str = "‥"; // 运行时保留字段前缀（U+2025）——‥ 的唯一定义处，List 时隐藏
-pub const INDEX_VALUE_SEP: &str = "\n"; // index XValueHead 中的路径分隔符
-pub const EXT_INDEX_HEAD: &str = "…"; // extindex XValueHead bytes 首元素前缀，如 …/lib/init/
+pub const EXT_INDEX_HEAD: &str = "…"; // Directory display marker.
 
 // ── 错误消息 ────────────────────────────────────────────────────────────
 
@@ -42,7 +42,3 @@ pub const KIND_FLOAT32: &str = "float32"; // → byte, 4B
 pub const KIND_INT64: &str = "int64"; // → byte, 8B
 pub const KIND_UINT64: &str = "uint64"; // → byte, 8B
 pub const KIND_FLOAT64: &str = "float64"; // → byte, 8B
-
-pub const KIND_MAP: &str = "stringkeymap";
-pub const KIND_INDEX: &str = "index";
-pub const KIND_EXT_INDEX: &str = "extindex"; // 扩展索引，写留在上层

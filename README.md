@@ -25,7 +25,7 @@ Crate types: `rlib`, `staticlib`, `cdylib` (`libkvspace_durable.so`).
 C ABI exported from the cdylib (`src/ffi.rs`):
 
 - lifecycle: `kvspaceConnect`, `kvspaceClose`
-- KV read/write (zero-copy borrow model, no free): `kvspaceGet` (borrow), `kvspaceWriteInPlace`, `kvspaceWriteNewPlace`
+- KV read/write: `kvspaceGet` (borrow), synchronous `kvspaceSetValue`, `kvspaceWriteInPlace`, `kvspaceWriteNewPlace`
 - enumerate / delete / copy: `kvspaceListLen`, `kvspaceListAt`, `kvspaceDel`, `kvspaceDelTree`, `kvspaceCp`, `kvspaceCpTree`
 - directories / extindex: `kvspaceMkindex`, `kvspaceMkindexExt`, `kvspaceRmindexExt`
 - watch / clear: `kvspaceWatch`, `kvspaceClear`
@@ -35,17 +35,14 @@ The same ABI is implemented by `kvspace-c` (`shm://`), so a consumer (e.g. the k
 
 ## XValue
 
-kindexpr TLV head, byte-identical to `kvspace-c`:
+The headlenpow wire format is byte-identical across this backend, `kvspace-c`, and the `kvspace` frontend. Its 18-byte prefix is `[headlenpow:u8][flags:u8][a:u64 LE][b:u64 LE]`. The UTF-8 langtype occupies the rest of the `2^headlenpow` head, followed by the body. `flags` uses its low two bits for the storage class and bit 2 for a pointer.
 
-```
-[1B kindexprlen][kindexpr + 0x00 pad][1B ro][4B vid LE][4B raw_len LE][raw]
-```
+- Class 0 stores short fixed values, `None`, maps, structs, and directory markers. `None` has an empty langtype; map members and directory children are enumerated from physical key prefixes.
+- Class 1 stores a byte length and reserved capacity (`a`, `b`) for strings and code slots. UTF-8 records the code point count in its langtype and the byte count in `a`.
+- Class 2 stores tensor element count and width. Its langtype carries the dimensions.
+- Class 3 stores an external locator, with the target's actual langtype. Pointer values use class 1 with the pointer bit set and a target key in the body.
 
-- kindexpr first byte: `*` = soft link (raw = target path), `@` = ext handle, otherwise inline.
-- `[d0,d1]kind` carries ndim+dims; bare `kind` is a scalar; `char/*` is always a 1-D sequence (`[n]`).
-- `None` is encoded as NULL / length 0.
-
-Kinds: `bool`, `int8..int64`, `uint8..uint64`, `float32/64`, `char/utf32|utf8|ascii`, `stringkeymap`, `index`, `extindex`, `rwir`, `rwfunc`, `defrwir`, `scope`, `time`, `duration`.
+`ro` and `vid` live at `/.kvspace-meta/<hex key>` as a separate XValue. Writes and copies preserve the sidecar; its absence means `ro=false, vid=0`.
 
 ## Tutorial
 
@@ -53,4 +50,4 @@ Kinds: `bool`, `int8..int64`, `uint8..uint64`, `float32/64`, `char/utf32|utf8|as
 python3 tutorial/test.py
 ```
 
-Fourteen shell cases (`01-basic.sh` … `14-head-perm.sh`) covering link, extindex, unlink, dir/value coexistence, type variety, edge cases, bulk ops, and head permission. The harness also cross-validates that `kvspace-c` and `kvspace-durable` produce byte-identical head encoding (ro/vid).
+The shell cases cover links, extensions, directory/value coexistence, type variety, and bulk operations. The codec tests compare the wire format across implementations.
