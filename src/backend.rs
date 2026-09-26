@@ -125,6 +125,67 @@ impl<S: KVStore> Backend<S> {
         (path.to_string(), false)
     }
 
+    // ── 子树枚举（沿目录索引递归）────────────────────────────────────
+
+    /// 列出 `base` 子树下的全部物理 key，等价于原来 `store.scan_keys(base)` 的结果集。
+    ///
+    /// **为什么不用 `scan_keys`**：那是让后端做「前缀扫描」，而 KVSpace 要的是
+    /// **词边界**匹配（`k[base.len()..]` 以 `/` 或 `·` 开头）。S3 的 `ListObjects`
+    /// 只能做裸字节前缀，`/proto` 会把 `/protocol` 一并吐出来，还得在客户端再筛一遍。
+    /// 而 KVSpace 本来就在每个目录 key 上维护着子项列表——直接用索引递归，
+    /// 既不必依赖后端有没有前缀扫描能力，也不会多拿无关数据。
+    ///
+    /// **前提：目录索引必须完整。** 任何绕过 `add_child` 的写入都会在这里漏掉。
+    /// 这条由 cp / map_coord 两套语义测试在 redis 与 s3 上共同守着。
+    ///
+    /// 返回顺序与原来不同（原来是后端的字典序），调用方都不依赖顺序。
+    fn collect_subtree(&self, base: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        self.collect_into(base, &mut out);
+        out
+    }
+
+    fn collect_into(&self, key: &str, out: &mut Vec<String>) {
+        if self.store.get(key).is_some() {
+            out.push(key.to_string());
+        }
+        // 一个节点最多带两个索引：成员索引（尾 `·`）与层级索引（尾 `/`）。
+        // 根是特例 —— `split_index` 对根不追加 `/`，所以根的层级索引就是 `/` 自身。
+        let idxes: Vec<String> = if key == PATH_SEP {
+            vec![PATH_SEP.to_string()]
+        } else {
+            vec![
+                format!("{}{}", key, OBJ_SEP),
+                format!("{}{}", key, DIR_INDEX_SUF),
+            ]
+        };
+        for idx in idxes {
+            let names = self.index_names(&idx);
+            if names.is_empty() {
+                continue;
+            }
+            if self.store.get(&idx).is_some() {
+                out.push(idx.clone());
+            }
+            for n in names {
+                self.collect_into(&format!("{}{}", idx, n), out);
+            }
+        }
+    }
+
+    /// 读索引的子项名。**与 `read_dir_index` 的区别：不是索引就返回空，不 panic。**
+    /// 递归时必然会碰到普通叶子值（`/proto` 自己可能就是 int64），不能炸。
+    fn index_names(&self, idx: &str) -> Vec<String> {
+        match self.store.get(idx) {
+            None => Vec::new(),
+            Some(data) => match decode_xvalue(&data) {
+                XValue::Index(c) => normalize_children(c),
+                XValue::ExtIndex(e) => e.childs,
+                _ => Vec::new(),
+            },
+        }
+    }
+
     // ── 目录 index 读写 ─────────────────────────────────────────────
 
     fn read_dir_index(&self, dir: &str) -> Vec<String> {
@@ -696,13 +757,13 @@ impl<S: KVStore> KVSpace for Backend<S> {
         }
 
         let resolved = self.resolve_path(prefix);
-        // scan 用去尾斜杠/点的前缀：scan_keys 匹配 k[prefix.len()..] 以 '/' 或 '·' 开头，
-        // 尾斜杠会使子节点首字符（如 f）落空，导致子树孩子扫不到。
+        // 枚举前缀用去尾斜杠/点的形式：索引里的子项名是相对当前节点的裸名，
+        // 带上尾斜杠会变成 `/proto/` + `/` 那种重复层级。见 `collect_subtree`。
         let mut scan = resolved.clone();
         if Self::is_dir(&scan) && scan != PATH_SEP {
             scan.pop();
         }
-        let keys = self.store.scan_keys(&scan);
+        let keys = self.collect_subtree(&scan);
 
         self.store.del(&[&resolved]);
         for k in &keys {
@@ -745,7 +806,7 @@ impl<S: KVStore> KVSpace for Backend<S> {
         if src_scan == dst_base {
             return Ok(());
         }
-        let keys = self.store.scan_keys(&src_scan);
+        let keys = self.collect_subtree(&src_scan);
         if keys.is_empty() {
             return Err(format!("CpTree: source not found: {}", src));
         }
@@ -792,7 +853,7 @@ impl<S: KVStore> KVSpace for Backend<S> {
         if src_base == dst_base {
             return Ok(());
         }
-        let keys = self.store.scan_keys(&src_base);
+        let keys = self.collect_subtree(&src_base);
         if keys.is_empty() {
             return Err(format!("CpList: source not found: {}", src));
         }

@@ -1,4 +1,9 @@
 // store.rs — 后端存储原语。redis/fs 各自实现，generic backend 只依赖它。
+//
+// 注意这里**没有** `scan_keys` 这类「前缀扫描」原语。子树枚举由 `Backend::collect_subtree`
+// 沿目录索引递归完成 —— 后端只需要 get/set/del 这几个点操作。
+// 这样 S3 后端不必依赖 `ListObjects(Prefix=)`（那是裸字节前缀，与 KVSpace 要的词边界
+// 匹配不是一回事），也不必为「有没有前缀扫描能力」做适配。
 
 /// 单 key 字节级存储原语（无目录索引、无 link 语义，纯 get/set/del/scan/flush）。
 pub trait KVStore {
@@ -34,7 +39,5 @@ pub trait KVStore {
             self.set(key, &v);
         }
     }
-    /// 返回所有以 prefix 开头的 key（含 prefix 自身，若存在）。
-    fn scan_keys(&self, prefix: &str) -> Vec<String>;
     fn flush(&self);
 }

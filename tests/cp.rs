@@ -3,6 +3,8 @@
 
 use kvspace_durable::*;
 
+mod common;
+
 fn set(kv: &mut dyn KVSpace, key: &str, v: &XValue) {
     kv.set(&[KVPair {
         key: key.to_string(),
@@ -103,4 +105,13 @@ fn cp_fs() {
     let _ = std::fs::remove_dir_all(&dir);
     run(&format!("fs://{}", dir.display()));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// S3 后端跑**同一套**语义测试 —— 与 redis、fs 用同一个 run()。
+/// 默认忽略：需要真桶和 $KVSPACE，且 DSN 前缀必须带 `_test`（见 tests/common/mod.rs）。
+#[test]
+#[ignore = "需要真桶凭据，cargo test -- --ignored 才跑"]
+fn cp_s3() {
+    let Some(dsn) = common::s3_test_dsn() else { return };
+    run(&dsn);
 }
