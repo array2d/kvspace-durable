@@ -27,17 +27,16 @@ fn run(dsn: &str) {
     let kv: &mut dyn KVSpace = kv.as_mut();
     kv.clear().unwrap();
 
-    // 显式创建 [2,3]stringkeymap 容器：值在 /m，memindex 在 /m·。
-    set(kv, "/m·", &new_map_index(&[2, 3]));
+    set(kv, "/m", &new_map_langtype("[int64,int64]·float32"));
 
     // 乱序写坐标成员。
     set(kv, "/m·[1,2]", &new_float32(&[6.28]));
     set(kv, "/m·[0,1]", &new_float32(&[3.14]));
     set(kv, "/m·[0,0]", &new_float32(&[1.0]));
 
-    // 容器值 round-trip：kind + dims 保留（值在 /m，成员在 memindex /m·）。
+    // The map type is stored at /m; members are physical /m· keys.
     match get_one(kv, "/m") {
-        XValue::Map(m) => assert_eq!(m.dims, vec![2, 3], "dims round-trip"),
+        XValue::Map(m) => assert_eq!(m.langtype, "[int64,int64]·float32"),
         other => panic!("容器值 kind 丢失: {:?}", other),
     }
 
@@ -61,7 +60,7 @@ fn run(dsn: &str) {
     assert!(is_none(&get_one(kv, "/n")), "被拒后不应留下容器值");
 
     // 命名成员仍为裸名，与坐标段字面可分。
-    set(kv, "/h/", &new_map_index(&[0]));
+    set(kv, "/h", &new_map_langtype("[]char/utf32·int64"));
     set(kv, "/h·x", &new_int64(&[1]));
     set(kv, "/h·[0]", &new_int64(&[2]));
     let names = kv.list("/h·", false, true);
@@ -70,7 +69,9 @@ fn run(dsn: &str) {
 
 #[test]
 fn map_coord_redis() {
-    run("redis://127.0.0.1:6379");
+    let dsn = std::env::var("KVSPACE_TEST_REDIS_DSN")
+        .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+    run(&dsn);
 }
 
 #[test]

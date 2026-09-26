@@ -5,17 +5,12 @@ use std::time::Duration;
 
 use crate::kvspace::{KVPair, KVSpace};
 use crate::kvspace_common::{
-    join_path, mk_index_recursive, sep_path, split_index, strip_dir_suf, validate_ptr, watch_value,
+    is_descendant, is_frame_operand_key, join_path, sep_path, split_index, strip_dir_suf,
+    validate_ptr, watch_value,
 };
 use crate::r#const::*;
 use crate::store::KVStore;
-use crate::xvalue::{
-    decode_xvalue, decode_xvalue_head, encode_head, is_none, is_ptr, ptr_target, XValue,
-};
-use crate::xvalue_index::{
-    encode_ext_index_grow, encode_index_grow, grow_cap, matrix_cap, matrix_width, new_ext_index,
-    new_index,
-};
+use crate::xvalue::{decode_xvalue, decode_xvalue_head, is_ptr, ptr_target, XValue, REF_EXT};
 
 pub struct Backend<S: KVStore> {
     store: S,
@@ -24,6 +19,25 @@ pub struct Backend<S: KVStore> {
 impl<S: KVStore> Backend<S> {
     pub fn new(store: S) -> Self {
         Backend { store }
+    }
+
+    fn sync_metadata(&mut self, key: &str, raw: &[u8]) -> Result<(), String> {
+        let head = decode_xvalue_head(raw);
+        if !raw.is_empty() && head.headlen == 0 {
+            return Err(format!("invalid XValue at {key}"));
+        }
+        self.set_metadata(key, head.ro, head.vid)
+    }
+
+    fn metadata_at(&self, key: &str) -> Result<(bool, u32), String> {
+        let meta =
+            crate::metadata::key_for(key).ok_or_else(|| format!("reserved metadata key: {key}"))?;
+        match self.store.get(&meta) {
+            None => Ok((false, 0)),
+            Some(data) => {
+                crate::metadata::decode(&data).ok_or_else(|| format!("invalid metadata at {key}"))
+            }
+        }
     }
 
     // ── 目录与路径工具 ──────────────────────────────────────────────
@@ -35,30 +49,6 @@ impl<S: KVStore> Backend<S> {
     fn assert_dir(path: &str) {
         if path != PATH_SEP && !Self::is_dir(path) {
             panic!("{}: {}", ERR_DIR_MUST_END_WITH_SLASH, path);
-        }
-    }
-
-    fn parent_name(path: &str) -> (String, String) {
-        let clean = if Self::is_dir(path) && path != PATH_SEP {
-            strip_dir_suf(path)
-        } else {
-            path
-        };
-        let (parent, name, _) = split_index(clean);
-        (parent, name)
-    }
-
-    /// 确保父目录存在：成员目录（尾 ·）建 index，层级目录（尾 /）递归建。
-    fn ensure_parent_dir(&mut self, dir: &str) {
-        if dir == PATH_SEP {
-            return;
-        }
-        if dir.ends_with(OBJ_SEP) {
-            if self.store.get(dir).is_none() {
-                self.store.set(dir, &new_index(&[]).encode());
-            }
-        } else {
-            mk_index_recursive(self, dir);
         }
     }
 
@@ -85,7 +75,11 @@ impl<S: KVStore> Backend<S> {
         let resolved = self.resolve_path(&parent);
         let mut result = join_path(&resolved, &last);
         if dir_suf {
-            result.push_str(DIR_INDEX_SUF);
+            result.push_str(if path.ends_with(OBJ_SEP) {
+                OBJ_SEP
+            } else {
+                DIR_INDEX_SUF
+            });
         }
         result
     }
@@ -125,162 +119,48 @@ impl<S: KVStore> Backend<S> {
         (path.to_string(), false)
     }
 
-    // ── 子树枚举（沿目录索引递归）────────────────────────────────────
-
-    /// 列出 `base` 子树下的全部物理 key，等价于原来 `store.scan_keys(base)` 的结果集。
-    ///
-    /// **为什么不用 `scan_keys`**：那是让后端做「前缀扫描」，而 KVSpace 要的是
-    /// **词边界**匹配（`k[base.len()..]` 以 `/` 或 `·` 开头）。S3 的 `ListObjects`
-    /// 只能做裸字节前缀，`/proto` 会把 `/protocol` 一并吐出来，还得在客户端再筛一遍。
-    /// 而 KVSpace 本来就在每个目录 key 上维护着子项列表——直接用索引递归，
-    /// 既不必依赖后端有没有前缀扫描能力，也不会多拿无关数据。
-    ///
-    /// **前提：目录索引必须完整。** 任何绕过 `add_child` 的写入都会在这里漏掉。
-    /// 这条由 cp / map_coord 两套语义测试在 redis 与 s3 上共同守着。
-    ///
-    /// 返回顺序与原来不同（原来是后端的字典序），调用方都不依赖顺序。
-    fn collect_subtree(&self, base: &str) -> Vec<String> {
-        let mut out = Vec::new();
-        self.collect_into(base, &mut out);
-        out
-    }
-
-    fn collect_into(&self, key: &str, out: &mut Vec<String>) {
-        if self.store.get(key).is_some() {
-            out.push(key.to_string());
-        }
-        // 一个节点最多带两个索引：成员索引（尾 `·`）与层级索引（尾 `/`）。
-        // 根是特例 —— `split_index` 对根不追加 `/`，所以根的层级索引就是 `/` 自身。
-        let idxes: Vec<String> = if key == PATH_SEP {
-            vec![PATH_SEP.to_string()]
-        } else {
-            vec![
-                format!("{}{}", key, OBJ_SEP),
-                format!("{}{}", key, DIR_INDEX_SUF),
-            ]
-        };
-        for idx in idxes {
-            let names = self.index_names(&idx);
-            if names.is_empty() {
-                continue;
-            }
-            if self.store.get(&idx).is_some() {
-                out.push(idx.clone());
-            }
-            for n in names {
-                self.collect_into(&format!("{}{}", idx, n), out);
-            }
-        }
-    }
-
-    /// 读索引的子项名。**与 `read_dir_index` 的区别：不是索引就返回空，不 panic。**
-    /// 递归时必然会碰到普通叶子值（`/proto` 自己可能就是 int64），不能炸。
-    fn index_names(&self, idx: &str) -> Vec<String> {
-        match self.store.get(idx) {
-            None => Vec::new(),
-            Some(data) => match decode_xvalue(&data) {
-                XValue::Index(c) => normalize_children(c),
-                XValue::ExtIndex(e) => e.childs,
-                _ => Vec::new(),
-            },
-        }
-    }
-
     // ── 目录 index 读写 ─────────────────────────────────────────────
 
     fn read_dir_index(&self, dir: &str) -> Vec<String> {
-        match self.store.get(dir) {
-            None => Vec::new(),
-            Some(data) => {
-                let v = decode_xvalue(&data);
-                if is_none(&v) {
-                    return Vec::new();
-                }
-                match v {
-                    XValue::Index(c) => normalize_children(c),
-                    XValue::ExtIndex(e) => e.childs,
-                    other => panic!("read_dir_index: unexpected kind {}", other.kind()),
+        let mut names = std::collections::HashMap::<String, bool>::new();
+        let scan_prefix = dir
+            .strip_suffix('/')
+            .or_else(|| dir.strip_suffix('·'))
+            .unwrap_or(dir);
+        for key in self.store.scan_keys(scan_prefix) {
+            let Some(rest) = key.strip_prefix(dir) else {
+                continue;
+            };
+            if rest.is_empty() {
+                continue;
+            }
+            let end = rest.find(['/', '·']).unwrap_or(rest.len());
+            if end > 0 {
+                let name = &rest[..end];
+                if dir != PATH_SEP || name != META_ROOT_NAME {
+                    let direct_dir =
+                        rest.as_bytes().get(end) == Some(&b'/') && rest.len() == end + 1;
+                    names
+                        .entry(name.to_string())
+                        .and_modify(|v| *v |= direct_dir)
+                        .or_insert(direct_dir);
                 }
             }
         }
-    }
-
-    fn add_child(&self, parent: &str, name: &str) {
-        match self.store.get(parent) {
-            None => {
-                if parent.ends_with(OBJ_SEP) {
-                    let v = new_index_for_member(name);
-                    self.store.set(parent, &v.encode());
-                } else {
-                    let v = new_index(&[name.to_string()]);
-                    self.store.set(parent, &v.encode());
-                }
-            }
-            Some(data) => {
-                let dims = decode_xvalue_head(&data).dims();
-                let old_cap = matrix_cap(&dims);
-                let old_m = matrix_width(&dims);
-                let v = decode_xvalue(&data);
-                match v {
-                    XValue::Index(nodes) => {
-                        let mut nodes = normalize_children(nodes);
-                        if nodes.iter().any(|n| n == name) {
-                            return;
-                        }
-                        nodes.push(name.to_string());
-                        let cap = grow_cap(old_cap, nodes.len());
-                        let (d, b) = encode_index_grow(&nodes, cap, old_m);
-                        self.store.set(parent, &encode_head(KIND_INDEX, 0, &d, &b));
+        let mut result: Vec<String> = names
+            .into_iter()
+            .map(
+                |(name, direct_dir)| {
+                    if direct_dir {
+                        format!("{name}/")
+                    } else {
+                        name
                     }
-                    XValue::ExtIndex(e) => {
-                        if e.childs.iter().any(|c| c == name) {
-                            return;
-                        }
-                        let mut childs = e.childs.clone();
-                        childs.push(name.to_string());
-                        let cap = grow_cap(old_cap, childs.len());
-                        let (d, b) = encode_ext_index_grow(&e.ext_path, &childs, cap, old_m);
-                        self.store
-                            .set(parent, &encode_head(KIND_EXT_INDEX, 0, &d, &b));
-                    }
-                    other => panic!("add_child: unexpected kind {}", other.kind()),
-                }
-            }
-        }
-    }
-
-    fn remove_child(&self, parent: &str, names: &[String]) {
-        let is_removed = |n: &str| {
-            names
-                .iter()
-                .any(|name| n == name || n == format!("{}{}", name, DIR_INDEX_SUF))
-        };
-        match self.store.get(parent) {
-            None => {}
-            Some(data) => {
-                let dims = decode_xvalue_head(&data).dims();
-                let old_cap = matrix_cap(&dims); // 删除不缩 cap
-                let old_m = matrix_width(&dims);
-                let v = decode_xvalue(&data);
-                match v {
-                    XValue::Index(nodes) => {
-                        let nodes = normalize_children(nodes);
-                        let filtered: Vec<String> =
-                            nodes.into_iter().filter(|n| !is_removed(n)).collect();
-                        let (d, b) = encode_index_grow(&filtered, old_cap, old_m);
-                        self.store.set(parent, &encode_head(KIND_INDEX, 0, &d, &b));
-                    }
-                    XValue::ExtIndex(e) => {
-                        let filtered: Vec<String> =
-                            e.childs.into_iter().filter(|n| !is_removed(n)).collect();
-                        let (d, b) = encode_ext_index_grow(&e.ext_path, &filtered, old_cap, old_m);
-                        self.store
-                            .set(parent, &encode_head(KIND_EXT_INDEX, 0, &d, &b));
-                    }
-                    other => panic!("remove_child: unexpected kind {}", other.kind()),
-                }
-            }
-        }
+                },
+            )
+            .collect();
+        result.sort_by(|a, b| crate::coord::cmp_coord(a, b));
+        result
     }
 
     // ── Get 内部 ────────────────────────────────────────────────────
@@ -295,49 +175,27 @@ impl<S: KVStore> Backend<S> {
     fn prefix_ext(&self, prefix: &str) -> String {
         if let Some(data) = self.store.get(prefix) {
             let head = decode_xvalue_head(&data);
-            if head.kind() == KIND_EXT_INDEX {
-                let body = head.body(&data);
-                return crate::xvalue_index::decode_ext_index(body, &head.dims()).ext_path;
+            if head.r#ref == REF_EXT {
+                return String::from_utf8_lossy(head.body(&data)).into_owned();
             }
         }
         String::new()
     }
-
-    /// listlen/listat O(1) 快路径的取值口：仅纯 index memindex 返 (dims=[N,M], body=N×M 矩阵)。
-    /// ext_index（body 头部含 ext_path）与非目录/非 index 返 None，交回退全量 list()。
-    fn index_head_body(&mut self, prefix: &str, resolve: bool) -> Option<(Vec<i32>, Vec<u8>)> {
-        let resolved = if resolve {
-            self.resolve_path(prefix)
-        } else {
-            prefix.to_string()
-        };
-        if !Self::is_dir(&resolved) {
-            return None;
-        }
-        let data = self.store.get(&resolved)?;
-        let head = decode_xvalue_head(&data);
-        if head.kind() == KIND_INDEX {
-            Some((head.dims(), head.body(&data).to_vec()))
-        } else {
-            None
-        }
-    }
-}
-
-/// 成员目录（memindex，`·` 结尾）新建时注册首个成员；成员顺序/kind 由容器值 object/stringkeymap 决定。
-fn new_index_for_member(name: &str) -> XValue {
-    new_index(&[name.to_string()])
-}
-
-fn normalize_children(children: Vec<String>) -> Vec<String> {
-    if children.len() == 1 && children[0].is_empty() {
-        Vec::new()
-    } else {
-        children
-    }
 }
 
 impl<S: KVStore> KVSpace for Backend<S> {
+    fn set_metadata(&mut self, key: &str, ro: bool, vid: u32) -> Result<(), String> {
+        let meta =
+            crate::metadata::key_for(key).ok_or_else(|| format!("reserved metadata key: {key}"))?;
+        if ro || vid != 0 {
+            let value = crate::metadata::encode(ro, vid)
+                .ok_or_else(|| format!("cannot encode metadata at {key}"))?;
+            self.store.set(&meta, &value);
+        } else {
+            self.store.del(&[&meta]);
+        }
+        Ok(())
+    }
     fn get(&mut self, prefix: &str, keys: &[String], resolve: bool) -> Vec<XValue> {
         Self::assert_dir(prefix);
         let prefix = if resolve {
@@ -349,6 +207,10 @@ impl<S: KVStore> KVSpace for Backend<S> {
         let mut full_keys: Vec<(usize, String)> = Vec::new();
         for (i, k) in keys.iter().enumerate() {
             let full = join_path(&prefix, k);
+            if crate::metadata::is_reserved(&full) {
+                results[i] = Some(XValue::None);
+                continue;
+            }
             if Self::is_dir(&full) {
                 results[i] = Some(self.get_dir(&full));
             } else {
@@ -398,12 +260,18 @@ impl<S: KVStore> KVSpace for Backend<S> {
     }
 
     fn get_raw(&mut self, key: &str) -> Vec<u8> {
+        if crate::metadata::is_reserved(key) {
+            return Vec::new();
+        }
         let (mut p, l) = sep_path(key);
         if p != PATH_SEP {
             p.push_str(DIR_INDEX_SUF);
         }
         let p = self.resolve_path(&p);
         let full = join_path(&p, &l);
+        if crate::metadata::is_reserved(&full) {
+            return Vec::new();
+        }
         if let Some(data) = self.store.get(&full) {
             return data;
         }
@@ -417,13 +285,24 @@ impl<S: KVStore> KVSpace for Backend<S> {
         Vec::new()
     }
 
+    fn get_metadata(&mut self, key: &str) -> Result<(bool, u32), String> {
+        let resolved = self.resolve_path(key);
+        self.metadata_at(&resolved)
+    }
+
     fn get_part(&mut self, key: &str, off: u32, len: u32) -> Vec<u8> {
+        if crate::metadata::is_reserved(key) {
+            return Vec::new();
+        }
         let (mut p, l) = sep_path(key);
         if p != PATH_SEP {
             p.push_str(DIR_INDEX_SUF);
         }
         let p = self.resolve_path(&p);
         let full = join_path(&p, &l);
+        if crate::metadata::is_reserved(&full) {
+            return Vec::new();
+        }
         if self.store.exists(&full) {
             return self.store.get_part(&full, off, len).unwrap_or_default();
         }
@@ -438,12 +317,18 @@ impl<S: KVStore> KVSpace for Backend<S> {
     }
 
     fn set_part(&mut self, key: &str, off: u32, buf: &[u8]) -> Result<(), String> {
+        if crate::metadata::is_reserved(key) {
+            return Err(format!("reserved metadata key: {key}"));
+        }
         let (mut p, l) = sep_path(key);
         if p != PATH_SEP {
             p.push_str(DIR_INDEX_SUF);
         }
         let p = self.resolve_path(&p);
         let full = join_path(&p, &l);
+        if crate::metadata::is_reserved(&full) {
+            return Err(format!("reserved metadata key: {full}"));
+        }
         if self.store.exists(&full) {
             self.store.set_part(&full, off, buf);
             return Ok(());
@@ -460,183 +345,52 @@ impl<S: KVStore> KVSpace for Backend<S> {
     }
 
     fn set(&mut self, pairs: &[KVPair]) -> Result<(), String> {
-        let mut children: Vec<(String, String)> = Vec::new();
-
-        for p in pairs {
-            // 只解析父路径，整键不穿透：写 Ptr 变量/帧槽时写的是指针本体（槽本身），
-            // 解引用由 runtime 显式 `*` 掌控（对齐 kvspace-c WriteNewPlace/Del）。
-            let resolved = self.resolve_parent(&p.key);
-            if resolved.contains("//") {
-                return Err(format!("Set: double-slash in key {:?}", resolved));
+        for pair in pairs {
+            if crate::metadata::is_reserved(&pair.key) {
+                return Err(format!("reserved metadata key: {}", pair.key));
             }
-            match &p.val {
-                XValue::Index(_) | XValue::ExtIndex(_) => {
-                    if !Self::is_dir(&resolved) {
-                        return Err(format!(
-                            "Set: directory-kind value at non-directory key {:?}",
-                            resolved
-                        ));
-                    }
-                }
-                _ => {}
+            let key = self.resolve_parent(&pair.key);
+            if key.contains("//") || crate::metadata::is_reserved(&key) {
+                return Err(format!("invalid key: {key}"));
             }
-            if let XValue::Ptr(ptr) = &p.val {
+            let raw = pair.raw.clone().unwrap_or_else(|| pair.val.encode());
+            let head = crate::headlenpow::decode(&raw)
+                .ok_or_else(|| format!("invalid XValue at {key}"))?;
+            if head.total != raw.len() {
+                return Err(format!("invalid XValue at {key}"));
+            }
+            if let XValue::Ptr(ptr) = decode_xvalue(&raw) {
                 validate_ptr(self, &ptr.target, &ptr.target_kindexpr)?;
             }
-
-            // 容器值（object/stringkeymap）：值存 p（无后缀），memindex 存 p·（空 index，成员后续写入维护）。
-            if let XValue::Map(_) = &p.val {
-                let base = if resolved == PATH_SEP {
-                    resolved.clone()
-                } else {
-                    strip_dir_suf(&resolved).to_string()
-                };
-                let bytes = p.raw.clone().unwrap_or_else(|| p.val.encode());
-                let mem = format!("{}{}", base, OBJ_SEP);
-                self.store.set(&base, &bytes);
-                self.store.set(&mem, &new_index(&[]).encode());
-                let (parent, name) = Self::parent_name(&base);
-                // 成员目录与成员名都要注册进各自 index：redis 后端的目录成员是显式 index
-                // XValue，不像 fs 靠真实目录自动可见，故这趟链必须走完（只去掉「自动建容器」）。
-                let mut dir = parent.clone();
-                let mut child = name.clone();
-                loop {
-                    self.ensure_parent_dir(&dir);
-                    children.push((dir.clone(), child.clone()));
-                    let (dp, dn) = Self::parent_name(&dir);
-                    if dp.ends_with(OBJ_SEP) {
-                        dir = dp;
-                        child = dn;
-                        continue;
-                    }
-                    children.push((dp, dn));
-                    break;
-                }
-                continue;
-            }
-
-            if Self::is_dir(&resolved) {
-                let (parent, name) = Self::parent_name(&resolved);
-                self.ensure_parent_dir(&parent);
-                let bytes = p.raw.clone().unwrap_or_else(|| p.val.encode());
-                self.store.set(&resolved, &bytes);
-                // 成员目录（尾 ·）注册裸 name（memindex 与容器值同名）；层级目录（尾 /）注册 name/。
-                let child = if resolved.ends_with(OBJ_SEP) {
-                    name
-                } else {
-                    format!("{}{}", name, DIR_INDEX_SUF)
-                };
-                children.push((parent, child));
-                continue;
-            }
-
-            let (parent, name, _) = split_index(&resolved);
+            let (parent, _, _) = split_index(&key);
             if parent.ends_with(OBJ_SEP) {
-                // 写成员前 memhead 必须已存在：容器值不在即**拒绝**，绝不兜底自动建。
-                // 「memhead 不存在则禁止写 memitem」是 kvspace 层的拦截（与 runtime 的
-                // kvlangBuiltinCheckMemhead 同一规则的两侧），自动建会把拼错的名字悄悄变成一个
-                // 新容器，且两个后端行为分叉（fs 无此兜底）。
-                // 同 fs：`/lib` 下的 `·` 是包·函数命名分隔符，不是 memindex 标记，豁免。
-                let base = strip_dir_suf(&parent).to_string();
-                if !base.starts_with("/lib") && self.store.get(&base).is_none() {
+                let base = strip_dir_suf(&parent);
+                if !base.starts_with("/lib") && self.store.get(base).is_none() {
                     return Err(format!(
                         "{}: memhead {} does not exist — declare the container first",
                         ERR_MEMHEAD_MISSING, base
                     ));
                 }
-                // 成员目录与成员名都要注册进各自 index：redis 后端的目录成员是显式 index
-                // XValue，不像 fs 靠真实目录自动可见，故这趟链必须走完（只去掉「自动建容器」）。
-                let mut dir = parent.clone();
-                let mut child = name.clone();
-                loop {
-                    self.ensure_parent_dir(&dir);
-                    children.push((dir.clone(), child.clone()));
-                    let (dp, dn) = Self::parent_name(&dir);
-                    if dp.ends_with(OBJ_SEP) {
-                        dir = dp;
-                        child = dn;
-                        continue;
-                    }
-                    children.push((dp, dn));
-                    break;
-                }
-            } else {
-                mk_index_recursive(self, &parent);
             }
-
-            // extindex 写保护：只读扩展层上的同名节点禁止写入。
-            if let Some(data) = self.store.get(&parent) {
-                let head = decode_xvalue_head(&data);
-                if head.kind() == KIND_EXT_INDEX {
-                    let body = head.body(&data);
-                    let ext_t = crate::xvalue_index::decode_ext_index(body, &head.dims()).ext_path;
-                    let local_nodes = self.read_dir_index(&parent);
-                    let local_exists = local_nodes.iter().any(|n| n == &name);
-                    if !local_exists {
-                        let ext_nodes = self.read_dir_index(&ext_t);
-                        if ext_nodes.iter().any(|n| n == &name) {
-                            return Err(format!("{}: {}", ERR_EXT_WRITE, resolved));
-                        }
-                    }
+            let ext_target = self.prefix_ext(&parent);
+            if !ext_target.is_empty() && self.store.get(&key).is_none() {
+                let suffix = key.strip_prefix(&parent).unwrap_or("");
+                if self.store.get(&format!("{ext_target}{suffix}")).is_some()
+                    && !(head.flags & 4 != 0 && is_frame_operand_key(&key))
+                {
+                    return Err(format!("{}: {}", ERR_EXT_WRITE, key));
                 }
             }
-
-            let bytes = p.raw.clone().unwrap_or_else(|| p.val.encode());
-            self.store.set(&resolved, &bytes);
-            children.push((parent, name));
+            self.sync_metadata(&key, &raw)?;
+            self.store.set(&key, &raw);
         }
-
-        // 按 parent 分组，去重合并 children 进父目录 index。
-        let mut parent_children: std::collections::HashMap<String, Vec<String>> =
-            std::collections::HashMap::new();
-        for (parent, name) in children {
-            parent_children.entry(parent).or_default().push(name);
-        }
-        for (parent, names) in parent_children {
-            let mut nodes: Vec<String> = Vec::new();
-            let mut ext_path = String::new();
-            let mut is_ext = false;
-            let mut old_cap = 0usize;
-            let mut old_m = 0usize;
-
-            if let Some(data) = self.store.get(&parent) {
-                let dims = decode_xvalue_head(&data).dims();
-                old_cap = matrix_cap(&dims);
-                old_m = matrix_width(&dims);
-                let v = decode_xvalue(&data);
-                match v {
-                    XValue::Index(c) => nodes = normalize_children(c),
-                    XValue::ExtIndex(e) => {
-                        nodes = e.childs;
-                        ext_path = e.ext_path;
-                        is_ext = true;
-                    }
-                    other => panic!("Set parentChildren: unexpected kind {}", other.kind()),
-                }
-            }
-
-            let mut seen: std::collections::HashSet<String> = nodes.iter().cloned().collect();
-            for n in &names {
-                if seen.insert(n.clone()) {
-                    nodes.push(n.clone());
-                }
-            }
-
-            let cap = grow_cap(old_cap, nodes.len());
-            if is_ext {
-                let (d, b) = encode_ext_index_grow(&ext_path, &nodes, cap, old_m);
-                self.store
-                    .set(&parent, &encode_head(KIND_EXT_INDEX, 0, &d, &b));
-            } else {
-                let (d, b) = encode_index_grow(&nodes, cap, old_m);
-                self.store.set(&parent, &encode_head(KIND_INDEX, 0, &d, &b));
-            }
-        }
-
         Ok(())
     }
 
     fn list(&mut self, prefix: &str, expand_ext: bool, resolve: bool) -> Vec<String> {
+        if crate::metadata::is_reserved(prefix) {
+            return Vec::new();
+        }
         Self::assert_dir(prefix);
         let resolved = if resolve {
             self.resolve_path(prefix)
@@ -646,8 +400,10 @@ impl<S: KVStore> KVSpace for Backend<S> {
         if !Self::is_dir(&resolved) {
             return Vec::new();
         }
+        if crate::metadata::is_reserved(&resolved) {
+            return Vec::new();
+        }
 
-        // map 成员在 add_child 时已按坐标 row-major 有序存储，list/listat 一律信任存储序，无读时排序。
         let members = self.read_dir_index(&resolved);
 
         let mut ext_members: Vec<String> = Vec::new();
@@ -670,20 +426,14 @@ impl<S: KVStore> KVSpace for Backend<S> {
             }
             result.push(m);
         }
+        result.sort_by(|a, b| crate::coord::cmp_coord(a, b));
         result
     }
 
-    /// O(1) 覆写：无 ext 展开的 index memindex 直接读 head dims[0]=N；ext/其余回退全量。
     fn list_len(&mut self, prefix: &str, expand_ext: bool, resolve: bool) -> i32 {
-        if !expand_ext {
-            if let Some((dims, _)) = self.index_head_body(prefix, resolve) {
-                return crate::xvalue_index::matrix_count(&dims) as i32;
-            }
-        }
         self.list(prefix, expand_ext, resolve).len() as i32
     }
 
-    /// O(1) 覆写：无 ext 展开的 index memindex 取矩阵第 idx 行；ext/其余回退全量。
     fn list_at(
         &mut self,
         prefix: &str,
@@ -694,18 +444,6 @@ impl<S: KVStore> KVSpace for Backend<S> {
         if idx < 0 {
             return None;
         }
-        if !expand_ext {
-            if let Some((dims, body)) = self.index_head_body(prefix, resolve) {
-                if idx as usize >= crate::xvalue_index::matrix_count(&dims) {
-                    return None;
-                }
-                return crate::xvalue_index::matrix_at(
-                    &body,
-                    crate::xvalue_index::matrix_width(&dims),
-                    idx as usize,
-                );
-            }
-        }
         self.list(prefix, expand_ext, resolve)
             .into_iter()
             .nth(idx as usize)
@@ -713,38 +451,39 @@ impl<S: KVStore> KVSpace for Backend<S> {
 
     fn del(&mut self, keys: &[String]) -> Result<(), String> {
         for key in keys {
+            if crate::metadata::is_reserved(key) {
+                return Err(format!("reserved metadata key: {key}"));
+            }
             let resolved = self.resolve_parent(key);
-            let (parent, name) = Self::parent_name(&resolved);
-
-            // extindex 删除保护：只读扩展层上的同名节点禁止删除。
-            if let Some(data) = self.store.get(&parent) {
-                let head = decode_xvalue_head(&data);
-                if head.kind() == KIND_EXT_INDEX {
-                    let body = head.body(&data);
-                    let ext_t = crate::xvalue_index::decode_ext_index(body, &head.dims()).ext_path;
-                    let local_nodes = self.read_dir_index(&parent);
-                    let local_exists = local_nodes.iter().any(|n| n == &name);
-                    if !local_exists {
-                        let ext_nodes = self.read_dir_index(&ext_t);
-                        if ext_nodes.iter().any(|n| n == &name) {
-                            return Err(format!("{}: {}", ERR_EXT_DEL, resolved));
-                        }
-                    }
+            if crate::metadata::is_reserved(&resolved) {
+                return Err(format!("reserved metadata key: {resolved}"));
+            }
+            let (parent, _, _) = split_index(&resolved);
+            let ext_target = self.prefix_ext(&parent);
+            if !ext_target.is_empty() && self.store.get(&resolved).is_none() {
+                let suffix = resolved.strip_prefix(&parent).unwrap_or("");
+                if self.store.get(&format!("{ext_target}{suffix}")).is_some() {
+                    return Err(format!("{}: {}", ERR_EXT_DEL, resolved));
                 }
             }
 
             if Self::is_dir(&resolved) {
                 let link_key = strip_dir_suf(&resolved);
                 self.store.del(&[link_key, &resolved]);
+                self.sync_metadata(link_key, &[])?;
+                self.sync_metadata(&resolved, &[])?;
             } else {
                 self.store.del(&[&resolved]);
+                self.sync_metadata(&resolved, &[])?;
             }
-            self.remove_child(&parent, &[name]);
         }
         Ok(())
     }
 
     fn del_tree(&mut self, prefix: &str) -> Result<(), String> {
+        if crate::metadata::is_reserved(prefix) {
+            return Err(format!("reserved metadata key: {prefix}"));
+        }
         let mut link_key = prefix;
         if Self::is_dir(link_key) && link_key != PATH_SEP {
             link_key = strip_dir_suf(prefix);
@@ -757,44 +496,60 @@ impl<S: KVStore> KVSpace for Backend<S> {
         }
 
         let resolved = self.resolve_path(prefix);
-        // 枚举前缀用去尾斜杠/点的形式：索引里的子项名是相对当前节点的裸名，
-        // 带上尾斜杠会变成 `/proto/` + `/` 那种重复层级。见 `collect_subtree`。
+        if crate::metadata::is_reserved(&resolved) {
+            return Err(format!("reserved metadata key: {resolved}"));
+        }
         let mut scan = resolved.clone();
         if Self::is_dir(&scan) && scan != PATH_SEP {
             scan.pop();
         }
-        let keys = self.collect_subtree(&scan);
+        let keys: Vec<_> = self
+            .store
+            .scan_keys(&scan)
+            .into_iter()
+            .filter(|key| !crate::metadata::is_reserved(key))
+            .collect();
 
         self.store.del(&[&resolved]);
+        self.sync_metadata(&resolved, &[])?;
         for k in &keys {
             self.store.del(&[k]);
+            self.sync_metadata(k, &[])?;
         }
 
-        let (parent, name) = Self::parent_name(&resolved);
-        let names = vec![name.clone(), format!("{}{}", name, OBJ_SEP)];
-        self.remove_child(&parent, &names);
         Ok(())
     }
 
     /// 单 key 拷贝：src 处 XValue（head+body 原样）写到 dst，并注册进 dst 父 index；不触碰 src·/成员。
     fn cp(&mut self, src: &str, dst: &str) -> Result<(), String> {
+        if crate::metadata::is_reserved(src) || crate::metadata::is_reserved(dst) {
+            return Err("reserved metadata key".into());
+        }
         let raw = self.get_raw(src);
         if raw.is_empty() {
             return Err(format!("Cp: source not found: {}", src));
         }
+        let (ro, vid) = self.metadata_at(src)?;
         let v = decode_xvalue(&raw);
         self.set(&[KVPair {
             key: dst.to_string(),
             val: v,
             raw: Some(raw),
-        }])
+        }])?;
+        self.set_metadata(dst, ro, vid)
     }
 
     /// 递归子树拷贝：以 src 为根，把整棵物理子树（base + 所有 ·/ 后代 key）字节级重映射到 dst。
     /// extindex 成员的 marker（含 ext_path）原样复制 → 在 dst 侧生成指向同一只读扩展的新 extindex。
     fn cp_tree(&mut self, src: &str, dst: &str) -> Result<(), String> {
+        if crate::metadata::is_reserved(src) || crate::metadata::is_reserved(dst) {
+            return Err("reserved metadata key".into());
+        }
         let src_res = self.resolve_path(src);
         let dst_res = self.resolve_path(dst);
+        if crate::metadata::is_reserved(&src_res) || crate::metadata::is_reserved(&dst_res) {
+            return Err("reserved metadata key".into());
+        }
         let mut src_scan = src_res.clone();
         if Self::is_dir(&src_scan) && src_scan != PATH_SEP {
             src_scan.pop();
@@ -806,80 +561,79 @@ impl<S: KVStore> KVSpace for Backend<S> {
         if src_scan == dst_base {
             return Ok(());
         }
-        let keys = self.collect_subtree(&src_scan);
+        if is_descendant(&src_scan, &dst_base) {
+            return Err("CpTree: destination is inside source".into());
+        }
+        let keys: Vec<_> = self
+            .store
+            .scan_keys(&src_scan)
+            .into_iter()
+            .filter(|key| !crate::metadata::is_reserved(key))
+            .collect();
         if keys.is_empty() {
             return Err(format!("CpTree: source not found: {}", src));
         }
-        // 覆盖语义确定：先清 dst 既有子树（也从父 index 摘除，随后重新登记）。
+        // Replace the destination subtree.
         let _ = self.del_tree(&dst_base);
         for k in &keys {
             let suffix = &k[src_scan.len()..];
             let new_key = format!("{}{}", dst_base, suffix);
             if let Some(data) = self.store.get(k) {
+                let (ro, vid) = self.metadata_at(k)?;
                 self.store.set(&new_key, &data);
+                self.set_metadata(&new_key, ro, vid)?;
             }
-        }
-        // 按 dst 根物理形态登记进父 index（base 值 / 层级目录 / 成员目录）。
-        let (parent, name) = Self::parent_name(&dst_base);
-        self.ensure_parent_dir(&parent);
-        if self.store.get(&dst_base).is_some() {
-            self.add_child(&parent, &name);
-        } else if self
-            .store
-            .get(&format!("{}{}", dst_base, DIR_INDEX_SUF))
-            .is_some()
-        {
-            self.add_child(&parent, &format!("{}{}", name, DIR_INDEX_SUF));
-        } else if self
-            .store
-            .get(&format!("{}{}", dst_base, OBJ_SEP))
-            .is_some()
-        {
-            self.add_child(&parent, &format!("{}{}", name, OBJ_SEP));
         }
         Ok(())
     }
 
     /// 浅拷贝：base 值 + 一层 · 成员（不递归成员子树、不遍历 / 子节点）。用于单 struct/扁平容器。
     fn cp_list(&mut self, src: &str, dst: &str) -> Result<(), String> {
+        if crate::metadata::is_reserved(src) || crate::metadata::is_reserved(dst) {
+            return Err("reserved metadata key".into());
+        }
         let mut src_base = self.resolve_path(src);
         if Self::is_dir(&src_base) && src_base != PATH_SEP {
             src_base.pop();
         }
         let mut dst_base = self.resolve_path(dst);
+        if crate::metadata::is_reserved(&src_base) || crate::metadata::is_reserved(&dst_base) {
+            return Err("reserved metadata key".into());
+        }
         if Self::is_dir(&dst_base) && dst_base != PATH_SEP {
             dst_base.pop();
         }
         if src_base == dst_base {
             return Ok(());
         }
-        let keys = self.collect_subtree(&src_base);
+        let keys: Vec<_> = self
+            .store
+            .scan_keys(&src_base)
+            .into_iter()
+            .filter(|key| !crate::metadata::is_reserved(key))
+            .collect();
         if keys.is_empty() {
             return Err(format!("CpList: source not found: {}", src));
         }
-        let dst_mem = format!("{}{}", dst_base, OBJ_SEP);
         let _ = self.del_tree(&dst_base);
         for k in &keys {
             let suffix = &k[src_base.len()..];
-            // 一层：base 自身、memindex 标记、无更深分隔的直接 · 成员；跳过 / 子节点与更深后代。
+            // Copy the base and direct members, including ext directories.
             let one_level = suffix.is_empty()
                 || (suffix.starts_with(OBJ_SEP) && {
                     let rest = &suffix[OBJ_SEP.len()..];
-                    !rest.contains(OBJ_SEP) && !rest.contains(PATH_SEP)
+                    let member = rest.strip_suffix(PATH_SEP).unwrap_or(rest);
+                    !member.is_empty() && !member.contains(OBJ_SEP) && !member.contains(PATH_SEP)
                 });
             if !one_level {
                 continue;
             }
             if let Some(data) = self.store.get(k) {
-                self.store.set(&format!("{}{}", dst_base, suffix), &data);
+                let new_key = format!("{}{}", dst_base, suffix);
+                let (ro, vid) = self.metadata_at(k)?;
+                self.store.set(&new_key, &data);
+                self.set_metadata(&new_key, ro, vid)?;
             }
-        }
-        let (parent, name) = Self::parent_name(&dst_base);
-        self.ensure_parent_dir(&parent);
-        if self.store.get(&dst_base).is_some() {
-            self.add_child(&parent, &name);
-        } else if self.store.get(&dst_mem).is_some() {
-            self.add_child(&parent, &format!("{}{}", name, OBJ_SEP));
         }
         Ok(())
     }
@@ -892,33 +646,12 @@ impl<S: KVStore> KVSpace for Backend<S> {
         if !Self::is_dir(path) {
             return Err(format!("{}: Mkindex {}", ERR_DIR_MUST_END_WITH_SLASH, path));
         }
+        let _ = capacity;
         let resolved = self.resolve_path(path);
-
-        let trimmed = resolved.trim_matches('/');
-        let parts: Vec<&str> = if trimmed.is_empty() {
-            Vec::new()
-        } else {
-            trimmed.split('/').collect()
-        };
-        let mut cur = PATH_SEP.to_string();
-        for p in parts {
-            cur = format!("{}{}", join_path(&cur, p), DIR_INDEX_SUF);
-            if self.read_dir_index(&cur).is_empty() {
-                let (parent, name) = Self::parent_name(&cur);
-                self.add_child(&parent, &format!("{}{}", name, DIR_INDEX_SUF));
-            }
-        }
-        // 叶目录预留容量：存 [0,cap,0]，首成员插入时 grow_cap(cap,1)=cap 物化 cap×M，不重分配。
-        if capacity > 0 && cur != PATH_SEP {
-            let nodes = self.read_dir_index(&cur);
-            let old_m = self
-                .store
-                .get(&cur)
-                .map(|d| matrix_width(&decode_xvalue_head(&d).dims()))
-                .unwrap_or(0);
-            let cap = grow_cap(capacity as usize, nodes.len());
-            let (d, b) = encode_index_grow(&nodes, cap, old_m);
-            self.store.set(&cur, &encode_head(KIND_INDEX, 0, &d, &b));
+        let value = crate::headlenpow::encode(5, 0, 0, 0, "lib", &[], 0)
+            .ok_or_else(|| format!("Mkindex: invalid directory {resolved}"))?;
+        if self.store.get(&resolved).is_none() {
+            self.store.set(&resolved, &value);
         }
         Ok(())
     }
@@ -930,20 +663,31 @@ impl<S: KVStore> KVSpace for Backend<S> {
                 ERR_DIR_MUST_END_WITH_SLASH, path, ext_path
             ));
         }
-        if let Some(data) = self.store.get(ext_path) {
-            let head = decode_xvalue_head(&data);
-            if head.kind() == KIND_EXT_INDEX {
-                return Err(format!("{}: {}", ERR_EXT_CASCADE, ext_path));
-            }
+        if !self.prefix_ext(ext_path).is_empty() {
+            return Err(format!("{}: {}", ERR_EXT_CASCADE, ext_path));
         }
 
         let resolved = self.resolve_parent(path);
-        let (parent, name) = Self::parent_name(&resolved);
-        self.ensure_parent_dir(&parent);
-
-        let v = new_ext_index(&[], ext_path);
-        self.store.set(&resolved, &v.encode());
-        self.add_child(&parent, &format!("{}{}", name, DIR_INDEX_SUF));
+        let source = self
+            .store
+            .get(ext_path)
+            .ok_or_else(|| format!("ExtIndex target missing: {ext_path}"))?;
+        let langtype = decode_xvalue_head(&source).langtype;
+        let pow = (5..=31)
+            .find(|&p| 18 + langtype.len() <= 1usize << p)
+            .ok_or_else(|| format!("ExtIndex type too long: {langtype}"))?;
+        let len = ext_path.len() as u64;
+        let value = crate::headlenpow::encode(
+            pow,
+            3,
+            len,
+            len,
+            &langtype,
+            ext_path.as_bytes(),
+            ext_path.len(),
+        )
+        .ok_or_else(|| format!("ExtIndex locator invalid: {ext_path}"))?;
+        self.store.set(&resolved, &value);
         Ok(())
     }
 
@@ -958,15 +702,13 @@ impl<S: KVStore> KVSpace for Backend<S> {
             let head = decode_xvalue_head(&data);
             if head.is_ptr() {
                 self.store.del(&[link_key]);
-                let (parent, name) = Self::parent_name(&resolved);
-                self.remove_child(&parent, &[name]);
+                self.set_metadata(link_key, false, 0)?;
                 return Ok(());
             }
         }
 
         self.store.del(&[&resolved]);
-        let (parent, name) = Self::parent_name(&resolved);
-        self.remove_child(&parent, &[name]);
+        self.set_metadata(&resolved, false, 0)?;
         Ok(())
     }
 

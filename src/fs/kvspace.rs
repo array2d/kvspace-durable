@@ -1,6 +1,6 @@
 // fs/kvspace.rs — 结构感知的文件系统 KVSpace。
 // 编码：kvspace 的 '·'（成员分隔）一律替换为 '·/'（父目录名带尾中点 + "/" 分隔成员），反向 '·/' → '·'。
-// "/" 与 "·" 的 index 都从 readdir 派生；ExtIndex 用目录内 __extindex__ 文件存 ext_target_path（第一行）。
+// Directory members come from physical keys.
 
 use std::fs;
 use std::os::unix::fs::FileExt;
@@ -10,17 +10,13 @@ use std::time::Duration;
 use crate::coord::cmp_coord;
 use crate::kvspace::{KVPair, KVSpace};
 use crate::kvspace_common::{
-    join_path, sep_path, split_index, strip_dir_suf, validate_ptr, watch_value,
+    is_descendant, is_frame_operand_key, join_path, sep_path, split_index, strip_dir_suf,
+    validate_ptr, watch_value,
 };
 use crate::r#const::*;
 use crate::xvalue::*;
-use crate::xvalue_index::{new_ext_index, new_index};
-
-const EXTINDEX_MARKER: &str = "__extindex__";
 const SELF_MARKER: &str = "__self__";
-const ORDER_MARKER: &str = "__order__";
-/// stringkeymap 成员目录标记，内容为 dims（逗号分隔）。readdir 派生不出 kind 与 dims，故显式落盘。
-const MAP_MARKER: &str = "__map__";
+const DIR_MARKER: &str = "__dir__";
 
 pub struct FsKVSpace {
     root: PathBuf,
@@ -58,11 +54,52 @@ impl FsKVSpace {
             }
             prev = c;
         }
-        self.root.join(rel.trim_start_matches('/'))
+        let path = rel
+            .trim_start_matches('/')
+            .split('/')
+            .map(|part| {
+                if part == SELF_MARKER || part == DIR_MARKER || part.starts_with('~') {
+                    let mut escaped = String::from("~");
+                    for byte in part.bytes() {
+                        escaped.push_str(&format!("{byte:02x}"));
+                    }
+                    escaped
+                } else {
+                    part.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("/");
+        self.root.join(path)
+    }
+
+    fn unescape_name(name: &str) -> String {
+        let Some(hex) = name.strip_prefix('~') else {
+            return name.to_string();
+        };
+        if hex.len() % 2 != 0 {
+            return name.to_string();
+        }
+        let bytes = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16))
+            .collect::<Result<Vec<_>, _>>();
+        bytes
+            .ok()
+            .and_then(|v| String::from_utf8(v).ok())
+            .unwrap_or_else(|| name.to_string())
     }
 
     fn is_dir_key(key: &str) -> bool {
         key.ends_with(DIR_INDEX_SUF) || key.ends_with(OBJ_SEP)
+    }
+
+    fn leaf_marker(key: &str) -> &'static str {
+        if key != PATH_SEP && key.ends_with(DIR_INDEX_SUF) {
+            DIR_MARKER
+        } else {
+            SELF_MARKER
+        }
     }
 
     fn read_leaf(&self, key: &str) -> Option<Vec<u8>> {
@@ -70,20 +107,22 @@ impl FsKVSpace {
             return None;
         }
         let p = self.fs_path(key);
-        // 目录带值：值落在目录内的保留文件 __self__，readdir 派生的 index 之外。
         if p.is_dir() {
-            fs::read(p.join(SELF_MARKER)).ok()
+            fs::read(p.join(Self::leaf_marker(key))).ok()
         } else {
             fs::read(p).ok()
         }
     }
-    /// 叶值实际所在文件（目录带值时为 __self__），供定位读写 pread/pwrite。存在才返回。
     fn leaf_file(&self, key: &str) -> Option<PathBuf> {
         if key.contains("//") {
             return None;
         }
         let p = self.fs_path(key);
-        let f = if p.is_dir() { p.join(SELF_MARKER) } else { p };
+        let f = if p.is_dir() {
+            p.join(Self::leaf_marker(key))
+        } else {
+            p
+        };
         if f.is_file() {
             Some(f)
         } else {
@@ -92,12 +131,19 @@ impl FsKVSpace {
     }
     /// 解析逻辑 key 到叶文件（先 meta，再 ext 扩展存储）。
     fn physical_file(&mut self, key: &str) -> Option<PathBuf> {
+        if crate::metadata::is_reserved(key) {
+            return None;
+        }
         let (mut p, l) = sep_path(key);
         if p != PATH_SEP {
             p.push_str(DIR_INDEX_SUF);
         }
         let p = self.resolve_path(&p);
-        if let Some(f) = self.leaf_file(&join_path(&p, &l)) {
+        let full = join_path(&p, &l);
+        if crate::metadata::is_reserved(&full) {
+            return None;
+        }
+        if let Some(f) = self.leaf_file(&full) {
             return Some(f);
         }
         let ext_t = self.prefix_ext(&p);
@@ -110,9 +156,12 @@ impl FsKVSpace {
     }
 
     fn write_leaf(&self, key: &str, val: &[u8]) {
+        if key != PATH_SEP && key.ends_with(DIR_INDEX_SUF) {
+            self.ensure_dir(key);
+        }
         let p = self.fs_path(key);
         if p.is_dir() {
-            fs::write(p.join(SELF_MARKER), val)
+            fs::write(p.join(Self::leaf_marker(key)), val)
                 .unwrap_or_else(|e| panic!("kvspace-fs: set {}: {}", key, e));
         } else {
             if let Some(parent) = p.parent() {
@@ -125,10 +174,90 @@ impl FsKVSpace {
     fn remove_leaf(&self, key: &str) {
         let p = self.fs_path(key);
         if p.is_dir() {
-            let _ = fs::remove_file(p.join(SELF_MARKER));
+            let _ = fs::remove_file(p.join(Self::leaf_marker(key)));
         } else {
             let _ = fs::remove_file(p);
         }
+    }
+
+    fn sync_metadata(&mut self, key: &str, raw: &[u8]) -> Result<(), String> {
+        let head = decode_xvalue_head(raw);
+        if !raw.is_empty() && head.headlen == 0 {
+            return Err(format!("invalid XValue at {key}"));
+        }
+        self.set_metadata(key, head.ro, head.vid)
+    }
+
+    fn metadata_at(&self, key: &str) -> Result<(bool, u32), String> {
+        let meta =
+            crate::metadata::key_for(key).ok_or_else(|| format!("reserved metadata key: {key}"))?;
+        match self.read_leaf(&meta) {
+            None => Ok((false, 0)),
+            Some(data) => {
+                crate::metadata::decode(&data).ok_or_else(|| format!("invalid metadata at {key}"))
+            }
+        }
+    }
+
+    fn metadata_entries(&self) -> Vec<(String, PathBuf)> {
+        let mut entries = Vec::new();
+        if let Ok(dir) = fs::read_dir(self.fs_path("/.kvspace-meta/")) {
+            for item in dir.flatten() {
+                let name = item.file_name().to_string_lossy().into_owned();
+                if let Some(key) = crate::metadata::original_key(&name) {
+                    entries.push((key, item.path()));
+                }
+            }
+        }
+        entries
+    }
+
+    fn in_tree(key: &str, base: &str) -> bool {
+        base == PATH_SEP
+            || key == base
+            || key
+                .strip_prefix(base)
+                .is_some_and(|rest| rest.starts_with(PATH_SEP) || rest.starts_with(OBJ_SEP))
+    }
+
+    fn remove_metadata_tree(&self, base: &str) -> Result<(), String> {
+        for (key, path) in self.metadata_entries() {
+            if Self::in_tree(&key, base) {
+                fs::remove_file(path).map_err(|e| format!("remove metadata for {key}: {e}"))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn copy_metadata_tree(&self, src: &str, dst: &str, one_level: bool) -> Result<(), String> {
+        for (key, path) in self.metadata_entries() {
+            if !Self::in_tree(&key, src) {
+                continue;
+            }
+            let suffix = &key[src.len()..];
+            if one_level && !suffix.is_empty() {
+                let Some(member) = suffix.strip_prefix(OBJ_SEP) else {
+                    continue;
+                };
+                if member.contains(OBJ_SEP) || member.contains(PATH_SEP) {
+                    continue;
+                }
+            }
+            let target = if src == PATH_SEP {
+                format!(
+                    "{}/{}",
+                    dst.trim_end_matches('/'),
+                    key.trim_start_matches('/')
+                )
+            } else {
+                format!("{dst}{suffix}")
+            };
+            let meta = crate::metadata::key_for(&target)
+                .ok_or_else(|| format!("reserved metadata key: {target}"))?;
+            let data = fs::read(path).map_err(|e| format!("copy metadata for {key}: {e}"))?;
+            self.write_leaf(&meta, &data);
+        }
+        Ok(())
     }
 
     fn parent_name(path: &str) -> (String, String) {
@@ -191,7 +320,11 @@ impl FsKVSpace {
         let resolved = self.resolve_path(&parent);
         let mut result = join_path(&resolved, &last);
         if dir_suf {
-            result.push_str(DIR_INDEX_SUF);
+            result.push_str(if path.ends_with(OBJ_SEP) {
+                OBJ_SEP
+            } else {
+                DIR_INDEX_SUF
+            });
         }
         result
     }
@@ -226,15 +359,9 @@ impl FsKVSpace {
     fn prefix_ext(&self, prefix: &str) -> String {
         if let Some(data) = self.read_leaf(prefix) {
             let head = decode_xvalue_head(&data);
-            if head.kind() == KIND_EXT_INDEX {
-                let body = head.body(&data);
-                return crate::xvalue_index::decode_ext_index(body, &head.dims()).ext_path;
+            if head.r#ref == crate::xvalue::REF_EXT {
+                return String::from_utf8_lossy(head.body(&data)).into_owned();
             }
-        }
-        // 结构感知：ext 也可能存在 marker 文件里
-        let marker = self.fs_path(prefix).join(EXTINDEX_MARKER);
-        if let Ok(b) = fs::read(&marker) {
-            return String::from_utf8_lossy(&b).into_owned();
         }
         String::new()
     }
@@ -246,64 +373,30 @@ impl FsKVSpace {
             return Vec::new();
         }
         let p = self.fs_path(dir_key);
-        // 目录名（末段）是否以 '·' 结尾：成员前缀目录（"math·"）内的成员不再扁平化。
-        let name = dir_key
-            .trim_end_matches('/')
-            .rsplit('/')
-            .next()
-            .unwrap_or("");
-        let is_member_dir = name.ends_with(OBJ_SEP);
         let mut children = Vec::new();
         if let Ok(entries) = fs::read_dir(&p) {
             for e in entries.flatten() {
                 let fname = e.file_name().to_string_lossy().into_owned();
-                if fname == EXTINDEX_MARKER
-                    || fname == SELF_MARKER
-                    || fname == ORDER_MARKER
-                    || fname == MAP_MARKER
+                if fname == SELF_MARKER
+                    || fname == DIR_MARKER
+                    || (dir_key == PATH_SEP && fname == META_ROOT_NAME)
                 {
                     continue;
                 }
-                if fname.ends_with(OBJ_SEP) {
-                    if is_member_dir {
-                        // 成员目录内：obj 是完整 key，发射为 "init."
-                        children.push(fname);
-                    } else {
-                        // 普通目录内：成员前缀目录（"string·"）→ **裸成员名** "string"。
-                        // 对齐 redis 后端（存储索引把成员前缀节点登记为去 · 的裸名）：
-                        // 扁平展开会让父目录列出全部后代（如 "string·upper.src"），
-                        // 递归遍历/重建（layout dump、walk_lib）就再也对不上父子层级。
-                        children.push(fname.trim_end_matches(OBJ_SEP).to_string());
-                    }
+                let name = Self::unescape_name(&fname);
+                if name.ends_with(OBJ_SEP) {
+                    children.push(name.trim_end_matches(OBJ_SEP).to_string());
                 } else if e.path().is_dir() {
-                    children.push(format!("{}/", fname));
-                    // 目录带值：额外发射无尾斜杠的叶名（对应 __self__）
-                    if e.path().join(SELF_MARKER).is_file() {
-                        children.push(fname.clone());
-                    }
+                    children.push(format!("{}/", name));
                 } else {
-                    children.push(fname);
+                    children.push(name);
                 }
             }
         }
         // memindex 统一按 cmp_coord 规范排序（坐标 row-major 数值序、字符串键字典序），三后端一致。
         children.sort_by(|a, b| cmp_coord(a, b));
+        children.dedup();
         children
-    }
-
-    /// 目录 key 的 XValue：统一为 index（memindex）；ExtIndex 有 marker 时为 extindex。
-    /// 不存在的目录返回 None（对齐 redis 后端：目录 key 不存在 → None）。
-    fn dir_value(&self, dir_key: &str) -> XValue {
-        if dir_key.contains("//") || !self.fs_path(dir_key).is_dir() {
-            return XValue::None;
-        }
-        let children = self.dir_children(dir_key);
-        let marker = self.fs_path(dir_key).join(EXTINDEX_MARKER);
-        if let Ok(b) = fs::read(&marker) {
-            let ext_path = String::from_utf8_lossy(&b).into_owned();
-            return new_ext_index(&children, &ext_path);
-        }
-        new_index(&children)
     }
 
     /// 递归复制文件/目录（extindex/self/order/map marker 作普通文件一并复制）。
@@ -325,6 +418,18 @@ impl FsKVSpace {
 }
 
 impl KVSpace for FsKVSpace {
+    fn set_metadata(&mut self, key: &str, ro: bool, vid: u32) -> Result<(), String> {
+        let meta =
+            crate::metadata::key_for(key).ok_or_else(|| format!("reserved metadata key: {key}"))?;
+        if ro || vid != 0 {
+            let value = crate::metadata::encode(ro, vid)
+                .ok_or_else(|| format!("cannot encode metadata at {key}"))?;
+            self.write_leaf(&meta, &value);
+        } else {
+            self.remove_leaf(&meta);
+        }
+        Ok(())
+    }
     fn get(&mut self, prefix: &str, keys: &[String], resolve: bool) -> Vec<XValue> {
         if prefix != PATH_SEP && !Self::is_dir_key(prefix) {
             panic!("{}: {}", ERR_DIR_MUST_END_WITH_SLASH, prefix);
@@ -339,16 +444,17 @@ impl KVSpace for FsKVSpace {
         keys.iter()
             .map(|k| {
                 let full = join_path(&prefix, k);
+                if crate::metadata::is_reserved(&full) {
+                    return XValue::None;
+                }
                 if Self::is_dir_key(&full) {
-                    return self.dir_value(&full);
+                    return self
+                        .read_leaf(&full)
+                        .map(|raw| decode_xvalue(&raw))
+                        .unwrap_or(XValue::None);
                 }
                 if let Some(data) = self.read_leaf(&full) {
                     return decode_xvalue(&data);
-                }
-                // dict 形式回落：读 seen 回落 seen.
-                let dict_key = format!("{}{}", full, OBJ_SEP);
-                if self.fs_path(&dict_key).is_dir() {
-                    return self.dir_value(&dict_key);
                 }
                 if !ext_t.is_empty() {
                     let target = join_path(&ext_t, k);
@@ -362,12 +468,13 @@ impl KVSpace for FsKVSpace {
     }
 
     fn get_raw(&mut self, key: &str) -> Vec<u8> {
-        // 目录 key 无落盘索引（FS 自身即索引）：按需派生 index XValue 再返回，
-        // 对齐 redis 后端「目录 key get 返回容器 XValue」（issue #250）。
+        if crate::metadata::is_reserved(key) {
+            return Vec::new();
+        }
         if Self::is_dir_key(key) {
             let resolved = self.resolve_path(key);
-            if Self::is_dir_key(&resolved) && self.fs_path(&resolved).is_dir() {
-                return self.dir_value(&resolved).encode();
+            if Self::is_dir_key(&resolved) {
+                return self.read_leaf(&resolved).unwrap_or_default();
             }
         }
         let (mut p, l) = sep_path(key);
@@ -376,6 +483,9 @@ impl KVSpace for FsKVSpace {
         }
         let p = self.resolve_path(&p);
         let full = join_path(&p, &l);
+        if crate::metadata::is_reserved(&full) {
+            return Vec::new();
+        }
         if let Some(data) = self.read_leaf(&full) {
             return data;
         }
@@ -389,13 +499,18 @@ impl KVSpace for FsKVSpace {
         Vec::new()
     }
 
+    fn get_metadata(&mut self, key: &str) -> Result<(bool, u32), String> {
+        let resolved = self.resolve_path(key);
+        self.metadata_at(&resolved)
+    }
+
     fn get_part(&mut self, key: &str, off: u32, len: u32) -> Vec<u8> {
-        // 目录 key：索引是派生物（FS 自身即索引），先在内存里拼出 index XValue 再切片，
-        // 否则 head 读前缀会拿到空（issue #250：fs 目录 key head → nil）。
+        if crate::metadata::is_reserved(key) {
+            return Vec::new();
+        }
         if Self::is_dir_key(key) {
             let resolved = self.resolve_path(key);
-            if Self::is_dir_key(&resolved) && self.fs_path(&resolved).is_dir() {
-                let v = self.dir_value(&resolved).encode();
+            if let Some(v) = self.read_leaf(&resolved) {
                 let s = (off as usize).min(v.len());
                 let e = (s + len as usize).min(v.len());
                 return v[s..e].to_vec();
@@ -418,6 +533,9 @@ impl KVSpace for FsKVSpace {
     }
 
     fn set_part(&mut self, key: &str, off: u32, buf: &[u8]) -> Result<(), String> {
+        if crate::metadata::is_reserved(key) {
+            return Err(format!("reserved metadata key: {key}"));
+        }
         let pf = self
             .physical_file(key)
             .ok_or_else(|| format!("set_part: missing key {}", key))?;
@@ -431,87 +549,56 @@ impl KVSpace for FsKVSpace {
     }
 
     fn set(&mut self, pairs: &[KVPair]) -> Result<(), String> {
-        for p in pairs {
-            // 只解析父路径，整键不穿透：写 Ptr 变量/帧槽时写的是指针本体（槽本身），
-            // 解引用由 runtime 显式 `*` 掌控（对齐 backend.rs / kvspace-c）。
-            let resolved = self.resolve_parent(&p.key);
-            if resolved.contains("//") {
-                return Err(format!("Set: double-slash in key {:?}", resolved));
+        for pair in pairs {
+            if crate::metadata::is_reserved(&pair.key) {
+                return Err(format!("reserved metadata key: {}", pair.key));
             }
-            match &p.val {
-                XValue::Index(_) | XValue::ExtIndex(_) => {
-                    if !Self::is_dir_key(&resolved) {
-                        return Err(format!(
-                            "Set: directory-kind value at non-directory key {:?}",
-                            resolved
-                        ));
-                    }
-                }
-                _ => {}
+            let key = self.resolve_parent(&pair.key);
+            if key.contains("//") || crate::metadata::is_reserved(&key) {
+                return Err(format!("invalid key: {key}"));
             }
-            if let XValue::Ptr(ptr) = &p.val {
+            let raw = pair.raw.clone().unwrap_or_else(|| pair.val.encode());
+            let head = crate::headlenpow::decode(&raw)
+                .ok_or_else(|| format!("invalid XValue at {key}"))?;
+            if head.total != raw.len() {
+                return Err(format!("invalid XValue at {key}"));
+            }
+            if let XValue::Ptr(ptr) = decode_xvalue(&raw) {
                 validate_ptr(self, &ptr.target, &ptr.target_kindexpr)?;
             }
-
-            // 目录 index 值：结构派生，无需存；ExtIndex 写 marker。
-            if let XValue::ExtIndex(e) = &p.val {
-                self.ensure_dir(&resolved);
-                let marker = self.fs_path(&resolved).join(EXTINDEX_MARKER);
-                fs::write(&marker, e.ext_path.as_bytes())
-                    .map_err(|e| format!("kvspace-fs: extindex {}: {}", resolved, e))?;
-                continue;
-            }
-            if let XValue::Map(_) = &p.val {
-                let base = if resolved == PATH_SEP {
-                    resolved.clone()
-                } else {
-                    strip_dir_suf(&resolved).to_string()
-                };
-                let (parent, _name) = Self::parent_name(&base);
-                self.ensure_dir(&parent); // 父可能是同名叶文件（如 /lib/input def rwir）→ 提升为目录
-                self.write_leaf(&base, &p.raw.clone().unwrap_or_else(|| p.val.encode()));
-                self.ensure_dir(&format!("{}{}", base, OBJ_SEP));
-                continue;
-            }
-            if let XValue::Index(_) = &p.val {
-                self.ensure_dir(&resolved);
-                continue;
-            }
-
-            // 叶值：确保父是目录（父可能是同名叶文件，如 /lib/println），写文件。
-            let (parent, name, _) = split_index(&resolved);
-            // 成员写（父为尾 `·` 的成员目录）：memhead 必须已存在，容器值不在即拒绝——
-            // 与 backend.rs / runtime 的 kvlangBuiltinCheckMemhead 同一规则，绝不兜底自动建。
-            // `/lib` 下的 `·` 是**包·函数命名分隔符**（`/lib/pkg·func`），不是 memindex 标记，
-            // 与 runtime 的 kvlangBuiltinCheckMemhead 同款豁免——不豁免会把 `/lib/json·to`
-            // 当成「在容器 /lib/json 上写成员 to」，把扩展算子的注册整个拒掉。
-            if parent.ends_with(OBJ_SEP) && !strip_dir_suf(&parent).starts_with("/lib") {
+            let (parent, _, _) = split_index(&key);
+            if parent.ends_with(OBJ_SEP) {
                 let base = strip_dir_suf(&parent);
-                if !self.fs_path(base).exists() && !Self::is_dir_key(base) {
+                if !base.starts_with("/lib") && self.read_leaf(base).is_none() {
                     return Err(format!(
                         "{}: memhead {} does not exist — declare the container first",
                         ERR_MEMHEAD_MISSING, base
                     ));
                 }
             }
-            self.ensure_dir(&parent);
-            // extindex 写保护：只读扩展层上的同名节点禁止写入（对齐 backend.rs）。
-            let marker = self.fs_path(&parent).join(EXTINDEX_MARKER);
-            if let Ok(b) = fs::read(&marker) {
-                let ext_t = String::from_utf8_lossy(&b).into_owned();
-                if !self.dir_children(&parent).iter().any(|n| n == &name)
-                    && self.dir_children(&ext_t).iter().any(|n| n == &name)
+            let ext_target = self.prefix_ext(&parent);
+            if !ext_target.is_empty() && self.read_leaf(&key).is_none() {
+                let suffix = key.strip_prefix(&parent).unwrap_or("");
+                if self.read_leaf(&format!("{ext_target}{suffix}")).is_some()
+                    && !(head.flags & 4 != 0 && is_frame_operand_key(&key))
                 {
-                    return Err(format!("{}: {}", ERR_EXT_WRITE, resolved));
+                    return Err(format!("{}: {}", ERR_EXT_WRITE, key));
                 }
             }
-            let bytes = p.raw.clone().unwrap_or_else(|| p.val.encode());
-            self.write_leaf(&resolved, &bytes);
+            self.ensure_dir(&parent);
+            if Self::is_dir_key(&key) {
+                self.ensure_dir(&key);
+            }
+            self.sync_metadata(&key, &raw)?;
+            self.write_leaf(&key, &raw);
         }
         Ok(())
     }
 
     fn list(&mut self, prefix: &str, expand_ext: bool, resolve: bool) -> Vec<String> {
+        if crate::metadata::is_reserved(prefix) {
+            return Vec::new();
+        }
         if prefix != PATH_SEP && !Self::is_dir_key(prefix) {
             panic!("{}: {}", ERR_DIR_MUST_END_WITH_SLASH, prefix);
         }
@@ -521,6 +608,9 @@ impl KVSpace for FsKVSpace {
             prefix.to_string()
         };
         if !Self::is_dir_key(&resolved) {
+            return Vec::new();
+        }
+        if crate::metadata::is_reserved(&resolved) {
             return Vec::new();
         }
         let mut members = self.dir_children(&resolved);
@@ -540,18 +630,27 @@ impl KVSpace for FsKVSpace {
 
     fn del(&mut self, keys: &[String]) -> Result<(), String> {
         for key in keys {
-            let resolved = self.resolve_parent(key);
-            if Self::is_dir_key(&resolved) {
-                let _ = fs::remove_dir_all(self.fs_path(&resolved));
-            } else {
-                self.remove_leaf(&resolved);
+            if crate::metadata::is_reserved(key) {
+                return Err(format!("reserved metadata key: {key}"));
             }
+            let resolved = self.resolve_parent(key);
+            if crate::metadata::is_reserved(&resolved) {
+                return Err(format!("reserved metadata key: {resolved}"));
+            }
+            self.remove_leaf(&resolved);
+            self.set_metadata(&resolved, false, 0)?;
         }
         Ok(())
     }
 
     fn del_tree(&mut self, prefix: &str) -> Result<(), String> {
+        if crate::metadata::is_reserved(prefix) {
+            return Err(format!("reserved metadata key: {prefix}"));
+        }
         let resolved = self.resolve_path(prefix);
+        if crate::metadata::is_reserved(&resolved) {
+            return Err(format!("reserved metadata key: {resolved}"));
+        }
         // 若 prefix 本身是链接（叶 Ptr），只删链接。
         let link_key = if Self::is_dir_key(&resolved) && resolved != PATH_SEP {
             strip_dir_suf(&resolved)
@@ -563,26 +662,50 @@ impl KVSpace for FsKVSpace {
                 return self.del(&[resolved]);
             }
         }
-        let _ = fs::remove_dir_all(self.fs_path(&resolved));
+        let base = if Self::is_dir_key(&resolved) && resolved != PATH_SEP {
+            strip_dir_suf(&resolved)
+        } else {
+            &resolved
+        };
+        for key in [base.to_string(), format!("{base}{OBJ_SEP}")] {
+            let node = self.node_path(&key);
+            if node.is_dir() {
+                fs::remove_dir_all(&node).map_err(|e| format!("DelTree {key}: {e}"))?;
+            } else if node.is_file() {
+                fs::remove_file(&node).map_err(|e| format!("DelTree {key}: {e}"))?;
+            }
+        }
+        self.remove_metadata_tree(base)?;
         Ok(())
     }
 
     fn cp(&mut self, src: &str, dst: &str) -> Result<(), String> {
+        if crate::metadata::is_reserved(src) || crate::metadata::is_reserved(dst) {
+            return Err("reserved metadata key".into());
+        }
         let raw = self.get_raw(src);
         if raw.is_empty() {
             return Err(format!("Cp: source not found: {}", src));
         }
+        let (ro, vid) = self.metadata_at(src)?;
         let v = decode_xvalue(&raw);
         self.set(&[KVPair {
             key: dst.to_string(),
             val: v,
             raw: Some(raw),
-        }])
+        }])?;
+        self.set_metadata(dst, ro, vid)
     }
 
     fn cp_tree(&mut self, src: &str, dst: &str) -> Result<(), String> {
+        if crate::metadata::is_reserved(src) || crate::metadata::is_reserved(dst) {
+            return Err("reserved metadata key".into());
+        }
         let src_res = self.resolve_path(src);
         let dst_res = self.resolve_path(dst);
+        if crate::metadata::is_reserved(&src_res) || crate::metadata::is_reserved(&dst_res) {
+            return Err("reserved metadata key".into());
+        }
         let de_suffix = |k: &str| {
             if Self::is_dir_key(k) && k != PATH_SEP {
                 strip_dir_suf(k).to_string()
@@ -594,6 +717,9 @@ impl KVSpace for FsKVSpace {
         let dst_base = de_suffix(&dst_res);
         if src_base == dst_base {
             return Ok(());
+        }
+        if is_descendant(&src_base, &dst_base) {
+            return Err("CpTree: destination is inside source".into());
         }
         // 一个节点跨两条 fs 实体：base（值/层级子树）与兄弟成员目录 base·。
         let sb = self.node_path(&src_base);
@@ -611,6 +737,7 @@ impl KVSpace for FsKVSpace {
             Self::copy_recursive(&smem, &dmem)
                 .map_err(|e| format!("CpTree {}→{}: {}", src, dst, e))?;
         }
+        self.copy_metadata_tree(&src_base, &dst_base, false)?;
         // 确保 dst 父目录存在（成员名单结构派生，无需登记）。
         let (parent, _name) = Self::parent_name(&dst_base);
         self.ensure_dir(&parent);
@@ -618,8 +745,14 @@ impl KVSpace for FsKVSpace {
     }
 
     fn cp_list(&mut self, src: &str, dst: &str) -> Result<(), String> {
+        if crate::metadata::is_reserved(src) || crate::metadata::is_reserved(dst) {
+            return Err("reserved metadata key".into());
+        }
         let src_res = self.resolve_path(src);
         let dst_res = self.resolve_path(dst);
+        if crate::metadata::is_reserved(&src_res) || crate::metadata::is_reserved(&dst_res) {
+            return Err("reserved metadata key".into());
+        }
         let de_suffix = |k: &str| {
             if Self::is_dir_key(k) && k != PATH_SEP {
                 strip_dir_suf(k).to_string()
@@ -651,13 +784,18 @@ impl KVSpace for FsKVSpace {
                     let dp = dmem.join(e.file_name());
                     if sp.is_file() {
                         let _ = fs::copy(&sp, &dp);
-                    } else if let Ok(c) = fs::read(sp.join(SELF_MARKER)) {
-                        let _ = fs::create_dir_all(&dp);
-                        let _ = fs::write(dp.join(SELF_MARKER), c);
+                    } else if sp.is_dir() {
+                        for marker in [SELF_MARKER, DIR_MARKER] {
+                            if let Ok(c) = fs::read(sp.join(marker)) {
+                                let _ = fs::create_dir_all(&dp);
+                                let _ = fs::write(dp.join(marker), c);
+                            }
+                        }
                     }
                 }
             }
         }
+        self.copy_metadata_tree(&src_base, &dst_base, true)?;
         let (parent, _name) = Self::parent_name(&dst_base);
         self.ensure_dir(&parent);
         Ok(())
@@ -673,7 +811,12 @@ impl KVSpace for FsKVSpace {
             return Err(format!("{}: Mkindex {}", ERR_DIR_MUST_END_WITH_SLASH, path));
         }
         let resolved = self.resolve_path(path);
-        let _ = fs::create_dir_all(self.fs_path(&resolved));
+        self.ensure_dir(&resolved);
+        if self.read_leaf(&resolved).is_none() {
+            let value = crate::headlenpow::encode(5, 0, 0, 0, "lib", &[], 0)
+                .ok_or_else(|| format!("Mkindex: invalid directory {resolved}"))?;
+            self.write_leaf(&resolved, &value);
+        }
         Ok(())
     }
 
@@ -685,22 +828,36 @@ impl KVSpace for FsKVSpace {
             ));
         }
         let resolved = self.resolve_parent(path);
-        // 级联检查：ext_path 本身是 extindex → 不容许（对齐 backend.rs）
-        if self.fs_path(ext_path).join(EXTINDEX_MARKER).is_file() {
+        if !self.prefix_ext(ext_path).is_empty() {
             return Err(format!("{}: {}", ERR_EXT_CASCADE, ext_path));
         }
-        let dir = self.fs_path(&resolved);
-        let _ = fs::create_dir_all(&dir);
-        let marker = dir.join(EXTINDEX_MARKER);
-        fs::write(&marker, ext_path.as_bytes())
-            .map_err(|e| format!("kvspace-fs: extindex {}: {}", resolved, e))?;
+        let source = self
+            .read_leaf(ext_path)
+            .ok_or_else(|| format!("ExtIndex target missing: {ext_path}"))?;
+        let langtype = decode_xvalue_head(&source).langtype;
+        let pow = (5..=31)
+            .find(|&p| 18 + langtype.len() <= 1usize << p)
+            .ok_or_else(|| format!("ExtIndex type too long: {langtype}"))?;
+        let len = ext_path.len() as u64;
+        let value = crate::headlenpow::encode(
+            pow,
+            3,
+            len,
+            len,
+            &langtype,
+            ext_path.as_bytes(),
+            ext_path.len(),
+        )
+        .ok_or_else(|| format!("ExtIndex locator invalid: {ext_path}"))?;
+        self.ensure_dir(&resolved);
+        self.write_leaf(&resolved, &value);
         Ok(())
     }
 
     fn del_ext_index(&mut self, path: &str) -> Result<(), String> {
         let resolved = self.resolve_parent(path);
-        let marker = self.fs_path(&resolved).join(EXTINDEX_MARKER);
-        let _ = fs::remove_file(marker);
+        self.remove_leaf(&resolved);
+        self.set_metadata(&resolved, false, 0)?;
         Ok(())
     }
 

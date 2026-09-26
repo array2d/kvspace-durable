@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 
-use crate::store::KVStore;
+use crate::store::{is_subtree_key, KVStore};
 
 pub struct RedisStore {
     stream: RefCell<BufReader<TcpStream>>,
@@ -48,7 +48,11 @@ impl RedisStore {
                 .write_all(&out)
                 .unwrap_or_else(|e| panic!("kvspace-redis: write: {}", e));
         }
-        self.read_resp()
+        let response = self.read_resp();
+        if let Resp::Error(message) = &response {
+            panic!("kvspace-redis: {message}");
+        }
+        response
     }
 
     fn read_line(&self) -> Vec<u8> {
@@ -177,6 +181,40 @@ impl KVStore for RedisStore {
             args.push(k.as_bytes());
         }
         let _ = self.cmd(&args);
+    }
+
+    fn scan_keys(&self, prefix: &str) -> Vec<String> {
+        let mut keys = Vec::new();
+        let mut cursor: i64 = 0;
+        loop {
+            let cur = cursor.to_string();
+            match self.cmd(&[b"SCAN", cur.as_bytes(), b"COUNT", b"1000"]) {
+                Resp::Array(parts) if parts.len() == 2 => {
+                    cursor = match &parts[0] {
+                        Resp::Bulk(Some(bytes)) => {
+                            String::from_utf8_lossy(bytes).parse().unwrap_or(0)
+                        }
+                        _ => 0,
+                    };
+                    if let Resp::Array(items) = &parts[1] {
+                        for item in items {
+                            if let Resp::Bulk(Some(bytes)) = item {
+                                if let Ok(key) = String::from_utf8(bytes.clone()) {
+                                    if is_subtree_key(prefix, &key) {
+                                        keys.push(key);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if cursor == 0 {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        keys
     }
 
     fn flush(&self) {

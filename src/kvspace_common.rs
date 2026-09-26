@@ -2,10 +2,9 @@
 
 use std::time::Duration;
 
-use crate::kvspace::{KVPair, KVSpace};
+use crate::kvspace::KVSpace;
 use crate::r#const::*;
 use crate::xvalue::{body_bytes, is_none, plain, XValue};
-use crate::xvalue_index::new_index;
 
 /// JoinPath 拼接父子路径。
 pub fn join_path(parent: &str, child: &str) -> String {
@@ -27,6 +26,28 @@ pub fn strip_dir_suf(path: &str) -> &str {
     } else {
         path
     }
+}
+
+pub fn is_descendant(base: &str, path: &str) -> bool {
+    if base == PATH_SEP {
+        return path != PATH_SEP && path.starts_with(PATH_SEP);
+    }
+    path.strip_prefix(base)
+        .is_some_and(|rest| rest.starts_with(PATH_SEP) || rest.starts_with(OBJ_SEP))
+}
+
+pub fn is_frame_operand_key(key: &str) -> bool {
+    if !key.starts_with("/vthread/") {
+        return false;
+    }
+    let slot = key.rsplit('/').next().unwrap_or("");
+    let Some(inner) = slot.strip_prefix('[').and_then(|s| s.strip_suffix(']')) else {
+        return false;
+    };
+    let Some((row, col)) = inner.split_once(',') else {
+        return false;
+    };
+    row.parse::<u32>().is_ok_and(|n| n > 0) && col.parse::<i32>().is_ok_and(|n| n != 0)
 }
 
 /// SepPath 拆分路径为 (prefix, last)。
@@ -71,42 +92,6 @@ pub fn split_index(path: &str) -> (String, String, SepKind) {
         }
     }
     (parent, last.to_string(), SepKind::SepDir)
-}
-
-/// MkIndexRecursive 递归创建目录，已存在的目录跳过。
-/// 用 split_index（而非 sep_path）切父目录，使 `·` 成员目录（如 /lib/math·sum/）按
-/// 其真实父 memindex `/lib/math·` 判定存在性，避免把已有成员目录误判为缺失而重建覆盖。
-pub fn mk_index_recursive(kv: &mut dyn KVSpace, path: &str) {
-    if !path.ends_with(DIR_INDEX_SUF) {
-        panic!("MkIndex: path must end with {}", DIR_INDEX_SUF);
-    }
-    let mut i = 1;
-    while i < path.len() {
-        match path[i..].find('/') {
-            None => break,
-            Some(j) => {
-                i += j + 1;
-                let dir = &path[..i];
-                let (p, n, _) = split_index(&dir[..dir.len() - 1]);
-                if !dir_exists(kv, &p, &n) {
-                    let _ = kv.set(&[KVPair {
-                        key: dir.to_string(),
-                        val: new_index(&[]),
-                        raw: None,
-                    }]);
-                }
-            }
-        }
-    }
-}
-
-pub fn dir_exists(kv: &mut dyn KVSpace, parent_dir: &str, name: &str) -> bool {
-    for m in kv.list(parent_dir, false, true) {
-        if m == name || m == format!("{}{}", name, DIR_INDEX_SUF) {
-            return true;
-        }
-    }
-    false
 }
 
 /// langtype 归一：**只**剥「数组形状前缀」（`[5]`、`[]`、`[?]`——方括号内是维度数字/空）。
@@ -209,38 +194,21 @@ pub fn equal_xvalue(a: &XValue, b: &XValue) -> bool {
     body_bytes(a) == body_bytes(b)
 }
 
-// ── 展示（对齐 FprintList / FprintTree / GetAt / ReadPrefixExt / StripExtChildren） ──
+// Display helpers.
 
 pub fn get_at(kv: &mut dyn KVSpace, dir: &str, name: &str) -> XValue {
     kv.get(dir, &[name.to_string()], true).remove(0)
 }
 
 pub fn read_prefix_ext(kv: &mut dyn KVSpace, prefix: &str) -> String {
-    if let XValue::ExtIndex(e) = get_one(kv, prefix) {
-        return e.ext_path;
+    if let XValue::Ext(e) = get_one(kv, prefix) {
+        return e.locator;
     }
     String::new()
 }
 
-pub fn strip_ext_children(
-    kv: &mut dyn KVSpace,
-    prefix: &str,
-    children: Vec<String>,
-) -> Vec<String> {
-    let ext_target = read_prefix_ext(kv, prefix);
-    if ext_target.is_empty() {
-        return children;
-    }
-    let ext_children = kv.list(&ext_target, false, true);
-    let n = children.len().saturating_sub(ext_children.len());
-    children[..n].to_vec()
-}
-
 pub fn fprint_list(kv: &mut dyn KVSpace, prefix: &str, show_ext: bool, show_kind: bool) {
-    let mut children = kv.list(prefix, true, true);
-    if !show_ext {
-        children = strip_ext_children(kv, prefix, children);
-    }
+    let children = kv.list(prefix, show_ext, true);
     for c in children {
         let mut v = get_at(kv, prefix, &c);
         let child_dir = format!("{}{}", join_path(prefix, &c), DIR_INDEX_SUF);
@@ -279,10 +247,7 @@ pub fn fprint_tree(
     show_ext: bool,
     show_kind: bool,
 ) {
-    let mut children = kv.list(prefix, true, true);
-    if !show_ext {
-        children = strip_ext_children(kv, prefix, children);
-    }
+    let mut children = kv.list(prefix, show_ext, true);
     children.sort_by(|a, b| {
         let (a_, b_) = (a.trim_end_matches('/'), b.trim_end_matches('/'));
         if a_ == b_ {

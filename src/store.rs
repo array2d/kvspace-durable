@@ -1,11 +1,11 @@
-// store.rs — 后端存储原语。redis/fs 各自实现，generic backend 只依赖它。
-//
-// 注意这里**没有** `scan_keys` 这类「前缀扫描」原语。子树枚举由 `Backend::collect_subtree`
-// 沿目录索引递归完成 —— 后端只需要 get/set/del 这几个点操作。
-// 这样 S3 后端不必依赖 `ListObjects(Prefix=)`（那是裸字节前缀，与 KVSpace 要的词边界
-// 匹配不是一回事），也不必为「有没有前缀扫描能力」做适配。
+pub(crate) fn is_subtree_key(prefix: &str, key: &str) -> bool {
+    if prefix.is_empty() || prefix == "/" {
+        return key.starts_with('/');
+    }
+    key.strip_prefix(prefix)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/') || rest.starts_with('·'))
+}
 
-/// 单 key 字节级存储原语（无目录索引、无 link 语义，纯 get/set/del/scan/flush）。
 pub trait KVStore {
     /// 读 key 的原始字节；None = 不存在。
     fn get(&self, key: &str) -> Option<Vec<u8>>;
@@ -15,6 +15,7 @@ pub trait KVStore {
     }
     fn set(&self, key: &str, val: &[u8]);
     fn del(&self, keys: &[&str]);
+    fn scan_keys(&self, prefix: &str) -> Vec<String>;
     /// key 是否存在。默认整读判定，后端可覆盖为 EXISTS。
     fn exists(&self, key: &str) -> bool {
         self.get(key).is_some()
@@ -40,4 +41,19 @@ pub trait KVStore {
         }
     }
     fn flush(&self);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_subtree_key;
+
+    #[test]
+    fn subtree_scan_respects_key_boundaries() {
+        assert!(is_subtree_key("/proto", "/proto"));
+        assert!(is_subtree_key("/proto", "/proto/member"));
+        assert!(is_subtree_key("/proto", "/proto·field"));
+        assert!(!is_subtree_key("/proto", "/protocol"));
+        assert!(is_subtree_key("/", "/proto/member"));
+        assert!(is_subtree_key("", "/proto/member"));
+    }
 }
