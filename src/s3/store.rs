@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use super::dsn::{self, S3Dsn};
 use super::sigv4::{self, uri_encode};
-use crate::store::KVStore;
+use crate::store::{is_subtree_key, KVStore};
 
 /// 5xx 与网络错误重试几次。4xx 一律不重试 —— 签名错、桶不存在这类问题重试一万次也不会好。
 const MAX_ATTEMPTS: u32 = 3;
@@ -51,33 +51,33 @@ fn hex_of(body: &[u8]) -> String {
 
 fn xml_unescape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    let b = s.as_bytes();
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'&' {
-            if let Some(semi) = s[i..].find(';') {
-                let ent = &s[i + 1..i + semi];
-                let rep = match ent {
-                    "amp" => Some('&'),
-                    "lt" => Some('<'),
-                    "gt" => Some('>'),
-                    "quot" => Some('"'),
-                    "apos" => Some('\''),
-                    _ => ent
-                        .strip_prefix('#')
-                        .and_then(|n| n.parse::<u32>().ok())
-                        .and_then(char::from_u32),
-                };
-                if let Some(c) = rep {
-                    out.push(c);
-                    i += semi + 1;
-                    continue;
-                }
+    let mut rest = s;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        rest = &rest[amp..];
+        if let Some(semi) = rest.find(';') {
+            let ent = &rest[1..semi];
+            let decoded = match ent {
+                "amp" => Some('&'),
+                "lt" => Some('<'),
+                "gt" => Some('>'),
+                "quot" => Some('"'),
+                "apos" => Some('\''),
+                _ => ent
+                    .strip_prefix('#')
+                    .and_then(|n| n.parse::<u32>().ok())
+                    .and_then(char::from_u32),
+            };
+            if let Some(ch) = decoded {
+                out.push(ch);
+                rest = &rest[semi + 1..];
+                continue;
             }
         }
-        out.push(b[i] as char);
-        i += 1;
+        out.push('&');
+        rest = &rest[1..];
     }
+    out.push_str(rest);
     out
 }
 
@@ -328,6 +328,13 @@ impl KVStore for S3Store {
         }
     }
 
+    fn scan_keys(&self, prefix: &str) -> Vec<String> {
+        self.list_all(prefix)
+            .into_iter()
+            .filter(|key| is_subtree_key(prefix, key))
+            .collect()
+    }
+
     fn exists(&self, key: &str) -> bool {
         // HEAD 不传 body，比整读便宜得多。这是覆盖默认实现最值的一处。
         match self.send_empty("HEAD", key, &[], None) {
@@ -392,6 +399,7 @@ mod tests {
     fn xml_数字实体() {
         assert_eq!(xml_unescape("&#22909;"), "好");
         assert_eq!(xml_unescape("&amp;lt;"), "&lt;"); // 只解一层
+        assert_eq!(xml_unescape("/f·键‥0&amp;x"), "/f·键‥0&x");
     }
 
     #[test]

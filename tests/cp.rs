@@ -28,16 +28,29 @@ fn run(dsn: &str) {
     kv.clear().unwrap();
 
     // 原型 stringkeymap 容器：两个叶成员 + 一个嵌套容器成员。
-    set(kv, "/proto", &new_map_index(&[0]));
+    set(kv, "/proto", &new_map_langtype("[]char/utf32·int64"));
     set(kv, "/proto·x", &new_int64(&[10]));
     set(kv, "/proto·y", &new_int64(&[20]));
-    set(kv, "/proto·sub", &new_map_index(&[0]));
+    set(kv, "/proto·sub", &new_map_langtype("[]char/utf32·int64"));
     set(kv, "/proto·sub·z", &new_int64(&[30]));
 
+    kv.cp_tree("/proto", "/proto").unwrap();
+    assert!(kv.cp_tree("/proto", "/proto/child").is_err());
+    assert_eq!(get_one(kv, "/proto·x"), new_int64(&[10]));
+
     // 只读扩展源 + 原型上的 extindex 成员 ov 覆盖 /ext·（extindex 节点落 `/` 目录键 /proto·ov/）。
-    set(kv, "/ext·", &new_map_index(&[0]));
+    set(kv, "/ext", &new_map_langtype("[]char/utf32·int64"));
+    set(
+        kv,
+        "/ext·",
+        &XValue::Opaque(Opaque {
+            kind: "lib".into(),
+            body: vec![],
+            array_len: 1,
+        }),
+    );
     set(kv, "/ext·a", &new_int64(&[99]));
-    kv.ext_index("/proto·ov·", "/ext·").unwrap();
+    kv.ext_index("/proto·ov/", "/ext·").unwrap();
 
     // ── cp：单 key 拷贝，不带成员 ──
     kv.cp("/proto·x", "/px").unwrap();
@@ -81,9 +94,15 @@ fn run(dsn: &str) {
         "cp_tree 的 extindex 成员 overlay 读通"
     );
     match kv.get("/inst·", &["ov/".into()], true).remove(0) {
-        XValue::ExtIndex(e) => assert_eq!(e.ext_path, "/ext·", "extindex 指向同一只读扩展"),
+        XValue::Ext(e) => assert_eq!((e.langtype.as_str(), e.locator.as_str()), ("lib", "/ext·")),
         other => panic!("target 侧应为 extindex: {:?}", other),
     }
+
+    kv.cp_list("/proto", "/shallow").unwrap();
+    assert_eq!(
+        kv.get("/shallow·ov/", &["a".into()], true).remove(0),
+        new_int64(&[99])
+    );
 
     // 改动源 extindex 目标，target 因共享同一只读扩展而同步可见（非深拷贝底层数据）。
     set(kv, "/ext·a", &new_int64(&[123]));
@@ -96,7 +115,9 @@ fn run(dsn: &str) {
 
 #[test]
 fn cp_redis() {
-    run("redis://127.0.0.1:6379");
+    let dsn = std::env::var("KVSPACE_TEST_REDIS_DSN")
+        .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+    run(&dsn);
 }
 
 #[test]

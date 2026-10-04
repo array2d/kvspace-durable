@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use crate::conn::conn;
 use crate::kvspace::{KVPair, KVSpace};
-use crate::xvalue::{decode_xvalue, decode_xvalue_head, encode_head, encode_head_perm, new_ptr};
+use crate::xvalue::{decode_xvalue, decode_xvalue_head, encode_head, new_ptr};
 use crate::xvalue_bool::new_bool;
 use crate::xvalue_byte::new_char_byte;
 use crate::xvalue_float::new_float64;
@@ -39,6 +39,7 @@ pub struct Handle {
     read_bufs: Vec<Vec<u8>>,
     write_buf: Vec<u8>,
     pending_key: Option<String>,
+    pending_meta: Option<(bool, u32)>,
 }
 
 impl Handle {
@@ -46,13 +47,17 @@ impl Handle {
     /// 借用生命周期同该槽、跨指令内的写仍有效；由 VM 在指令边界显式调 kvspaceReadReset 回收。
     fn flush(&mut self) -> Result<(), String> {
         if let Some(key) = self.pending_key.take() {
+            let meta = self.pending_meta.take();
             let tlv = std::mem::take(&mut self.write_buf);
             let val = decode_xvalue(&tlv);
             self.kv.set(&[KVPair {
-                key,
+                key: key.clone(),
                 val,
                 raw: Some(tlv),
             }])?;
+            if let Some((ro, vid)) = meta {
+                self.kv.set_metadata(&key, ro, vid)?;
+            }
         }
         Ok(())
     }
@@ -75,54 +80,20 @@ unsafe fn kv_flush<'a>(h: *mut Handle) -> Result<&'a mut dyn KVSpace, String> {
     Ok(&mut *hd.kv)
 }
 
-/// 由 (ref, storetype, ro, vid, langtype) + body_len 直接构造三正交轴 head 并预留 body_len 零字节。
-/// 与 kvspace-c kvspaceXvalueWriteHead 逐字节一致：ARRAYND 从 langtype 的 [dims] 落物理字段，
-/// NONE/ATOM 无物理字段（index/extindex 不走本路径）。
 fn build_tlv(
     r#ref: u8,
     storetype: u8,
-    ro: u8,
-    vid: u32,
     langtype: &str,
     body_len: usize,
-) -> Vec<u8> {
-    let dims = parse_langtype_dims(langtype);
-    let lt = langtype.as_bytes();
-    let has_dims = crate::xvalue::store_has_dims(storetype);
-    let phys = if has_dims { 1 + 4 * dims.len() } else { 0 };
-    let headlen = crate::xvalue::HEAD_PREFIX + phys + lt.len();
-    let mut v = vec![0u8; headlen + body_len];
-    v[0..2].copy_from_slice(&(headlen as u16).to_le_bytes());
-    v[2] = r#ref;
-    v[3] = storetype;
-    v[4] = ro;
-    v[5..9].copy_from_slice(&vid.to_le_bytes());
-    v[9..13].copy_from_slice(&(body_len as u32).to_le_bytes());
-    let mut o = crate::xvalue::HEAD_PREFIX;
-    if has_dims {
-        v[o] = dims.len() as u8;
-        o += 1;
-        for d in &dims {
-            v[o..o + 4].copy_from_slice(&(*d as u32).to_le_bytes());
-            o += 4;
-        }
-    }
-    v[o..o + lt.len()].copy_from_slice(lt);
-    v
-}
-
-/// 解析 langtype 前导 [dims]（仅 ARRAYND 携带；无则空）。
-fn parse_langtype_dims(lt: &str) -> Vec<i32> {
-    if lt.starts_with('[') {
-        if let Some(end) = lt.find(']') {
-            return lt[1..end]
-                .split(',')
-                .filter(|s| !s.is_empty())
-                .map(|s| s.parse().unwrap_or(0))
-                .collect();
-        }
-    }
-    Vec::new()
+    body_cap: usize,
+) -> Option<Vec<u8>> {
+    let flags = match (r#ref, storetype) {
+        (0, 0..=2) => storetype,
+        (1, 1) => 5,
+        (2, 3) => 3,
+        _ => return None,
+    };
+    crate::headlenpow::reserve(flags, langtype, body_len, body_cap)
 }
 
 // ── 内部助手 ─────────────────────────────────────────────────────────
@@ -196,7 +167,7 @@ fn result_to_code(r: Result<(), String>, err: *mut c_char, err_cap: u32) -> c_in
 pub struct kvspaceHead_t {
     pub headlen: u16,        // head 总字节数
     pub r#ref: u8,           // 存储位置：0=inline 1=ptr 2=@ext
-    pub storetype: u8,       // 物理布局：NONE/ATOM/ARRAYND/index/extindex
+    pub storetype: u8,       // Wire storage class.
     pub ro: u8,              // 1=只读，0=可写
     pub vid: u32,            // vthread id
     pub body_len: i32,       // body 字节数
@@ -205,6 +176,7 @@ pub struct kvspaceHead_t {
     pub langtype: [u8; 256], // 完整 kindexpr 串（含 [dims]、无前缀），NUL 终止
     pub langtype_len: i32,   // langtype 字节数（不含 NUL）
     pub body_offset: i32,    // body 在 data 内的起始偏移（= head_len）
+    pub body_cap: u64,
 }
 
 fn fill_head(head: &crate::xvalue::XValueHead, out: *mut kvspaceHead_t) {
@@ -229,6 +201,7 @@ fn fill_head(head: &crate::xvalue::XValueHead, out: *mut kvspaceHead_t) {
         o.vid = head.vid;
         o.body_len = head.body_len;
         o.body_offset = head.head_len();
+        o.body_cap = head.body_cap;
     }
 }
 
@@ -243,6 +216,7 @@ pub extern "C" fn kvspaceConnect(dsn: *const c_char) -> *mut Handle {
             read_bufs: Vec::new(),
             write_buf: Vec::new(),
             pending_key: None,
+            pending_meta: None,
         })),
         Err(_) => std::ptr::null_mut(),
     }
@@ -301,6 +275,53 @@ pub extern "C" fn kvspaceGet(
                 *out = std::ptr::null_mut();
                 *out_len = 0;
             }
+            1
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn kvspaceSetValue(
+    h: *mut Handle,
+    key: *const c_char,
+    value: *const u8,
+    value_len: u32,
+    ro: u8,
+    vid: u32,
+    err: *mut c_char,
+    err_cap: u32,
+) -> c_int {
+    let Some(hd) = (unsafe { h.as_mut() }) else {
+        return 1;
+    };
+    if key.is_null() || value.is_null() || value_len == 0 {
+        write_err(err, err_cap, "invalid SetValue input");
+        return 1;
+    }
+    if let Err(e) = hd.flush() {
+        write_err(err, err_cap, &e);
+        return 1;
+    }
+    let key = unsafe { cstr(key) }.to_string();
+    let raw = unsafe { std::slice::from_raw_parts(value, value_len as usize) };
+    if crate::headlenpow::decode(raw).map(|head| head.total) != Some(raw.len()) {
+        write_err(err, err_cap, "invalid XValue");
+        return 1;
+    }
+    let raw = raw.to_vec();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let val = decode_xvalue(&raw);
+        hd.kv.set(&[KVPair {
+            key: key.clone(),
+            val,
+            raw: Some(raw),
+        }])?;
+        hd.kv.set_metadata(&key, ro != 0, vid)
+    }));
+    match result {
+        Ok(result) => result_to_code(result, err, err_cap),
+        Err(_) => {
+            write_err(err, err_cap, "SetValue backend panic");
             1
         }
     }
@@ -406,22 +427,28 @@ pub extern "C" fn kvspaceGetHead(
         return 1;
     }
     let key = unsafe { cstr(key) }.to_string();
-    let prefix = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        hd.kv.get_part(&key, 0, 512)
-    })) {
+    let value = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hd.kv.get_raw(&key)))
+    {
         Ok(p) => p,
         Err(_) => return 1,
     };
-    if prefix.is_empty() {
+    if value.is_empty() {
         return 1;
     }
-    // head 只需前缀即可解（body 不在手上，不能走整值校验）；head 长于已读前缀说明前缀太小，
-    // 报错而非给出空 head——绝不静默返回一个"看起来合法"的默认值。
-    let head = crate::xvalue::decode_xvalue_head_prefix(&prefix);
+    let head = crate::xvalue::decode_xvalue_head(&value);
     if head.headlen == 0 {
         return 1;
     }
+    let (ro, vid) =
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hd.kv.get_metadata(&key))) {
+            Ok(Ok(meta)) => meta,
+            _ => return 1,
+        };
     fill_head(&head, out);
+    unsafe {
+        (*out).ro = ro as u8;
+        (*out).vid = vid;
+    }
     0
 }
 
@@ -453,12 +480,25 @@ pub extern "C" fn kvspaceWriteInPlace(
     }
     let head = decode_xvalue_head(&existing);
     let head_len = head.head_len() as usize;
-    if head.body_len as u32 != body_len || existing.len() != head_len + body_len as usize {
+    if head.headlen == 0
+        || head.body_len < 0
+        || head.body_len as u32 != body_len
+        || head.body_cap > usize::MAX as u64
+        || head_len.checked_add(head.body_cap as usize) != Some(existing.len())
+    {
         write_err(err, err_cap, "kvspace: write-in-place body_len mismatch");
         return 1;
     }
+    let meta = match hd.kv.get_metadata(&key) {
+        Ok(value) => value,
+        Err(e) => {
+            write_err(err, err_cap, &e);
+            return 1;
+        }
+    };
     hd.write_buf = existing;
     hd.pending_key = Some(key);
+    hd.pending_meta = Some(meta);
     unsafe { *body = hd.write_buf.as_mut_ptr().add(head_len) };
     0
 }
@@ -474,6 +514,7 @@ pub extern "C" fn kvspaceWriteNewPlace(
     vid: u32,
     langtype: *const c_char,
     body_len: u32,
+    body_cap: u64,
     body: *mut *mut u8,
     err: *mut c_char,
     err_cap: u32,
@@ -488,10 +529,18 @@ pub extern "C" fn kvspaceWriteNewPlace(
     }
     let key = unsafe { cstr(key) }.to_string();
     let lt = unsafe { cstr(langtype) };
-    let tlv = build_tlv(r#ref, storetype, ro, vid, lt, body_len as usize);
-    let head_len = tlv.len() - body_len as usize;
+    let Ok(cap) = usize::try_from(body_cap) else {
+        write_err(err, err_cap, "capacity exceeds platform size");
+        return 1;
+    };
+    let Some(tlv) = build_tlv(r#ref, storetype, lt, body_len as usize, cap) else {
+        write_err(err, err_cap, "invalid XValue geometry");
+        return 1;
+    };
+    let head_len = tlv.len() - cap;
     hd.write_buf = tlv;
     hd.pending_key = Some(key);
+    hd.pending_meta = Some((ro != 0, vid));
     unsafe { *body = hd.write_buf.as_mut_ptr().add(head_len) };
     0
 }
@@ -829,8 +878,11 @@ pub extern "C" fn kvspaceTlvEncodeMode(
 ) -> c_int {
     let raw = unsafe { std::slice::from_raw_parts(raw, raw_len as usize) };
     let dims = ffi_dims(dims, ndim);
+    if ro != 0 || vid != 0 {
+        return 1;
+    }
     alloc(
-        encode_head_perm(unsafe { cstr(kind) }, r#ref, dims, raw, ro != 0, vid),
+        encode_head(unsafe { cstr(kind) }, r#ref, dims, raw),
         out,
         out_len,
     )
@@ -856,6 +908,9 @@ pub extern "C" fn kvspaceDecodeHead(
         return 1;
     }
     let head = decode_xvalue_head(unsafe { std::slice::from_raw_parts(data, data_len as usize) });
+    if head.headlen == 0 {
+        return 1;
+    }
     fill_head(&head, out);
     0
 }

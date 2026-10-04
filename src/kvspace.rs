@@ -42,6 +42,8 @@ pub trait KVSpace {
     fn get(&mut self, prefix: &str, keys: &[String], resolve: bool) -> Vec<XValue>;
     /// 单点读原始字节（不 decode/re-encode，保 head 权限位 ro/vid）。无值返回空。
     fn get_raw(&mut self, key: &str) -> Vec<u8>;
+    fn get_metadata(&mut self, key: &str) -> Result<(bool, u32), String>;
+    fn set_metadata(&mut self, key: &str, ro: bool, vid: u32) -> Result<(), String>;
     /// 单点写：Set 写完整 XValue，并维护目录索引；只解析父路径 link，整键不穿透。
     fn set(&mut self, pairs: &[KVPair]) -> Result<(), String>;
 
