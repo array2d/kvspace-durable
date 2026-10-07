@@ -422,7 +422,7 @@ pub fn encode_head(kind: &str, r#ref: i32, dims: &[i32], raw: &[u8]) -> Vec<u8> 
         return Vec::new();
     } else if kind.is_empty() || kind == "None" {
         (5, 0, 0, 0, String::new())
-    } else if matches!(kind, "char/utf8" | "char/ascii" | "char/utf32" | "byte") {
+    } else if matches!(kind, "char/utf8" | "char/ascii" | "char/utf32") {
         let count = match kind {
             "char/utf8" => std::str::from_utf8(raw).ok().map(|s| s.chars().count()),
             "char/ascii" if raw.is_ascii() => Some(raw.len()),
@@ -434,7 +434,6 @@ pub fn encode_head(kind: &str, r#ref: i32, dims: &[i32], raw: &[u8]) -> Vec<u8> 
             {
                 Some(raw.len() / 4)
             }
-            "byte" => Some(raw.len()),
             _ => None,
         };
         let Some(count) = count else {
