@@ -47,7 +47,7 @@ fn decimal(s: &str) -> Option<u64> {
 fn slack_count(s: &str, body: &[u8]) -> Option<u64> {
     match s {
         "char/utf8" => Some(std::str::from_utf8(body).ok()?.chars().count() as u64),
-        "byte" => Some(body.len() as u64),
+        "uint8" => Some(body.len() as u64),
         "char/ascii" if body.is_ascii() => Some(body.len() as u64),
         "char/utf32" if body.len() % 4 == 0 => {
             for chunk in body.chunks_exact(4) {
@@ -241,7 +241,7 @@ pub fn reserve(flags: u8, langtype: &str, content: usize, cap: usize) -> Option<
                     || decimal(&langtype[1..end]).is_none()
                     || !matches!(
                         &langtype[end + 1..],
-                        "char/utf8" | "byte" | "char/utf32" | "char/ascii"
+                        "char/utf8" | "uint8" | "char/utf32" | "char/ascii"
                     )
                 {
                     return None;

@@ -40,7 +40,7 @@ pub fn encode(ro: bool, vid: u32) -> Option<Vec<u8>> {
     let mut body = [0u8; 5];
     body[0] = u8::from(ro);
     body[1..].copy_from_slice(&vid.to_le_bytes());
-    headlenpow::encode(6, 1, 5, 5, "[5]byte", &body, 5)
+    headlenpow::encode(6, 1, 5, 5, "[5]uint8", &body, 5)
 }
 
 pub fn decode(data: &[u8]) -> Option<(bool, u32)> {
@@ -49,7 +49,7 @@ pub fn decode(data: &[u8]) -> Option<(bool, u32)> {
         || h.flags != 1
         || h.a != 5
         || h.b != 5
-        || h.langtype != "[5]byte"
+        || h.langtype != "[5]uint8"
         || h.body[0] > 1
     {
         return None;
