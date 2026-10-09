@@ -4,3 +4,6 @@ __pycache__/
 
 # OMC 运行时状态
 .omc/
+
+# CodeGraph 索引（本地知识图，不入库）
+.codegraph/
