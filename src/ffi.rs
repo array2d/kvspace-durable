@@ -12,6 +12,7 @@
 //
 // 注意：本层函数不得 panic 跨边界（panic 会 abort 进程）；调用方保证入参合法。
 
+use std::collections::HashMap;
 use std::ffi::CStr;
 use std::io::Write;
 use std::os::raw::{c_char, c_int};
@@ -27,24 +28,39 @@ use crate::xvalue_int::new_int64;
 
 // ── 句柄 ─────────────────────────────────────────────────────────────
 //
-// durable 无常驻映射：0copy 适配下沉到句柄内。读把每笔结果单独存进 read_bufs 借用池并返回
-// 其指针，池内缓冲同时存活至下一次写 flush（履约 kvspace.h「借用生命周期同该槽」，令单条指令
-// 的多个读操作数可同时借用）；写把整条 TLV 攒进 write_buf、置 pending_key，在**下一个可观察
-// 操作前**惰性 flush——body 由调用方在返回后填，返回前无法落盘，故落盘点恒为「下一次 op 或
-// Close」；漏 Close 的兜底由前端 atexit 兑现（见 kvspace.h 写原语注释、spec [[CABI]] 写侧落盘
-// 时机）。调用方从不 free、从不 commit。
+// durable 无常驻映射：0copy 适配下沉到句柄内。读按 **key → Vec<u8>** 常驻缓存：命中直接返回
+// 该副本指针，未命中读后端并缓存；指针寿命到该 key 被写/删或 handle close（履约 kvspace.h
+// 「借用生命周期到该 key 写/删」）。写把整条 TLV 攒进 write_buf、置 pending_key，在**下一个
+// 可观察操作前**惰性 flush——body 由调用方在返回后填，返回前无法落盘，故落盘点恒为「下一次
+// op 或 Close」；漏 Close 的兜底由前端 atexit 兑现（见 kvspace.h 写原语注释、spec [[CABI]]
+// 写侧落盘时机）。调用方从不 free、从不 commit。
+
+/// 控制键的双缓冲：每次读写入另一块，上一块保活到该 key 下一次读。
+pub struct VolatileBuf {
+    slots: [Vec<u8>; 2],
+    which: usize,
+}
+
+/// 外部可改写、必须每读重读后端的控制键（normative：见 spec CABI）。
+fn is_volatile(key: &str) -> bool {
+    key.starts_with("/vthread/") && key.ends_with("\u{2025}status")
+}
 
 pub struct Handle {
     kv: Box<dyn KVSpace>,
-    read_bufs: Vec<Vec<u8>>,
+    /// key → 该 key 最近一次读到的完整 XValue（常驻快照，无 eviction）。
+    read_cache: HashMap<String, Vec<u8>>,
+    /// 控制键：每次读重读后端；双缓冲保住上一视图。
+    volatile_cache: HashMap<String, VolatileBuf>,
+    /// Watch 替换缓存项时旧快照的保活区（冷路径，活到 Close）。
+    retired: Vec<Vec<u8>>,
     write_buf: Vec<u8>,
     pending_key: Option<String>,
     pending_meta: Option<(bool, u32)>,
 }
 
 impl Handle {
-    /// 落盘上一笔惰性写（调用方已把 body 填进 write_buf）。读借用池不在此清——
-    /// 借用生命周期同该槽、跨指令内的写仍有效；由 VM 在指令边界显式调 kvspaceReadReset 回收。
+    /// 落盘上一笔惰性写（调用方已把 body 填进 write_buf），并失效该 key 的读缓存。
     fn flush(&mut self) -> Result<(), String> {
         if let Some(key) = self.pending_key.take() {
             let meta = self.pending_meta.take();
@@ -58,22 +74,107 @@ impl Handle {
             if let Some((ro, vid)) = meta {
                 self.kv.set_metadata(&key, ro, vid)?;
             }
+            self.read_cache.remove(&key);
         }
         Ok(())
     }
 
-    /// 借入一段读缓冲：存进借用池、返回其常驻指针（活到下一次写 flush，调用方不得 free）。
-    fn lend(&mut self, buf: Vec<u8>, out: *mut *mut u8, out_len: *mut u32) {
-        self.read_bufs.push(buf);
-        let b = self.read_bufs.last_mut().unwrap();
+    fn cache_invalidate(&mut self, key: &str) {
+        self.read_cache.remove(key);
+        self.volatile_cache.remove(key);
+    }
+
+    fn cache_invalidate_tree(&mut self, prefix: &str) {
+        self.read_cache.retain(|k, _| !under_prefix(k, prefix));
+        self.volatile_cache.retain(|k, _| !under_prefix(k, prefix));
+    }
+}
+
+/// key 是否等于 prefix 或位于其下（`/` 或 `‥` 分隔）。
+fn under_prefix(key: &str, prefix: &str) -> bool {
+    if key == prefix {
+        return true;
+    }
+    if prefix.ends_with('/') || prefix.ends_with('\u{2025}') {
+        return key.starts_with(prefix);
+    }
+    key.strip_prefix(prefix)
+        .map(|rest| rest.starts_with('/') || rest.starts_with('\u{2025}'))
+        .unwrap_or(false)
+}
+
+/// 控制键重读后端并写入双缓冲的另一块（上一块保活到该 key 下一次读）。
+fn volatile_refresh(hd: &mut Handle, key: &str) -> bool {
+    let raw = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hd.kv.get_raw(key))) {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    let vb = hd
+        .volatile_cache
+        .entry(key.to_string())
+        .or_insert_with(|| VolatileBuf {
+            slots: [Vec::new(), Vec::new()],
+            which: 0,
+        });
+    vb.which ^= 1;
+    vb.slots[vb.which] = raw;
+    true
+}
+
+fn volatile_get(hd: &mut Handle, key: &str, out: *mut *mut u8, out_len: *mut u32) -> c_int {
+    if !volatile_refresh(hd, key) {
         unsafe {
+            *out = std::ptr::null_mut();
+            *out_len = 0;
+        }
+        return 1;
+    }
+    let vb = hd.volatile_cache.get_mut(key).unwrap();
+    let b = &mut vb.slots[vb.which];
+    unsafe {
+        if b.is_empty() {
+            *out = std::ptr::null_mut();
+            *out_len = 0;
+        } else {
             *out = b.as_mut_ptr();
             *out_len = b.len() as u32;
         }
     }
+    0
 }
 
-/// flush 上一笔惰性写后返回后端引用。任一步失败 → Err（调用方转 err/返回 1）。
+fn volatile_get_part(
+    hd: &mut Handle,
+    key: &str,
+    offset: u32,
+    len: u32,
+    out: *mut *mut u8,
+    out_len: *mut u32,
+) -> c_int {
+    if !volatile_refresh(hd, key) {
+        unsafe {
+            *out = std::ptr::null_mut();
+            *out_len = 0;
+        }
+        return 1;
+    }
+    let vb = hd.volatile_cache.get_mut(key).unwrap();
+    let b = &mut vb.slots[vb.which];
+    let s = (offset as usize).min(b.len());
+    let e = (s + len as usize).min(b.len());
+    unsafe {
+        if e <= s {
+            *out = std::ptr::null_mut();
+            *out_len = 0;
+        } else {
+            *out = b.as_mut_ptr().add(s);
+            *out_len = (e - s) as u32;
+        }
+    }
+    0
+}
+
+/// flush 上一笔惰性写后返回后端引用。任一步失败 → Err（调用方转 err/err 返回 1）。
 unsafe fn kv_flush<'a>(h: *mut Handle) -> Result<&'a mut dyn KVSpace, String> {
     let hd = h.as_mut().ok_or("kvspace: null handle")?;
     hd.flush()?;
@@ -213,7 +314,9 @@ pub extern "C" fn kvspaceConnect(dsn: *const c_char) -> *mut Handle {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| conn(dsn))) {
         Ok(kv) => Box::into_raw(Box::new(Handle {
             kv,
-            read_bufs: Vec::new(),
+            read_cache: HashMap::new(),
+            volatile_cache: HashMap::new(),
+            retired: Vec::new(),
             write_buf: Vec::new(),
             pending_key: None,
             pending_meta: None,
@@ -258,6 +361,18 @@ pub extern "C" fn kvspaceGet(
         }
         return 1;
     }
+    /* 控制键：每次重读后端，写进双缓冲的另一块；上一块保活到本 key 下一次读。 */
+    if is_volatile(&key) {
+        return volatile_get(hd, &key, out, out_len);
+    }
+    /* 命中：返回同一份常驻快照。绝不重读/替换——同指令两次读同一 key 的视图必须共存。 */
+    if let Some(b) = hd.read_cache.get_mut(&key) {
+        unsafe {
+            *out = b.as_mut_ptr();
+            *out_len = b.len() as u32;
+        }
+        return 0;
+    }
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hd.kv.get_raw(&key))) {
         Ok(raw) => {
             if raw.is_empty() {
@@ -266,7 +381,12 @@ pub extern "C" fn kvspaceGet(
                     *out_len = 0;
                 }
             } else {
-                hd.lend(raw, out, out_len);
+                hd.read_cache.insert(key.clone(), raw);
+                let b = hd.read_cache.get_mut(&key).unwrap();
+                unsafe {
+                    *out = b.as_mut_ptr();
+                    *out_len = b.len() as u32;
+                }
             }
             0
         }
@@ -319,7 +439,14 @@ pub extern "C" fn kvspaceSetValue(
         hd.kv.set_metadata(&key, ro != 0, vid)
     }));
     match result {
-        Ok(result) => result_to_code(result, err, err_cap),
+        Ok(result) => {
+            let code = result_to_code(result, err, err_cap);
+            if code == 0 {
+                /* 写后失效：不把写值留在读缓存里，避免写密集负载无界占用。 */
+                hd.read_cache.remove(&key);
+            }
+            code
+        }
         Err(_) => {
             write_err(err, err_cap, "SetValue backend panic");
             1
@@ -327,16 +454,7 @@ pub extern "C" fn kvspaceSetValue(
     }
 }
 
-/// 借指令边界回收读借用池：VM 每条指令执行完调用一次。durable 惰性写不再清池，
-/// 全部读借用在此统一失效（shm 常驻映射侧为 no-op）。
-#[no_mangle]
-pub extern "C" fn kvspaceReadReset(h: *mut Handle) {
-    if let Some(hd) = unsafe { h.as_mut() } {
-        hd.read_bufs.clear();
-    }
-}
-
-/// 定位读：借用读 key 值的 [offset, offset+len) 字节，*out 指向读借用池（活到 ReadReset，调用方不得 free）。
+/// 定位读：借用读 key 值的 [offset, offset+len) 字节，*out 指向该 key 读缓存（活到该 key 被写/删或 close，调用方不得 free）。
 /// 空/不存在/越界为空 → *out=NULL、out_len=0。
 #[no_mangle]
 pub extern "C" fn kvspaceGetPart(
@@ -359,28 +477,44 @@ pub extern "C" fn kvspaceGetPart(
         }
         return 1;
     }
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        hd.kv.get_part(&key, offset, len)
-    })) {
-        Ok(buf) => {
-            if buf.is_empty() {
+    if is_volatile(&key) {
+        return volatile_get_part(hd, &key, offset, len, out, out_len);
+    }
+    /* 缓存的是整值：GetPart 未命中先取整值再切片（与后端 get_part 同字节）。 */
+    if !hd.read_cache.contains_key(&key) {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hd.kv.get_raw(&key))) {
+            Ok(raw) => {
+                if raw.is_empty() {
+                    unsafe {
+                        *out = std::ptr::null_mut();
+                        *out_len = 0;
+                    }
+                    return 0;
+                }
+                hd.read_cache.insert(key.clone(), raw);
+            }
+            Err(_) => {
                 unsafe {
                     *out = std::ptr::null_mut();
                     *out_len = 0;
                 }
-            } else {
-                hd.lend(buf, out, out_len);
+                return 1;
             }
-            0
-        }
-        Err(_) => {
-            unsafe {
-                *out = std::ptr::null_mut();
-                *out_len = 0;
-            }
-            1
         }
     }
+    let b = hd.read_cache.get_mut(&key).unwrap();
+    let s = (offset as usize).min(b.len());
+    let e = (s + len as usize).min(b.len());
+    unsafe {
+        if e <= s {
+            *out = std::ptr::null_mut();
+            *out_len = 0;
+        } else {
+            *out = b.as_mut_ptr().add(s);
+            *out_len = (e - s) as u32;
+        }
+    }
+    0
 }
 
 /// 定位写：就地写 buf 到 key 值的 [offset, offset+buf_len)（key 须已存在、不改结构）。立即持久，非惰性。
@@ -409,7 +543,11 @@ pub extern "C" fn kvspaceSetPart(
     }))
     .map_err(panic_msg)
     .and_then(|x| x);
-    result_to_code(r, err, err_cap)
+    let code = result_to_code(r, err, err_cap);
+    if code == 0 {
+        hd.read_cache.remove(&key);
+    }
+    code
 }
 
 /// 读 head：只读值前缀并解码三正交轴 head（不取 body）。空/不存在 → 返回 1。
@@ -496,6 +634,7 @@ pub extern "C" fn kvspaceWriteInPlace(
             return 1;
         }
     };
+    hd.read_cache.remove(&key);
     hd.write_buf = existing;
     hd.pending_key = Some(key);
     hd.pending_meta = Some(meta);
@@ -538,6 +677,7 @@ pub extern "C" fn kvspaceWriteNewPlace(
         return 1;
     };
     let head_len = tlv.len() - cap;
+    hd.read_cache.remove(&key);
     hd.write_buf = tlv;
     hd.pending_key = Some(key);
     hd.pending_meta = Some((ro != 0, vid));
@@ -640,7 +780,13 @@ pub extern "C" fn kvspaceDel(
     let keys: Vec<String> = (0..nkeys as usize)
         .map(|i| unsafe { cstr(*keys.add(i)) }.to_string())
         .collect();
-    result_to_code(catch_panic(|| kv.del(&keys)), err, err_cap)
+    let code = result_to_code(catch_panic(|| kv.del(&keys)), err, err_cap);
+    if let Some(hd) = unsafe { h.as_mut() } {
+        for k in &keys {
+            hd.cache_invalidate(k);
+        }
+    }
+    code
 }
 
 #[no_mangle]
@@ -657,11 +803,12 @@ pub extern "C" fn kvspaceDelTree(
             return 1;
         }
     };
-    result_to_code(
-        catch_panic(|| kv.del_tree(unsafe { cstr(prefix) })),
-        err,
-        err_cap,
-    )
+    let prefix = unsafe { cstr(prefix) }.to_string();
+    let code = result_to_code(catch_panic(|| kv.del_tree(&prefix)), err, err_cap);
+    if let Some(hd) = unsafe { h.as_mut() } {
+        hd.cache_invalidate_tree(&prefix);
+    }
+    code
 }
 
 #[no_mangle]
@@ -679,11 +826,13 @@ pub extern "C" fn kvspaceCp(
             return 1;
         }
     };
-    result_to_code(
-        catch_panic(|| kv.cp(unsafe { cstr(src) }, unsafe { cstr(dst) })),
-        err,
-        err_cap,
-    )
+    let src = unsafe { cstr(src) }.to_string();
+    let dst = unsafe { cstr(dst) }.to_string();
+    let code = result_to_code(catch_panic(|| kv.cp(&src, &dst)), err, err_cap);
+    if let Some(hd) = unsafe { h.as_mut() } {
+        hd.cache_invalidate(&dst);
+    }
+    code
 }
 
 #[no_mangle]
@@ -701,11 +850,13 @@ pub extern "C" fn kvspaceCpTree(
             return 1;
         }
     };
-    result_to_code(
-        catch_panic(|| kv.cp_tree(unsafe { cstr(src) }, unsafe { cstr(dst) })),
-        err,
-        err_cap,
-    )
+    let src = unsafe { cstr(src) }.to_string();
+    let dst = unsafe { cstr(dst) }.to_string();
+    let code = result_to_code(catch_panic(|| kv.cp_tree(&src, &dst)), err, err_cap);
+    if let Some(hd) = unsafe { h.as_mut() } {
+        hd.cache_invalidate_tree(&dst);
+    }
+    code
 }
 
 #[no_mangle]
@@ -723,11 +874,13 @@ pub extern "C" fn kvspaceCpList(
             return 1;
         }
     };
-    result_to_code(
-        catch_panic(|| kv.cp_list(unsafe { cstr(src) }, unsafe { cstr(dst) })),
-        err,
-        err_cap,
-    )
+    let src = unsafe { cstr(src) }.to_string();
+    let dst = unsafe { cstr(dst) }.to_string();
+    let code = result_to_code(catch_panic(|| kv.cp_list(&src, &dst)), err, err_cap);
+    if let Some(hd) = unsafe { h.as_mut() } {
+        hd.cache_invalidate_tree(&dst);
+    }
+    code
 }
 
 #[no_mangle]
@@ -816,14 +969,19 @@ pub extern "C" fn kvspaceWatch(
         }
         return 1;
     }
+    let key = unsafe { cstr(key) }.to_string();
     let target_v =
         decode_xvalue(unsafe { std::slice::from_raw_parts(target, target_len as usize) });
-    let v = hd.kv.watch(
-        unsafe { cstr(key) },
-        &target_v,
-        Duration::from_nanos(tick_ns),
-    );
-    hd.lend(v.encode(), out, out_len);
+    let v = hd.kv.watch(&key, &target_v, Duration::from_nanos(tick_ns));
+    if let Some(old) = hd.read_cache.remove(&key) {
+        hd.retired.push(old); /* 旧视图保活到 Close（watch 是冷路径） */
+    }
+    hd.read_cache.insert(key.clone(), v.encode());
+    let b = hd.read_cache.get_mut(&key).unwrap();
+    unsafe {
+        *out = b.as_mut_ptr();
+        *out_len = b.len() as u32;
+    }
     0
 }
 
@@ -836,7 +994,13 @@ pub extern "C" fn kvspaceClear(h: *mut Handle, err: *mut c_char, err_cap: u32) -
             return 1;
         }
     };
-    result_to_code(catch_panic(|| kv.clear()), err, err_cap)
+    let code = result_to_code(catch_panic(|| kv.clear()), err, err_cap);
+    if code == 0 {
+        if let Some(hd) = unsafe { h.as_mut() } {
+            hd.read_cache.clear();
+        }
+    }
+    code
 }
 
 // ── XValue 编解码（head/TLV + 标准标量构造器） ─────────────────────────
