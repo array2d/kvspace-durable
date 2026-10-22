@@ -518,8 +518,8 @@ pub fn decode_xvalue_head(data: &[u8]) -> XValueHead {
 /// 解析完整 XValue（head + body）为 XValue。
 pub fn decode_xvalue(data: &[u8]) -> XValue {
     let h = decode_xvalue_head(data);
-    // An empty inline langtype denotes None.
-    if h.langtype.is_empty() && !h.is_ptr() {
+    // An empty inline langtype denotes None；Ptr/Ext 的空 langtype 表示「目标不约束」。
+    if h.langtype.is_empty() && !h.is_ptr() && h.r#ref() != REF_EXT as i32 {
         return XValue::None;
     }
     h.decode(h.body(data))
@@ -609,6 +609,12 @@ mod tests {
         roundtrip(&new_char_byte(b"hello"));
         roundtrip(&new_char_byte(b""));
         roundtrip(&new_ptr("int64", "/x/y"));
+        // 空 kindexpr = 不约束：Ptr 目标允许为空（EXT 同理，见 [[文法与合法性]]）。
+        roundtrip(&new_ptr("", "/x/y"));
+        roundtrip(&XValue::Ext(ExtHandle {
+            langtype: String::new(),
+            locator: "/lib/x".into(),
+        }));
         roundtrip(&XValue::Int32(Arr {
             data: vec![1, 2, 3, 4, 5, 6],
             dims: vec![2, 3],
