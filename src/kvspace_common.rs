@@ -127,11 +127,8 @@ pub fn validate_ptr(
     if target.is_empty() || target_kindexpr.is_empty() {
         return Ok(());
     }
-    // `any` 是通配：声明 any 的形参接受任意类型实参（见 [[文法与合法性]]）。逐字比较会把
-    // 一切都判为不符——曾致 `rwfunc f(a:any)` 的实参 Ptr 全被拒写、帧槽丢参数直接 panic。
-    if target_kindexpr == "any" {
-        return Ok(());
-    }
+    // 空 kindexp（`name:` / `*`）= 不约束，已在上面放行；`any` 不再是类型名，落到
+    // 精确比较并报 kind mismatch（不得当通配放行）。
     let v = get_one(kv, target);
     if is_none(&v) {
         return Ok(());

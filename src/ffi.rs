@@ -1088,7 +1088,12 @@ pub extern "C" fn kvspaceNewPtr(
     out: *mut *mut u8,
     out_len: *mut u32,
 ) -> c_int {
-    let v = new_ptr(unsafe { cstr(target_kindexpr) }, unsafe { cstr(target) });
+    let kindexpr = unsafe { cstr(target_kindexpr) };
+    // `any` 不是类型名（空 kindexpr = 不约束，见 spec [[文法与合法性]]）。
+    if kindexpr == "any" {
+        return 1;
+    }
+    let v = new_ptr(kindexpr, unsafe { cstr(target) });
     alloc(v.encode(), out, out_len)
 }
 

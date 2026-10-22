@@ -147,7 +147,7 @@ pub fn decode(data: &[u8]) -> Option<Head<'_>> {
             (size, size)
         }
         3 | 5 => {
-            if langtype.is_empty() || a == 0 || a > b || min_pow(type_len)? != pow {
+            if a == 0 || a > b || min_pow(type_len)? != pow {
                 return None;
             }
             (a, b)
@@ -256,9 +256,7 @@ pub fn reserve(flags: u8, langtype: &str, content: usize, cap: usize) -> Option<
             }
             (7, numel, width)
         }
-        3 | 5 if !langtype.is_empty() && content > 0 => {
-            (min_pow(langtype.len())?, content as u64, cap as u64)
-        }
+        3 | 5 if content > 0 => (min_pow(langtype.len())?, content as u64, cap as u64),
         _ => return None,
     };
     let headlen = 1usize.checked_shl(pow as u32)?;
