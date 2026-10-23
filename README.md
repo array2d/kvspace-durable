@@ -29,7 +29,7 @@ C ABI exported from the cdylib (`src/ffi.rs`):
 - enumerate / delete / copy: `kvspaceListLen`, `kvspaceListAt`, `kvspaceDel`, `kvspaceDelTree`, `kvspaceCp`, `kvspaceCpTree`
 - directories / extindex: `kvspaceMkindex`, `kvspaceMkindexExt`, `kvspaceRmindexExt`
 - watch / clear: `kvspaceWatch`, `kvspaceClear`
-- XValue codec (frontend malloc, caller `free()`s): `kvspaceTlvEncode`, `kvspaceTlvEncodeMode`, `kvspaceDecodeHead`, `kvspaceNewPtr`, `kvspaceNewChar`, `kvspaceNewBool`, `kvspaceNewInt64`, `kvspaceNewFloat64`
+- XValue codec (frontend malloc, caller `free()`s): `kvspaceXvalueEncode`, `kvspaceXvalueEncodeMode`, `kvspaceDecodeHead`, `kvspaceNewPtr`, `kvspaceNewChar`, `kvspaceNewBool`, `kvspaceNewInt64`, `kvspaceNewFloat64`
 
 The same ABI is implemented by `kvspace-c` (`shm://`), so a consumer (e.g. the kvlang layout) switches backends by DSN only, with no code change.
 

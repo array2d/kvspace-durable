@@ -11,7 +11,7 @@
 use kvspace_durable::ffi::*;
 
 /// 64KB 级 char/utf8 值：[n]char/utf8，body 全 0（仅用于内存观测）。
-fn tlv_pad(n: usize) -> Vec<u8> {
+fn xvalue_pad(n: usize) -> Vec<u8> {
     let mut v = vec![0u8; 64 + n];
     v[0] = 6; // headlen = 64
     v[1] = 1; // flags: array/storetype 1
@@ -22,7 +22,7 @@ fn tlv_pad(n: usize) -> Vec<u8> {
     v
 }
 
-fn tlv_i64(n: i64) -> Vec<u8> {
+fn xvalue_i64(n: i64) -> Vec<u8> {
     let mut v = vec![0u8; 40];
     v[0] = 5; // headlen = 32
     v[18..23].copy_from_slice(b"int64");
@@ -33,7 +33,7 @@ fn tlv_i64(n: i64) -> Vec<u8> {
 unsafe fn set(h: *mut Handle, key: &str, n: i64) {
     let mut k = key.as_bytes().to_vec();
     k.push(0);
-    let v = tlv_i64(n);
+    let v = xvalue_i64(n);
     let mut err = [0i8; 128];
     let rc = kvspaceSetValue(
         h,
@@ -191,7 +191,7 @@ fn memory_growth() {
     unsafe {
         for i in 0..N {
             let key = format!("/k{i}");
-            let v = tlv_pad(64 * 1024);
+            let v = xvalue_pad(64 * 1024);
             let mut k = key.as_bytes().to_vec();
             k.push(0);
             assert_eq!(
@@ -245,7 +245,7 @@ fn same_key_two_reads_and_watch_retire() {
         assert_eq!(read_i64(p2, l2), 7);
 
         // watch 同 key：目标值就是当前值，立即返回；旧视图必须仍然有效。
-        let tv = tlv_i64(7);
+        let tv = xvalue_i64(7);
         let mut wp: *mut u8 = std::ptr::null_mut();
         let mut wl: u32 = 0;
         let rc = kvspaceWatch(
@@ -267,7 +267,7 @@ fn same_key_two_reads_and_watch_retire() {
     std::fs::remove_dir_all(dsn.trim_start_matches("fs://")).ok();
 }
 
-fn tlv_utf8(s: &str) -> Vec<u8> {
+fn xvalue_utf8(s: &str) -> Vec<u8> {
     let n = s.len();
     let mut v = vec![0u8; 64 + n];
     v[0] = 6;
@@ -286,7 +286,7 @@ unsafe fn read_str(p: *const u8, l: u32) -> String {
 }
 
 unsafe fn set_str(h: *mut Handle, key: &str, s: &str) {
-    let v = tlv_utf8(s);
+    let v = xvalue_utf8(s);
     let mut k = key.as_bytes().to_vec();
     k.push(0);
     assert_eq!(

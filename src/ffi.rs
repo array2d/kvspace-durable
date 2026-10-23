@@ -1,13 +1,13 @@
 // ffi.rs — kvspace-durable 的 C ABI 暴露层。
 //
 // 目的：让 kvlang-layout（Rust）、kvlang-runtime（C/C++）等第三方语言只通过
-// extern "C" 符号表调用本库，不接触 Rust 类型。所有 XValue 以 TLV 字节跨边界。
+// extern "C" 符号表调用本库，不接触 Rust 类型。所有 XValue 以 head+body 字节跨边界。
 //
 // 约定：
 //   - 句柄：kvspaceConnect 返回 *mut Handle（Box<dyn KVSpace>），kvspaceClose 释放。
 //   - 输入字符串：*const c_char（NUL 终止）；输入字节：*const u8 + u32 len。
 //   - 读出字节：kvspaceGet/ListAt 返回句柄内常驻/回收缓冲的借用偏移指针，调用方不得 free；
-//     codec（TlvEncode/New*）产出为 frontend malloc 缓冲，调用方以 libc free 释放。
+//     codec（XvalueEncode/New*）产出为 frontend malloc 缓冲，调用方以 libc free 释放。
 //   - 错误：返回 c_int（0=成功，1=失败），失败信息写入 err 缓冲（err_cap 上限）。
 //
 // 注意：本层函数不得 panic 跨边界（panic 会 abort 进程）；调用方保证入参合法。
@@ -30,7 +30,7 @@ use crate::xvalue_int::new_int64;
 //
 // durable 无常驻映射：0copy 适配下沉到句柄内。读按 **key → Vec<u8>** 常驻缓存：命中直接返回
 // 该副本指针，未命中读后端并缓存；指针寿命到该 key 被写/删或 handle close（履约 kvspace.h
-// 「借用生命周期到该 key 写/删」）。写把整条 TLV 攒进 write_buf、置 pending_key，在**下一个
+// 「借用生命周期到该 key 写/删」）。写把整条 XValue 攒进 write_buf、置 pending_key，在**下一个
 // 可观察操作前**惰性 flush——body 由调用方在返回后填，返回前无法落盘，故落盘点恒为「下一次
 // op 或 Close」；漏 Close 的兜底由前端 atexit 兑现（见 kvspace.h 写原语注释、spec [[CABI]]
 // 写侧落盘时机）。调用方从不 free、从不 commit。
@@ -64,12 +64,12 @@ impl Handle {
     fn flush(&mut self) -> Result<(), String> {
         if let Some(key) = self.pending_key.take() {
             let meta = self.pending_meta.take();
-            let tlv = std::mem::take(&mut self.write_buf);
-            let val = decode_xvalue(&tlv);
+            let xv = std::mem::take(&mut self.write_buf);
+            let val = decode_xvalue(&xv);
             self.kv.set(&[KVPair {
                 key: key.clone(),
                 val,
-                raw: Some(tlv),
+                raw: Some(xv),
             }])?;
             if let Some((ro, vid)) = meta {
                 self.kv.set_metadata(&key, ro, vid)?;
@@ -181,7 +181,7 @@ unsafe fn kv_flush<'a>(h: *mut Handle) -> Result<&'a mut dyn KVSpace, String> {
     Ok(&mut *hd.kv)
 }
 
-fn build_tlv(
+fn build_xvalue_head(
     r#ref: u8,
     storetype: u8,
     langtype: &str,
@@ -672,13 +672,13 @@ pub extern "C" fn kvspaceWriteNewPlace(
         write_err(err, err_cap, "capacity exceeds platform size");
         return 1;
     };
-    let Some(tlv) = build_tlv(r#ref, storetype, lt, body_len as usize, cap) else {
+    let Some(xv) = build_xvalue_head(r#ref, storetype, lt, body_len as usize, cap) else {
         write_err(err, err_cap, "invalid XValue geometry");
         return 1;
     };
-    let head_len = tlv.len() - cap;
+    let head_len = xv.len() - cap;
     hd.read_cache.remove(&key);
-    hd.write_buf = tlv;
+    hd.write_buf = xv;
     hd.pending_key = Some(key);
     hd.pending_meta = Some((ro != 0, vid));
     unsafe { *body = hd.write_buf.as_mut_ptr().add(head_len) };
@@ -1003,12 +1003,12 @@ pub extern "C" fn kvspaceClear(h: *mut Handle, err: *mut c_char, err_cap: u32) -
     code
 }
 
-// ── XValue 编解码（head/TLV + 标准标量构造器） ─────────────────────────
+// ── XValue 编解码（head + 标准标量构造器） ─────────────────────────────
 
-/// 通用 TLV 编码（内联，ref=0）。dims/ndim 直接落盘：ndim=0 标量，dims 可为 NULL。
+/// 通用 XValue 编码（内联，ref=0）。dims/ndim 直接落盘：ndim=0 标量，dims 可为 NULL。
 /// kvlang 的自有 kind（rwir/rwfunc/scope）经此构造：body 由 kvlang 自己编码。
 #[no_mangle]
-pub extern "C" fn kvspaceTlvEncode(
+pub extern "C" fn kvspaceXvalueEncode(
     kind: *const c_char,
     raw: *const u8,
     raw_len: u32,
@@ -1028,7 +1028,7 @@ pub extern "C" fn kvspaceTlvEncode(
 
 /// 带权限编码：显式指定 ref（0/1/2）、ro（1=只读）、vid。用于权限位落盘。
 #[no_mangle]
-pub extern "C" fn kvspaceTlvEncodeMode(
+pub extern "C" fn kvspaceXvalueEncodeMode(
     kind: *const c_char,
     raw: *const u8,
     raw_len: u32,
@@ -1079,7 +1079,7 @@ pub extern "C" fn kvspaceDecodeHead(
     0
 }
 
-// ── 标准标量构造器（返回完整 TLV 字节） ───────────────────────────────
+// ── 标准标量构造器（返回完整 XValue 字节） ─────────────────────────────
 
 #[no_mangle]
 pub extern "C" fn kvspaceNewPtr(
