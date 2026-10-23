@@ -8,7 +8,7 @@ use crate::xvalue::XValue;
 pub struct KVPair {
     pub key: String,
     pub val: XValue,
-    pub raw: Option<Vec<u8>>, // 原始 TLV 字节：Set 透传，保留 head 权限位（ro/vid）
+    pub raw: Option<Vec<u8>>, // 原始 XValue 字节：Set 透传，保留 head 权限位（ro/vid）
 }
 
 /// KVSpace KV 存储接口。

@@ -1,6 +1,6 @@
 // xvalue.rs — 对齐 xvalue.go
 // XValue 是所有值的统一枚举（Go 的 interface + 具体类型 → 枚举变体）。
-// XValueHead + TLV 编解码（head + body）。
+// XValueHead + XValue 编解码（head + body）。
 
 use crate::r#const::*;
 
@@ -242,7 +242,7 @@ impl XValue {
     pub fn encode(&self) -> Vec<u8> {
         match self {
             XValue::None => encode_head("None", 0, &[], &[]),
-            XValue::Ptr(p) => tlv_encode_ptr(&p.target_kindexpr, p.target.as_bytes()),
+            XValue::Ptr(p) => xvalue_encode_ptr(&p.target_kindexpr, p.target.as_bytes()),
             XValue::Bool(d) => crate::xvalue_bool::encode_bool(&d.data, &d.dims),
             XValue::Int8(d) => crate::xvalue_int::encode_int8(&d.data, &d.dims),
             XValue::Int16(d) => crate::xvalue_int::encode_int16(&d.data, &d.dims),
@@ -259,7 +259,7 @@ impl XValue {
             XValue::Char32(d) => crate::xvalue_byte::encode_char32(&d.data, &d.dims),
             XValue::Map(m) => encode_head(&m.langtype, 0, &[], &[]),
             XValue::Ext(e) => encode_head(&e.langtype, 2, &[], e.locator.as_bytes()),
-            XValue::Opaque(o) => tlv_encode(&o.kind, &o.body, o.array_len),
+            XValue::Opaque(o) => xvalue_encode(&o.kind, &o.body, o.array_len),
         }
     }
 
@@ -386,13 +386,13 @@ fn bool_string(b: bool) -> String {
 
 // Headlenpow XValue encoding.
 
-pub fn tlv_encode(kind: &str, raw: &[u8], array_len: i32) -> Vec<u8> {
+pub fn xvalue_encode(kind: &str, raw: &[u8], array_len: i32) -> Vec<u8> {
     encode_head(kind, 0, &array_to_header(kind, array_len), raw)
 }
 
 /// 指针编码：langtype = 目标完整 kindexpr（含其 [dims]/引用性），storetype = 目标语义 storetype，
 /// 物理字段恒空，body = 目标 key 路径。
-pub fn tlv_encode_ptr(target_kindexpr: &str, raw: &[u8]) -> Vec<u8> {
+pub fn xvalue_encode_ptr(target_kindexpr: &str, raw: &[u8]) -> Vec<u8> {
     encode_head(target_kindexpr, 1, &[], raw)
 }
 
