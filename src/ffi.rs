@@ -1148,3 +1148,114 @@ pub extern "C" fn kvspaceSlotView(
 ) -> c_int {
     -2
 }
+
+// ── P2 view token（shm-only）────────────────────────────────────────
+//
+// 与 kvspace/include/kvspace/kvspace.h 的 kvspaceViewToken_t 逐字段一致。
+// durable 后端没有映射内槽与垃圾环，全部恒返回 -2（不支持）；调用方（runtime）
+// 见 -2 即回退既有读写 API，且每个句柄只判定一次。没有 kvspaceViewRelease：
+// 历史上从未导出该符号。
+
+#[repr(C)]
+pub struct KvspaceViewToken {
+    pub head: *mut u8,
+    pub body: *mut u8,
+    pub headlen: u32,
+    pub value_len: u32,
+    pub cap: u64,
+    pub body_cap: u64,
+    pub struct_gen: u32,
+    pub value_gen: u32,
+    pub store_id: u64,
+    pub node_id: u32,
+    pub _pad: u32,
+}
+
+#[no_mangle]
+pub extern "C" fn kvspaceViewSweep(_h: *mut Handle) -> c_int {
+    -2
+}
+
+#[no_mangle]
+pub extern "C" fn kvspaceViewResolvePrefix(
+    _h: *mut Handle,
+    _path: *const c_char,
+    _ref: *mut std::ffi::c_void,
+) -> c_int {
+    -2
+}
+
+#[no_mangle]
+pub extern "C" fn kvspaceViewResolve(
+    _h: *mut Handle,
+    _key: *const c_char,
+    _tok: *mut KvspaceViewToken,
+) -> c_int {
+    -2
+}
+
+#[no_mangle]
+pub extern "C" fn kvspaceViewFromRef(
+    _h: *mut Handle,
+    _r: *const std::ffi::c_void,
+    _key: *const c_char,
+    _tok: *mut KvspaceViewToken,
+) -> c_int {
+    -2
+}
+
+#[no_mangle]
+pub extern "C" fn kvspaceViewResolveFrom(
+    _h: *mut Handle,
+    _parent: *const std::ffi::c_void,
+    _rel: *const c_char,
+    _tok: *mut KvspaceViewToken,
+) -> c_int {
+    -2
+}
+
+#[no_mangle]
+pub extern "C" fn kvspaceViewCheck(
+    _h: *mut Handle,
+    _tok: *const KvspaceViewToken,
+) -> c_int {
+    -2
+}
+
+#[no_mangle]
+pub extern "C" fn kvspaceViewWrite(
+    _h: *mut Handle,
+    _tok: *mut KvspaceViewToken,
+    _data: *const u8,
+    _len: u32,
+) -> c_int {
+    -2
+}
+
+#[no_mangle]
+pub extern "C" fn kvspaceViewDel(
+    _h: *mut Handle,
+    _tok: *mut KvspaceViewToken,
+    _key: *const c_char,
+) -> c_int {
+    -2
+}
+
+#[no_mangle]
+pub extern "C" fn kvspaceViewRefresh(
+    _h: *mut Handle,
+    _tok: *mut KvspaceViewToken,
+    _key: *const c_char,
+) -> c_int {
+    -2
+}
+
+#[no_mangle]
+pub extern "C" fn kvspaceViewAck(_h: *mut Handle, _epoch: *mut u32) -> c_int {
+    -2
+}
+
+#[no_mangle]
+pub extern "C" fn kvspaceViewQuiesce(_h: *mut Handle, _on: c_int) -> c_int {
+    -2
+}
