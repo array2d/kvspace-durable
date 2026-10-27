@@ -1128,9 +1128,9 @@ pub extern "C" fn kvspaceNewFloat64(v: f64, out: *mut *mut u8, out_len: *mut u32
 
 // ── slot view（shm-only）─────────────────────────────────────────────
 
-/// 与 kvspace/include/kvspace/kvspace.h 的 kvspaceSlotView_t 逐字段一致。
+/// 与 kvspace/include/kvspace/kvspace.h 的 kvspaceXvalueBodyView_t 逐字段一致。
 #[repr(C)]
-pub struct KvspaceSlotView {
+pub struct KvspaceXvalueBodyView {
     pub head: *mut u8,
     pub headlen: u32,
     pub body: *mut u8,
@@ -1140,11 +1140,11 @@ pub struct KvspaceSlotView {
 
 /// durable 后端没有映射内槽：恒返回 -2（不支持），调用方回退既有读写 API。
 #[no_mangle]
-pub extern "C" fn kvspaceSlotView(
+pub extern "C" fn kvspaceXvalueBodyView(
     _h: *mut Handle,
     _r: *const std::ffi::c_void,
     _key: *const c_char,
-    _out: *mut KvspaceSlotView,
+    _out: *mut KvspaceXvalueBodyView,
 ) -> c_int {
     -2
 }
