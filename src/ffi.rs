@@ -53,22 +53,72 @@ pub struct Handle {
     retired: Vec<Vec<u8>>,
     write_buf: Vec<u8>,
     pending_key: Option<String>,
+    /// Cached child list for `ListLen` followed by sequential `ListAt(i)` traversal.
+    list_snapshot: Option<ListSnapshot>,
+}
+
+struct ListSnapshot {
+    prefix: String,
+    expand_ext: bool,
+    resolve: bool,
+    names: Vec<String>,
 }
 
 impl Handle {
     /// 落盘上一笔惰性写（调用方已把 body 填进 write_buf），并失效该 key 的读缓存。
+    /// Catches backend panics (Redis disconnect/timeout, fs I/O error) and converts them into
+    /// `Err` so they never unwind across `extern "C"`.
     fn flush(&mut self) -> Result<(), String> {
         if let Some(key) = self.pending_key.take() {
             let xv = std::mem::take(&mut self.write_buf);
-            let val = from_wire(&xv);
-            self.kv.set(&[KVPair {
-                key: key.clone(),
-                val,
-                raw: Some(xv),
-            }])?;
+            self.list_snapshot = None;
+            let kv = &mut self.kv;
+            let k = key.clone();
+            let r = catch_panic(move || {
+                let val = from_wire(&xv);
+                kv.set(&[KVPair {
+                    key: k,
+                    val,
+                    raw: Some(xv),
+                }])
+            });
             self.read_cache.remove(&key);
+            r?;
         }
         Ok(())
+    }
+
+    /// Returns child names under `prefix`, reusing the snapshot when valid.
+    fn list_names(
+        &mut self,
+        prefix: &str,
+        expand_ext: bool,
+        resolve: bool,
+        fresh: bool,
+    ) -> Result<&[String], String> {
+        let reuse = !fresh
+            && self.list_snapshot.as_ref().is_some_and(|s| {
+                s.prefix == prefix && s.expand_ext == expand_ext && s.resolve == resolve
+            });
+        if !reuse {
+            self.list_snapshot = None;
+            let kv = &mut self.kv;
+            let names = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                kv.list(prefix, expand_ext, resolve)
+            }))
+            .map_err(panic_msg)?;
+            self.list_snapshot = Some(ListSnapshot {
+                prefix: prefix.to_string(),
+                expand_ext,
+                resolve,
+                names,
+            });
+        }
+        Ok(&self
+            .list_snapshot
+            .as_ref()
+            .expect("snapshot just set")
+            .names)
     }
 
     fn cache_invalidate(&mut self, key: &str) {
@@ -182,8 +232,10 @@ fn volatile_get_part(
 }
 
 /// flush 上一笔惰性写后返回后端引用。任一步失败 → Err（调用方转 err/err 返回 1）。
+/// Used by mutating structure ops (`Del`/`DelTree`/`Cp*`/`Mkindex*`/`RmindexExt`/`Clear`); clears `list_cache`.
 unsafe fn kv_flush<'a>(h: *mut Handle) -> Result<&'a mut dyn KVSpace, String> {
     let hd = h.as_mut().ok_or("kvspace: null handle")?;
+    hd.list_snapshot = None;
     hd.flush()?;
     Ok(&mut *hd.kv)
 }
@@ -326,6 +378,7 @@ pub extern "C" fn kvspaceConnect(dsn: *const c_char) -> *mut Handle {
             retired: Vec::new(),
             write_buf: Vec::new(),
             pending_key: None,
+            list_snapshot: None,
         })),
         Err(_) => std::ptr::null_mut(),
     }
@@ -433,6 +486,7 @@ pub extern "C" fn kvspaceSetValue(
         return 1;
     }
     let raw = raw.to_vec();
+    hd.list_snapshot = None;
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let val = from_wire(&raw);
         hd.kv.set(&[KVPair {
@@ -541,6 +595,7 @@ pub extern "C" fn kvspaceSetPart(
     }
     let key = unsafe { cstr(key) }.to_string();
     let data = unsafe { std::slice::from_raw_parts(buf, buf_len as usize) };
+    hd.list_snapshot = None;
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         hd.kv.set_part(&key, offset, data)
     }))
@@ -606,7 +661,14 @@ pub extern "C" fn kvspaceWriteInPlace(
         return 1;
     }
     let key = unsafe { cstr(key) }.to_string();
-    let existing = hd.kv.get_raw(&key);
+    let existing =
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hd.kv.get_raw(&key))) {
+            Ok(v) => v,
+            Err(p) => {
+                write_err(err, err_cap, &panic_msg(p));
+                return 1;
+            }
+        };
     if existing.is_empty() {
         write_err(err, err_cap, "kvspace: write-in-place on missing key");
         return 1;
@@ -690,11 +752,10 @@ pub extern "C" fn kvspaceListLen(
         unsafe { *out_count = 0 };
         return 1;
     }
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        hd.kv.list_len(&prefix, expand_ext != 0, resolve != 0)
-    })) {
-        Ok(n) => {
-            unsafe { *out_count = n };
+    /* Always re-list so callers polling child count observe external additions; snapshot serves ListAt. */
+    match hd.list_names(&prefix, expand_ext != 0, resolve != 0, true) {
+        Ok(names) => {
+            unsafe { *out_count = names.len() as i32 };
             0
         }
         Err(_) => {
@@ -726,14 +787,15 @@ pub extern "C" fn kvspaceListAt(
         *out_len = 0;
     }
     let prefix = unsafe { cstr(prefix) }.to_string();
-    if hd.flush().is_err() || hd.kv.validate_dir(&prefix).is_err() {
+    if idx < 0 || hd.flush().is_err() || hd.kv.validate_dir(&prefix).is_err() {
         return 1;
     }
-    let name = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        hd.kv.list_at(&prefix, idx, expand_ext != 0, resolve != 0)
-    })) {
-        Ok(Some(n)) => n,
-        Ok(None) => return 1,
+    /* Reuse snapshot when parameters match without intervening writes. */
+    let name = match hd.list_names(&prefix, expand_ext != 0, resolve != 0, false) {
+        Ok(names) => match names.get(idx as usize) {
+            Some(n) => n.clone(),
+            None => return 1,
+        },
         Err(_) => return 1,
     };
     let name = name.as_bytes();
@@ -961,7 +1023,19 @@ pub extern "C" fn kvspaceWatch(
     let target_v = from_wire(unsafe {
         std::slice::from_raw_parts(target, target_len as usize)
     });
-    let v = hd.kv.watch(&key, &target_v, Duration::from_nanos(tick_ns));
+    let kv = &mut hd.kv;
+    let v = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        kv.watch(&key, &target_v, Duration::from_nanos(tick_ns))
+    })) {
+        Ok(v) => v,
+        Err(_) => {
+            unsafe {
+                *out = std::ptr::null_mut();
+                *out_len = 0;
+            }
+            return 1;
+        }
+    };
     if let Some(old) = hd.read_cache.remove(&key) {
         hd.retired.push(old); /* 旧视图保活到 Close（watch 是冷路径） */
     }

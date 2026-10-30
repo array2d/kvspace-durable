@@ -17,6 +17,55 @@ use crate::r#const::*;
 use crate::xvalue::*;
 const SELF_MARKER: &str = "__self__";
 const DIR_MARKER: &str = "__dir__";
+/// Prefix for atomic-write temp files (`~~` cannot collide with `~` + hex escaped key names)
+/// and is skipped during directory listing and copies.
+const TMP_PREFIX: &str = "~~tmp.";
+static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Replaces a full value without exposing a missing or truncated file to concurrent readers:
+/// overwrites the body in place when length, header, and attr match; otherwise writes a temp
+/// file in the same directory and renames it over `path`.
+fn write_atomic(path: &Path, val: &[u8]) -> std::io::Result<()> {
+    if overwrite_body_in_place(path, val)? {
+        return Ok(());
+    }
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = dir.join(format!("{TMP_PREFIX}{}.{seq}", std::process::id()));
+    fs::write(&tmp, val)?;
+    fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = fs::remove_file(&tmp);
+    })
+}
+
+/// Overwrites only the body if `path` already has the same size, header, and attr bytes.
+fn overwrite_body_in_place(path: &Path, val: &[u8]) -> std::io::Result<bool> {
+    let Some(head) = crate::headlenpow::from_wire(val) else {
+        return Ok(false);
+    };
+    let attr_off = crate::headlenpow::PREFIX + head.body.len();
+    let f = match fs::OpenOptions::new().read(true).write(true).open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    if f.metadata()?.len() != val.len() as u64 {
+        return Ok(false);
+    }
+    let mut old = vec![0u8; crate::headlenpow::PREFIX + (val.len() - attr_off)];
+    let (old_head, old_attr) = old.split_at_mut(crate::headlenpow::PREFIX);
+    f.read_exact_at(old_head, 0)?;
+    f.read_exact_at(old_attr, attr_off as u64)?;
+    if old_head != &val[..crate::headlenpow::PREFIX] || old_attr != &val[attr_off..] {
+        return Ok(false);
+    }
+    f.write_all_at(head.body, crate::headlenpow::PREFIX as u64)?;
+    Ok(true)
+}
+
+fn is_tmp_name(name: &std::ffi::OsStr) -> bool {
+    name.to_str().is_some_and(|n| n.starts_with(TMP_PREFIX))
+}
 
 pub struct FsKVSpace {
     root: PathBuf,
@@ -161,13 +210,13 @@ impl FsKVSpace {
         }
         let p = self.fs_path(key);
         if p.is_dir() {
-            fs::write(p.join(Self::leaf_marker(key)), val)
+            write_atomic(&p.join(Self::leaf_marker(key)), val)
                 .unwrap_or_else(|e| panic!("kvspace-fs: set {}: {}", key, e));
         } else {
             if let Some(parent) = p.parent() {
                 let _ = fs::create_dir_all(parent);
             }
-            fs::write(p, val).unwrap_or_else(|e| panic!("kvspace-fs: set {}: {}", key, e));
+            write_atomic(&p, val).unwrap_or_else(|e| panic!("kvspace-fs: set {}: {}", key, e));
         }
     }
 
@@ -296,6 +345,9 @@ impl FsKVSpace {
         let mut children = Vec::new();
         if let Ok(entries) = fs::read_dir(&p) {
             for e in entries.flatten() {
+                if is_tmp_name(&e.file_name()) {
+                    continue;
+                }
                 let fname = e.file_name().to_string_lossy().into_owned();
                 if fname == SELF_MARKER
                     || fname == DIR_MARKER
@@ -329,6 +381,9 @@ impl FsKVSpace {
             fs::create_dir_all(dst)?;
             for e in fs::read_dir(src)? {
                 let e = e?;
+                if is_tmp_name(&e.file_name()) {
+                    continue;
+                }
                 Self::copy_recursive(&e.path(), &dst.join(e.file_name()))?;
             }
         } else {
@@ -686,6 +741,9 @@ impl KVSpace for FsKVSpace {
             let _ = fs::create_dir_all(&dmem);
             if let Ok(rd) = fs::read_dir(&smem) {
                 for e in rd.flatten() {
+                    if is_tmp_name(&e.file_name()) {
+                        continue;
+                    }
                     let sp = e.path();
                     let dp = dmem.join(e.file_name());
                     if sp.is_file() {
