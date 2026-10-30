@@ -304,7 +304,7 @@ impl FsKVSpace {
                     continue;
                 }
                 let name = Self::unescape_name(&fname);
-                // RUNTIME_MEMBER_SEP（‥）前缀键是系统变量/langtype attr key，List 时隐藏。
+                // Hide runtime system keys containing RUNTIME_MEMBER_SEP (‥) from List.
                 if name.contains(RUNTIME_MEMBER_SEP) {
                     continue;
                 }
@@ -595,7 +595,7 @@ impl KVSpace for FsKVSpace {
         if raw.is_empty() {
             return Err(format!("Cp: source not found: {}", src));
         }
-        // attr key 与值同址：读解析后的物理 src 路径的类型。
+        // Copy raw wire bytes verbatim (langtype lives in the value's attr trailer).
         let v = from_wire(&raw);
         self.set(&[KVPair {
             key: dst.to_string(),
@@ -718,8 +718,8 @@ impl KVSpace for FsKVSpace {
         let resolved = self.resolve_path(path);
         self.ensure_dir(&resolved);
         if self.read_leaf(&resolved).is_none() {
-            // 固定头空目录 marker：storetype 0、ptr 0、空 body；类型 "lib" 在值 attr 区。
-            let value = crate::headlenpow::to_wire(0, 0, &[], "lib")
+            // Directory marker: ST_SHORT, inline, empty body, langtype "lib" in attr.
+            let value = crate::headlenpow::to_wire(ST_SHORT, REF_INLINE, &[], "lib")
                 .ok_or_else(|| format!("Mkindex: invalid directory {resolved}"))?;
             self.write_leaf(&resolved, &value);
         }
@@ -741,8 +741,8 @@ impl KVSpace for FsKVSpace {
             return Err(format!("ExtIndex target missing: {ext_path}"));
         }
         let langtype = self.langtype_of(ext_path);
-        // 扩展定位：storetype 3（ST_EXT）+ ptr 2（PTR_EXT）+ 定位串 body + 类型 attr 区。
-        let value = crate::headlenpow::to_wire(3, 2, ext_path.as_bytes(), &langtype)
+        // External locator: ST_EXT + REF_EXT + locator body + target langtype in attr.
+        let value = crate::headlenpow::to_wire(ST_EXT, REF_EXT, ext_path.as_bytes(), &langtype)
             .ok_or_else(|| format!("ExtIndex locator invalid: {ext_path}"))?;
         self.ensure_dir(&resolved);
         self.write_leaf(&resolved, &value);

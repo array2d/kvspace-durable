@@ -20,11 +20,8 @@ use std::time::Duration;
 
 use crate::conn::conn;
 use crate::kvspace::{KVPair, KVSpace};
-use crate::xvalue::{from_wire, from_wire_head, new_ptr};
-use crate::xvalue_bool::new_bool;
-use crate::xvalue_byte::new_char_byte;
-use crate::xvalue_float::new_float64;
-use crate::xvalue_int::new_int64;
+use crate::r#const::{DIR_INDEX_SUF, OBJ_SEP, PATH_SEP, RUNTIME_MEMBER_SEP};
+use crate::xvalue::{from_wire, from_wire_head, REF_INLINE, REF_PTR, ST_SHORT, ST_SLACK};
 
 // ── 句柄 ─────────────────────────────────────────────────────────────
 //
@@ -85,17 +82,32 @@ impl Handle {
     }
 }
 
-/// key 是否等于 prefix 或位于其下（`/` 或 `‥` 分隔）。
+/// Returns whether `key` falls within the subtree affected by `DelTree`/`CpTree`/`CpList(prefix)`,
+/// normalizing a trailing `/` or `·` to `base` and matching `/`, `·`, and `‥` boundaries.
 fn under_prefix(key: &str, prefix: &str) -> bool {
     if key == prefix {
         return true;
     }
-    if prefix.ends_with('/') || prefix.ends_with('\u{2025}') {
+    if prefix.ends_with(RUNTIME_MEMBER_SEP) {
         return key.starts_with(prefix);
     }
-    key.strip_prefix(prefix)
-        .map(|rest| rest.starts_with('/') || rest.starts_with('\u{2025}'))
-        .unwrap_or(false)
+    let base = if prefix == PATH_SEP {
+        ""
+    } else {
+        prefix
+            .strip_suffix(DIR_INDEX_SUF)
+            .or_else(|| prefix.strip_suffix(OBJ_SEP))
+            .unwrap_or(prefix)
+    };
+    if base.is_empty() {
+        return key.starts_with(PATH_SEP);
+    }
+    key.strip_prefix(base).is_some_and(|rest| {
+        rest.is_empty()
+            || rest.starts_with(PATH_SEP)
+            || rest.starts_with(OBJ_SEP)
+            || rest.starts_with(RUNTIME_MEMBER_SEP)
+    })
 }
 
 /// 控制键重读后端并写入双缓冲的另一块（上一块保活到该 key 下一次读）。
@@ -980,9 +992,31 @@ pub extern "C" fn kvspaceClear(h: *mut Handle, err: *mut c_char, err_cap: u32) -
     code
 }
 
-// ── XValue 编解码（head + 标准标量构造器） ─────────────────────────────
-
 // ── 标准标量构造器（返回完整 XValue 字节） ─────────────────────────────
+//
+// Signatures and wire output match `kvspace.h`, frontend `codec_abi.c`, and `kvspace-c`:
+// `langtype` is written verbatim into the attr trailer (NULL/empty -> empty attr).
+
+/// Hands ownership of `wire` to the caller (`free()`-able), or returns 1 if invalid/oversized.
+fn emit(wire: Option<Vec<u8>>, out: *mut *mut u8, out_len: *mut u32) -> c_int {
+    if out.is_null() || out_len.is_null() {
+        return 1;
+    }
+    match wire {
+        Some(w) if u32::try_from(w.len()).is_ok() => alloc(w, out, out_len),
+        _ => 1,
+    }
+}
+
+/// Scalar constructor: `ST_SHORT`, inline, `body = raw`.
+fn new_scalar(raw: &[u8], langtype: *const c_char, out: *mut *mut u8, out_len: *mut u32) -> c_int {
+    let lt = unsafe { cstr(langtype) };
+    emit(
+        crate::headlenpow::to_wire(ST_SHORT, REF_INLINE, raw, lt),
+        out,
+        out_len,
+    )
+}
 
 #[no_mangle]
 pub extern "C" fn kvspaceNewPtr(
@@ -991,42 +1025,78 @@ pub extern "C" fn kvspaceNewPtr(
     out: *mut *mut u8,
     out_len: *mut u32,
 ) -> c_int {
+    if target_kindexpr.is_null() || target.is_null() {
+        return 1;
+    }
     let kindexpr = unsafe { cstr(target_kindexpr) };
     // `any` 不是类型名（空 kindexpr = 不约束，见 spec [[文法与合法性]]）。
     if kindexpr == "any" {
         return 1;
     }
-    let v = new_ptr(kindexpr, unsafe { cstr(target) });
-    alloc(v.to_wire(), out, out_len)
+    // Write raw target path bytes as body; reject empty target (matches kvspaceXvalueHeadNewPtr).
+    let path = unsafe { CStr::from_ptr(target) }.to_bytes();
+    if path.is_empty() {
+        return 1;
+    }
+    emit(
+        crate::headlenpow::to_wire(ST_SLACK, REF_PTR, path, kindexpr),
+        out,
+        out_len,
+    )
 }
 
 #[no_mangle]
 pub extern "C" fn kvspaceNewChar(
     bytes: *const u8,
     len: u32,
+    langtype: *const c_char,
     out: *mut *mut u8,
     out_len: *mut u32,
 ) -> c_int {
-    let v = new_char_byte(unsafe { std::slice::from_raw_parts(bytes, len as usize) });
-    alloc(v.to_wire(), out, out_len)
+    if len != 0 && bytes.is_null() {
+        return 1;
+    }
+    let body: &[u8] = if len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(bytes, len as usize) }
+    };
+    let lt = unsafe { cstr(langtype) };
+    emit(
+        crate::headlenpow::to_wire(ST_SLACK, REF_INLINE, body, lt),
+        out,
+        out_len,
+    )
 }
 
 #[no_mangle]
-pub extern "C" fn kvspaceNewBool(v: u8, out: *mut *mut u8, out_len: *mut u32) -> c_int {
-    let x = new_bool(&[v != 0]);
-    alloc(x.to_wire(), out, out_len)
+pub extern "C" fn kvspaceNewBool(
+    v: u8,
+    langtype: *const c_char,
+    out: *mut *mut u8,
+    out_len: *mut u32,
+) -> c_int {
+    new_scalar(&[u8::from(v != 0)], langtype, out, out_len)
 }
 
 #[no_mangle]
-pub extern "C" fn kvspaceNewInt64(v: i64, out: *mut *mut u8, out_len: *mut u32) -> c_int {
-    let x = new_int64(&[v]);
-    alloc(x.to_wire(), out, out_len)
+pub extern "C" fn kvspaceNewInt64(
+    v: i64,
+    langtype: *const c_char,
+    out: *mut *mut u8,
+    out_len: *mut u32,
+) -> c_int {
+    new_scalar(&v.to_le_bytes(), langtype, out, out_len)
 }
 
 #[no_mangle]
-pub extern "C" fn kvspaceNewFloat64(v: f64, out: *mut *mut u8, out_len: *mut u32) -> c_int {
-    let x = new_float64(&[v]);
-    alloc(x.to_wire(), out, out_len)
+pub extern "C" fn kvspaceNewFloat64(
+    v: f64,
+    langtype: *const c_char,
+    out: *mut *mut u8,
+    out_len: *mut u32,
+) -> c_int {
+    new_scalar(&v.to_bits().to_le_bytes(), langtype, out, out_len)
 }
 
 // ── slot view（shm-only）─────────────────────────────────────────────

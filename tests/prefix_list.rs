@@ -135,7 +135,6 @@ fn new_wire_directories_and_extensions_use_physical_keys() {
         .0
         .borrow()
         .iter()
-        .filter(|(key, _)| !key.ends_with("‥langtype"))
         .all(|(_, raw)| kvspace_durable::headlenpow::from_wire(raw).is_some()));
     assert!(inspect.get("/m·").is_none());
 }

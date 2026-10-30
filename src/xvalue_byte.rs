@@ -14,34 +14,6 @@ pub fn new_char_byte(v: &[u8]) -> XValue {
         dims: char_dims(v.len()),
     })
 }
-pub fn new_char32(v: &[u32]) -> XValue {
-    XValue::Char32(Arr {
-        data: v.to_vec(),
-        dims: char_dims(v.len()),
-    })
-}
-
-/// NewChar 根据 kind 从字符串构造字符值（char/utf32 默认，char/utf8/ascii 为字节）。
-pub fn new_char(kind: &str, s: &str) -> XValue {
-    match kind {
-        KIND_CHAR_UTF8 => XValue::CharByte(Arr {
-            data: s.as_bytes().to_vec(),
-            dims: char_dims(s.len()),
-        }),
-        KIND_CHAR_ASCII => XValue::CharAscii(Arr {
-            data: s.as_bytes().to_vec(),
-            dims: char_dims(s.len()),
-        }),
-        _ => {
-            let v: Vec<u32> = s.chars().map(|c| c as u32).collect();
-            XValue::Char32(Arr {
-                data: v.clone(),
-                dims: char_dims(v.len()),
-            })
-        }
-    }
-}
-
 pub fn char_byte_from_wire(body: &[u8], dims: &[i32]) -> Arr<u8> {
     Arr {
         data: body.to_vec(),
@@ -73,9 +45,4 @@ pub fn char_ascii_to_wire(data: &[u8], dims: &[i32]) -> Vec<u8> {
 pub fn char32_to_wire(data: &[u32], dims: &[i32]) -> Vec<u8> {
     let raw: Vec<u8> = data.iter().flat_map(|&v| v.to_le_bytes()).collect();
     to_wire_head(KIND_CHAR, 0, dims, &raw)
-}
-
-/// IsCharKind 判断 kind 是否为字符家族（前缀 char/）。
-pub fn is_char_kind(kind: &str) -> bool {
-    kind.starts_with("char/")
 }

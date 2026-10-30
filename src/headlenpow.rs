@@ -74,47 +74,33 @@ pub fn attr_bytes(langtype: &str) -> Option<Vec<u8>> {
 /// 读 attr 总长（含自身 2 字节；空 attr = 2）。坏 wire → None。
 #[inline]
 pub fn attr_len(data: &[u8], body_len: usize) -> Option<u16> {
-    let p = data.get(PREFIX.checked_add(body_len)?..PREFIX + body_len + 2)?;
+    let start = PREFIX.checked_add(body_len)?;
+    let p = data.get(start..start.checked_add(2)?)?;
     Some(u16::from_le_bytes([p[0], p[1]]))
 }
 
 /// 从 wire attr 区取 tag=1（langtype）记录 data；无/坏 attr → None。
+/// Scans only available bytes in `data` (mirrors C `kvspaceXvalueHeadLangtype`); truncated or
+/// malformed records past `data.len()` return `None` without panicking.
 pub fn langtype_from_wire(data: &[u8], body_len: usize) -> Option<&[u8]> {
     let alen = usize::from(attr_len(data, body_len)?);
-    if alen < 2 {
-        return None;
-    }
-    let mut p = PREFIX + body_len + 2;
-    let end = PREFIX + body_len + alen;
-    while p + 3 <= end {
-        let tag = data[p];
-        let rlen = usize::from(u16::from_le_bytes([data[p + 1], data[p + 2]]));
-        if p + 3 + rlen > end {
-            return None;
+    let start = PREFIX + body_len; // guaranteed <= data.len() - 2 by attr_len
+    let end = start.saturating_add(alen).min(data.len());
+    let mut rest = data.get(start + 2..end)?; // None if alen < 2
+    while let [tag, l0, l1, tail @ ..] = rest {
+        let rlen = usize::from(u16::from_le_bytes([*l0, *l1]));
+        let rec = tail.get(..rlen)?;
+        if *tag == ATTR_TAG_LANGTYPE {
+            return Some(rec);
         }
-        if tag == ATTR_TAG_LANGTYPE {
-            return Some(&data[p + 3..p + 3 + rlen]);
-        }
-        p += 3 + rlen;
+        rest = &tail[rlen..];
     }
     None
 }
 
 pub fn to_wire(storetype: u8, ptr: u8, body: &[u8], langtype: &str) -> Option<Vec<u8>> {
-    if storetype > 3 || ptr > 2 {
-        return None;
-    }
-    let attr = attr_bytes(langtype)?;
-    let len = u64::try_from(body.len()).ok()?;
-    let total = PREFIX.checked_add(body.len())?.checked_add(attr.len())?;
-    let mut data = Vec::new();
-    data.try_reserve_exact(total).ok()?;
-    data.resize(total, 0);
-    write_len(&mut data, len);
-    data[6] = storetype;
-    data[7] = ptr;
+    let mut data = reserve(storetype, ptr, body.len(), langtype)?;
     data[PREFIX..PREFIX + body.len()].copy_from_slice(body);
-    data[PREFIX + body.len()..].copy_from_slice(&attr);
     Some(data)
 }
 

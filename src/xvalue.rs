@@ -434,27 +434,25 @@ fn array_to_header(kind: &str, array_len: i32) -> Vec<i32> {
 /// - dims 非空且非 map/struct → ST_LARGE（张量）；
 /// - 否则 ST_SHORT（None/标量/目录/map 头/空 rwfunc 目录值）。
 pub fn to_wire_head(kind: &str, r#ref: i32, dims: &[i32], raw: &[u8]) -> Vec<u8> {
-    let storetype = if r#ref == 2 {
-        ST_EXT
-    } else if r#ref == 1 {
-        ST_SLACK
-    } else if r#ref != 0 {
-        return Vec::new();
-    } else if matches!(kind, "rwir" | "def langtype") || (kind == "rwfunc" && !raw.is_empty()) {
-        ST_SLACK
-    } else if kind.starts_with("char/") {
-        ST_SLACK
-    } else if !dims.is_empty() && !kind.contains('·') && !kind.starts_with('/') {
-        ST_LARGE
-    } else {
-        ST_SHORT
+    let (storetype, ptr) = match r#ref {
+        0 => {
+            let slack = matches!(kind, "rwir" | "def langtype")
+                || (kind == "rwfunc" && !raw.is_empty())
+                || kind.starts_with("char/");
+            let st = if slack {
+                ST_SLACK
+            } else if !dims.is_empty() && !kind.contains(OBJ_SEP) && !kind.starts_with(PATH_SEP) {
+                ST_LARGE
+            } else {
+                ST_SHORT
+            };
+            (st, REF_INLINE)
+        }
+        1 => (ST_SLACK, REF_PTR),
+        2 => (ST_EXT, REF_EXT),
+        _ => return Vec::new(),
     };
-    let ptr = match r#ref {
-        1 => REF_PTR,
-        2 => REF_EXT,
-        _ => REF_INLINE,
-    };
-    let langtype = if kind == "None" {
+    let langtype = if kind == KIND_NONE {
         String::new()
     } else {
         kindexpr_of(kind, dims)
@@ -467,35 +465,27 @@ pub fn from_wire_head(data: &[u8]) -> XValueHead {
     let Some(h) = crate::headlenpow::from_wire(data) else {
         return XValueHead::default();
     };
-    let Ok(headlen) = u16::try_from(crate::headlenpow::PREFIX) else {
+    let Ok(body_len) = i32::try_from(h.len) else {
         return XValueHead::default();
     };
-    let body_len = i32::try_from(h.len).unwrap_or(-1);
-    if body_len < 0 {
-        return XValueHead::default();
-    }
     let langtype = crate::headlenpow::langtype_from_wire(data, h.len as usize)
         .map(|b| String::from_utf8_lossy(b).into_owned())
         .unwrap_or_default();
-    let dims = if h.storetype == 2 || (h.storetype == 1 && langtype.starts_with('[')) {
+    let has_dims =
+        h.storetype == ST_LARGE || (h.storetype == ST_SLACK && langtype.starts_with('['));
+    let dims = if has_dims {
         parse_kindexpr(&langtype).0
     } else {
         Vec::new()
     };
     XValueHead {
-        headlen,
-        r#ref: if h.ptr == REF_PTR {
-            REF_PTR
-        } else if h.ptr == REF_EXT {
-            REF_EXT
-        } else {
-            REF_INLINE
-        },
+        headlen: crate::headlenpow::PREFIX as u16, // fixed 8-byte header
+        r#ref: h.ptr, // validated <= 2 by headlenpow::from_wire; matches REF_*
         storetype: h.storetype,
         langtype,
         phys_dims: dims,
         body_len,
-        body_cap: h.len as u64,
+        body_cap: h.len,
     }
 }
 
@@ -518,74 +508,6 @@ pub fn body_bytes(v: &XValue) -> Vec<u8> {
     match crate::headlenpow::from_wire(&data) {
         Some(h) => h.body.to_vec(),
         None => Vec::new(),
-    }
-}
-
-/// 返回 XValue 的完整 langtype 串（含 [dims] 形状段），用于写 x‥langtype attr key。
-/// None → 空串；Ptr/Ext → 目标 kindexpr；Map → 完整 map 类型；Opaque → 自定义 kind；
-/// 数组 → `[d0,d1]kind`（无 dims 则裸 kind）。
-pub fn xvalue_langtype(v: &XValue) -> String {
-    let dims: &[i32] = match v {
-        XValue::None => return String::new(),
-        XValue::Ptr(p) => return p.target_kindexpr.clone(),
-        XValue::Ext(e) => return e.langtype.clone(),
-        XValue::Map(m) => return m.langtype.clone(),
-        XValue::Opaque(o) => return o.kind.clone(),
-        XValue::Bool(d) => &d.dims,
-        XValue::Int8(d) => &d.dims,
-        XValue::Int16(d) => &d.dims,
-        XValue::Int32(d) => &d.dims,
-        XValue::Int64(d) => &d.dims,
-        XValue::Uint8(d) => &d.dims,
-        XValue::Uint16(d) => &d.dims,
-        XValue::Uint32(d) => &d.dims,
-        XValue::Uint64(d) => &d.dims,
-        XValue::Float32(d) => &d.dims,
-        XValue::Float64(d) => &d.dims,
-        XValue::CharByte(d) => &d.dims,
-        XValue::CharAscii(d) => &d.dims,
-        XValue::Char32(d) => &d.dims,
-    };
-    if dims.is_empty() {
-        v.kind().to_string()
-    } else {
-        format!(
-            "[{}]{}",
-            dims.iter()
-                .map(i32::to_string)
-                .collect::<Vec<_>>()
-                .join(","),
-            v.kind()
-        )
-    }
-}
-
-/// ElemSize 返回 kind 的单元素字节数；≤0 表示非定长类型（非 byte 派生）。
-pub fn elem_size(kind: &str) -> i32 {
-    match kind {
-        KIND_INT8 | KIND_UINT8 | KIND_CHAR_UTF8 | KIND_CHAR_ASCII | KIND_BOOL => 1,
-        KIND_INT16 | KIND_UINT16 => 2,
-        KIND_INT32 | KIND_UINT32 | KIND_FLOAT32 | KIND_CHAR => 4,
-        KIND_INT64 | KIND_UINT64 | KIND_FLOAT64 | "time" | "duration" => 8,
-        _ => 0,
-    }
-}
-
-/// Format 返回规范表示（对齐 Go 的 Format）。
-pub fn format(v: &XValue) -> String {
-    if is_none(v) {
-        KIND_NONE.to_string()
-    } else {
-        v.code_string()
-    }
-}
-
-/// Plain 返回明文表示（对齐 Go 的 Plain）。
-pub fn plain(v: &XValue) -> String {
-    if is_none(v) {
-        KIND_NONE.to_string()
-    } else {
-        v.value_string()
     }
 }
 

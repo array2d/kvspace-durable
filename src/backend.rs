@@ -11,7 +11,8 @@ use crate::kvspace_common::{
 use crate::r#const::*;
 use crate::store::KVStore;
 use crate::xvalue::{
-    from_wire, from_wire_head, is_ptr, ptr_target, XValue, REF_EXT, REF_PTR,
+    from_wire, from_wire_head, is_ptr, ptr_target, XValue, REF_EXT, REF_INLINE, REF_PTR, ST_EXT,
+    ST_SHORT,
 };
 
 pub struct Backend<S: KVStore> {
@@ -120,7 +121,7 @@ impl<S: KVStore> Backend<S> {
             let end = rest.find(['/', '·']).unwrap_or(rest.len());
             if end > 0 {
                 let name = &rest[..end];
-                // RUNTIME_MEMBER_SEP（‥）前缀键是系统变量/langtype attr key，List 时隐藏。
+                // Hide runtime system keys containing RUNTIME_MEMBER_SEP (‥) from List.
                 if (dir != PATH_SEP || name != META_ROOT_NAME) && !name.contains(RUNTIME_MEMBER_SEP)
                 {
                     let direct_dir =
@@ -403,25 +404,6 @@ impl<S: KVStore> KVSpace for Backend<S> {
         result
     }
 
-    fn list_len(&mut self, prefix: &str, expand_ext: bool, resolve: bool) -> i32 {
-        self.list(prefix, expand_ext, resolve).len() as i32
-    }
-
-    fn list_at(
-        &mut self,
-        prefix: &str,
-        idx: i32,
-        expand_ext: bool,
-        resolve: bool,
-    ) -> Option<String> {
-        if idx < 0 {
-            return None;
-        }
-        self.list(prefix, expand_ext, resolve)
-            .into_iter()
-            .nth(idx as usize)
-    }
-
     fn del(&mut self, keys: &[String]) -> Result<(), String> {
         for key in keys {
             if crate::r#const::is_reserved(key) {
@@ -497,7 +479,7 @@ impl<S: KVStore> KVSpace for Backend<S> {
         if raw.is_empty() {
             return Err(format!("Cp: source not found: {}", src));
         }
-        // attr key 与值同址：读解析后的物理 src 路径的类型。
+        // Copy raw wire bytes verbatim (langtype lives in the value's attr trailer).
         let v = from_wire(&raw);
         self.set(&[KVPair {
             key: dst.to_string(),
@@ -583,9 +565,8 @@ impl<S: KVStore> KVSpace for Backend<S> {
         let _ = self.del_tree(&dst_base);
         for k in &keys {
             let suffix = &k[src_base.len()..];
-            // Copy the base（含其 langtype attr key）、直接 · 成员（含成员 attr key）与 ext 目录。
+            // Copy base value, direct '·' members, and ext directories (attrs travel with values).
             let one_level = suffix.is_empty()
-                || suffix == format!("{RUNTIME_MEMBER_SEP}langtype")
                 || (suffix.starts_with(OBJ_SEP) && {
                     let rest = &suffix[OBJ_SEP.len()..];
                     let member = rest.strip_suffix(PATH_SEP).unwrap_or(rest);
@@ -612,8 +593,8 @@ impl<S: KVStore> KVSpace for Backend<S> {
         }
         let _ = capacity;
         let resolved = self.resolve_path(path);
-        // 固定头空目录 marker：storetype 0、ptr 0、空 body；类型 "lib" 在值 attr 区。
-        let value = crate::headlenpow::to_wire(0, 0, &[], "lib")
+        // Directory marker: ST_SHORT, inline, empty body, langtype "lib" in attr.
+        let value = crate::headlenpow::to_wire(ST_SHORT, REF_INLINE, &[], "lib")
             .ok_or_else(|| format!("Mkindex: invalid directory {resolved}"))?;
         if self.store.get(&resolved).is_none() {
             self.store.set(&resolved, &value);
@@ -637,8 +618,8 @@ impl<S: KVStore> KVSpace for Backend<S> {
             return Err(format!("ExtIndex target missing: {ext_path}"));
         }
         let langtype = self.langtype_of(ext_path);
-        // 扩展定位：storetype 3（ST_EXT）+ ptr 2（PTR_EXT）+ 定位串 body + 类型 attr 区。
-        let value = crate::headlenpow::to_wire(3, 2, ext_path.as_bytes(), &langtype)
+        // External locator: ST_EXT + REF_EXT + locator body + target langtype in attr.
+        let value = crate::headlenpow::to_wire(ST_EXT, REF_EXT, ext_path.as_bytes(), &langtype)
             .ok_or_else(|| format!("ExtIndex locator invalid: {ext_path}"))?;
         self.store.set(&resolved, &value);
         Ok(())
