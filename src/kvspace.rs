@@ -42,14 +42,15 @@ pub trait KVSpace {
     fn get(&mut self, prefix: &str, keys: &[String], resolve: bool) -> Vec<XValue>;
     /// 单点读原始字节（不经 wire 转换）。无值返回空。
     fn get_raw(&mut self, key: &str) -> Vec<u8>;
-    /// 读 x‥langtype attr key 的明文类型串：attr key 值是字符串 XValue（char/utf8），
-    /// 解出明文；无/空/解析失败 → 空串。
+    /// 读 key 值的 attr 区明文类型串（#571 单 key 整体）；无/空/解析失败 → 空串。
     fn langtype_of(&mut self, key: &str) -> String {
-        let ltkey = format!("{key}{}langtype", crate::r#const::RUNTIME_MEMBER_SEP);
-        match crate::xvalue::from_wire(&self.get_raw(&ltkey), "[]char/utf8") {
-            XValue::CharByte(b) => String::from_utf8_lossy(&b.data).into_owned(),
-            _ => String::new(),
-        }
+        let raw = self.get_raw(key);
+        let Some(h) = crate::headlenpow::from_wire(&raw) else {
+            return String::new();
+        };
+        crate::headlenpow::langtype_from_wire(&raw, h.len as usize)
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .unwrap_or_default()
     }
     /// 单点写：Set 写完整 XValue，并维护目录索引；只解析父路径 link，整键不穿透。
     fn set(&mut self, pairs: &[KVPair]) -> Result<(), String>;

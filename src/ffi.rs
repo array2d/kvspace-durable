@@ -63,8 +63,7 @@ impl Handle {
     fn flush(&mut self) -> Result<(), String> {
         if let Some(key) = self.pending_key.take() {
             let xv = std::mem::take(&mut self.write_buf);
-            let langtype = self.kv.langtype_of(&key);
-            let val = from_wire(&xv, &langtype);
+            let val = from_wire(&xv);
             self.kv.set(&[KVPair {
                 key: key.clone(),
                 val,
@@ -177,13 +176,13 @@ unsafe fn kv_flush<'a>(h: *mut Handle) -> Result<&'a mut dyn KVSpace, String> {
     Ok(&mut *hd.kv)
 }
 
-/// 固定头预留：langtype 不入 head（由调用方写 x‥langtype attr key），
-/// wire = [storetype][ptr][reserved:u16=0][len:u32]，body 偏移恒 = PREFIX。
+/// 固定头预留：head + attr 区（langtype 尾部）一次写，body 偏移恒 = PREFIX。
 fn build_xvalue_head(
     r#ref: u8,
     storetype: u8,
     body_len: usize,
     body_cap: usize,
+    langtype: &str,
 ) -> Option<Vec<u8>> {
     if body_len > body_cap {
         return None;
@@ -194,7 +193,7 @@ fn build_xvalue_head(
         (2, 3) => (3, 2),
         _ => return None,
     };
-    crate::headlenpow::reserve(st, ptr, body_len)
+    crate::headlenpow::reserve(st, ptr, body_len, langtype)
 }
 
 // ── 内部助手 ─────────────────────────────────────────────────────────
@@ -423,8 +422,7 @@ pub extern "C" fn kvspaceSetValue(
     }
     let raw = raw.to_vec();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let langtype = hd.kv.langtype_of(&key);
-        let val = from_wire(&raw, &langtype);
+        let val = from_wire(&raw);
         hd.kv.set(&[KVPair {
             key: key.clone(),
             val,
@@ -566,14 +564,8 @@ pub extern "C" fn kvspaceGetHead(
     if value.is_empty() {
         return 1;
     }
-    /* langtype 在 x‥langtype attr key（明文事实源）；attr key 缺失 = None/无类型。 */
-    let langtype = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        hd.kv.langtype_of(&key)
-    })) {
-        Ok(lt) => lt,
-        Err(_) => return 1,
-    };
-    let head = crate::xvalue::from_wire_head(&value, &langtype);
+    /* langtype 在值 attr 区（单 key 整体）；无类型 = 空 attr。 */
+    let head = crate::xvalue::from_wire_head(&value);
     if head.headlen == 0 {
         return 1;
     }
@@ -607,14 +599,14 @@ pub extern "C" fn kvspaceWriteInPlace(
         write_err(err, err_cap, "kvspace: write-in-place on missing key");
         return 1;
     }
-    let langtype = hd.kv.langtype_of(&key);
-    let head = from_wire_head(&existing, &langtype);
+    let head = from_wire_head(&existing);
     let head_len = head.head_len() as usize;
+    let blen = head.body_len.max(0) as usize;
+    let attr = crate::headlenpow::attr_len(&existing, blen).unwrap_or(0) as usize;
     if head.headlen == 0
         || head.body_len < 0
         || head.body_len as u32 != body_len
-        || head.body_cap > usize::MAX as u64
-        || head_len.checked_add(head.body_cap as usize) != Some(existing.len())
+        || head_len.checked_add(blen).and_then(|x| x.checked_add(attr)) != Some(existing.len())
     {
         write_err(err, err_cap, "kvspace: write-in-place body_len mismatch");
         return 1;
@@ -627,7 +619,7 @@ pub extern "C" fn kvspaceWriteInPlace(
 }
 
 /// 新位置写：按 (ref, storetype, body_len, body_cap) 攒好 head 到 write_buf、置 pending，返回 body 偏移指针。
-/// kvspace 层不写 attr key——`x‥langtype` 归属上层：需要类型时调用方自写 attr key（attr 先落、x 后落）。
+/// langtype（可为空）随 head + attr 区整体写入——单 key 一次写。
 #[no_mangle]
 pub extern "C" fn kvspaceWriteNewPlace(
     h: *mut Handle,
@@ -636,6 +628,7 @@ pub extern "C" fn kvspaceWriteNewPlace(
     storetype: u8,
     body_len: u32,
     body_cap: u64,
+    langtype: *const c_char,
     body: *mut *mut u8,
     err: *mut c_char,
     err_cap: u32,
@@ -649,11 +642,12 @@ pub extern "C" fn kvspaceWriteNewPlace(
         return 1;
     }
     let key = unsafe { cstr(key) }.to_string();
+    let lt = unsafe { cstr(langtype) };
     let Ok(cap) = usize::try_from(body_cap) else {
         write_err(err, err_cap, "capacity exceeds platform size");
         return 1;
     };
-    let Some(xv) = build_xvalue_head(r#ref, storetype, body_len as usize, cap) else {
+    let Some(xv) = build_xvalue_head(r#ref, storetype, body_len as usize, cap, lt) else {
         write_err(err, err_cap, "invalid XValue geometry");
         return 1;
     };
@@ -951,12 +945,10 @@ pub extern "C" fn kvspaceWatch(
         return 1;
     }
     let key = unsafe { cstr(key) }.to_string();
-    /* watch 目标与 key 值同型（相等判据），langtype 取 key 的 attr key。 */
-    let langtype = hd.kv.langtype_of(&key);
-    let target_v = from_wire(
-        unsafe { std::slice::from_raw_parts(target, target_len as usize) },
-        &langtype,
-    );
+    /* watch 目标与 key 值同型（相等判据）：langtype 在值 attr 区。 */
+    let target_v = from_wire(unsafe {
+        std::slice::from_raw_parts(target, target_len as usize)
+    });
     let v = hd.kv.watch(&key, &target_v, Duration::from_nanos(tick_ns));
     if let Some(old) = hd.read_cache.remove(&key) {
         hd.retired.push(old); /* 旧视图保活到 Close（watch 是冷路径） */

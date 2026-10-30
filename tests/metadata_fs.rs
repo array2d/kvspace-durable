@@ -6,10 +6,10 @@ fn reads_new_wire_directory_value() {
     let root = std::env::temp_dir().join(format!("kvspace-new-dir-fs-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
     let mut kv = conn(&format!("fs://{}", root.display()));
-    let raw = kvspace_durable::headlenpow::to_wire(0, 0, &[]).unwrap();
+    let raw = kvspace_durable::headlenpow::to_wire(0, 0, &[], "").unwrap();
     kv.set(&[KVPair {
         key: "/lib/f/".into(),
-        val: kvspace_durable::xvalue::from_wire(&raw, ""),
+        val: kvspace_durable::xvalue::from_wire(&raw),
         raw: Some(raw.clone()),
     }])
     .unwrap();

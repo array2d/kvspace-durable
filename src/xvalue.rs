@@ -394,10 +394,23 @@ pub fn xvalue_to_wire(kind: &str, raw: &[u8], array_len: i32) -> Vec<u8> {
     to_wire_head(kind, 0, &array_to_header(kind, array_len), raw)
 }
 
-/// 指针 wire 转换：固定头恒 ST_SLACK + PTR_PTR，body = 目标 key 路径。目标 kindexpr 不进 head
-/// （由调用方写 x‥langtype attr key）。
-pub fn xvalue_to_wire_ptr(_target_kindexpr: &str, raw: &[u8]) -> Vec<u8> {
-    crate::headlenpow::to_wire(ST_SLACK, REF_PTR, raw).unwrap_or_default()
+/// 指针 wire 转换：固定头恒 ST_SLACK + PTR_PTR，body = 目标 key 路径。
+/// 目标 kindexpr 拼入 attr 区（单 key 整体）。
+pub fn xvalue_to_wire_ptr(target_kindexpr: &str, raw: &[u8]) -> Vec<u8> {
+    crate::headlenpow::to_wire(ST_SLACK, REF_PTR, raw, target_kindexpr).unwrap_or_default()
+}
+
+/// kind + dims → 完整 langtype 串（`[d0,d1]kind`；dims 空 = 裸 kind）。
+fn kindexpr_of(kind: &str, dims: &[i32]) -> String {
+    if dims.is_empty() {
+        kind.to_string()
+    } else {
+        format!(
+            "[{}]{}",
+            dims.iter().map(i32::to_string).collect::<Vec<_>>().join(","),
+            kind
+        )
+    }
 }
 
 /// array_len → dims：char/* 恒一维（含空串/单字符）；其余标量(≤1)=0 维、多元素=1 维。
@@ -412,7 +425,7 @@ fn array_to_header(kind: &str, array_len: i32) -> Vec<i32> {
 }
 
 /// 固定 8 字节 head 落盘：storetype 按 kind/dims 判定，ptr 按 ref 判定，body = raw 原样。
-/// langtype 不进 head（调用方写 x‥langtype attr key）。
+/// langtype 拼入 attr 区（单 key 整体；None 无类型 = 空 attr）。
 ///
 /// storetype 判定（对齐 kvspace 三正交轴与 C codec）：
 /// - ref==1（指针）→ ST_SLACK；ref==2（@ext）→ ST_EXT；
@@ -441,11 +454,16 @@ pub fn to_wire_head(kind: &str, r#ref: i32, dims: &[i32], raw: &[u8]) -> Vec<u8>
         2 => REF_EXT,
         _ => REF_INLINE,
     };
-    crate::headlenpow::to_wire(storetype, ptr, raw).unwrap_or_default()
+    let langtype = if kind == "None" {
+        String::new()
+    } else {
+        kindexpr_of(kind, dims)
+    };
+    crate::headlenpow::to_wire(storetype, ptr, raw, &langtype).unwrap_or_default()
 }
 
-/// 从固定 8 字节 head + 侧写 langtype 解析 XValueHead（langtype 从 x‥langtype attr key 读）。
-pub fn from_wire_head(data: &[u8], langtype: &str) -> XValueHead {
+/// 从完整 XValue 字节（固定 head + body + attr 区）解析 XValueHead（langtype 从 attr 取）。
+pub fn from_wire_head(data: &[u8]) -> XValueHead {
     let Some(h) = crate::headlenpow::from_wire(data) else {
         return XValueHead::default();
     };
@@ -456,8 +474,11 @@ pub fn from_wire_head(data: &[u8], langtype: &str) -> XValueHead {
     if body_len < 0 {
         return XValueHead::default();
     }
+    let langtype = crate::headlenpow::langtype_from_wire(data, h.len as usize)
+        .map(|b| String::from_utf8_lossy(b).into_owned())
+        .unwrap_or_default();
     let dims = if h.storetype == 2 || (h.storetype == 1 && langtype.starts_with('[')) {
-        parse_kindexpr(langtype).0
+        parse_kindexpr(&langtype).0
     } else {
         Vec::new()
     };
@@ -471,17 +492,17 @@ pub fn from_wire_head(data: &[u8], langtype: &str) -> XValueHead {
             REF_INLINE
         },
         storetype: h.storetype,
-        langtype: langtype.to_string(),
+        langtype,
         phys_dims: dims,
         body_len,
         body_cap: h.len as u64,
     }
 }
 
-/// 从完整 XValue 字节（固定 head + 侧写 langtype + body）组装 XValue。
-pub fn from_wire(data: &[u8], langtype: &str) -> XValue {
-    let h = from_wire_head(data, langtype);
-    // 空 langtype 表示 None（head 固定后 attr key 缺失 = 无类型）。
+/// 从完整 XValue 字节（固定 head + body + attr）组装 XValue。
+pub fn from_wire(data: &[u8]) -> XValue {
+    let h = from_wire_head(data);
+    // 空 langtype 表示 None（无类型 = 空 attr）。
     if h.langtype.is_empty() && !h.is_ptr() && h.r#ref() != REF_EXT as i32 {
         return XValue::None;
     }
@@ -578,12 +599,7 @@ mod tests {
 
     fn roundtrip(v: &XValue) {
         let bytes = v.to_wire();
-        assert_eq!(
-            *v,
-            from_wire(&bytes, &xvalue_langtype(v)),
-            "roundtrip {:?}",
-            v
-        );
+        assert_eq!(*v, from_wire(&bytes), "roundtrip {:?}", v);
     }
 
     #[test]
@@ -632,9 +648,9 @@ mod tests {
 
     #[test]
     fn directory_and_extension_wire() {
-        // 目录值：SHORT、inline、空 body，固定 8 字节 head。
+        // 目录值：SHORT、inline、空 body，固定 8 字节 head + attr（langtype "lib"）。
         let dir = to_wire_head("lib", 0, &[], &[]);
-        assert_eq!(dir.len(), 8);
+        assert_eq!(dir.len(), 8 + 2 + 3 + 3);
         let head = crate::headlenpow::from_wire(&dir).unwrap();
         assert_eq!(
             (head.storetype, head.ptr, head.len, head.body.len()),
@@ -646,14 +662,14 @@ mod tests {
             locator: "/lib/f/".into(),
         })
         .to_wire();
-        assert_eq!(ext.len(), 8 + "/lib/f/".len());
+        assert_eq!(ext.len(), 8 + "/lib/f/".len() + 11); /* + attr（rwfunc 记录） */
         let head = crate::headlenpow::from_wire(&ext).unwrap();
         assert_eq!(
             (head.storetype, head.ptr, head.body),
             (ST_EXT, REF_EXT, b"/lib/f/".as_slice())
         );
         assert_eq!(
-            from_wire(&ext, "rwfunc"),
+            from_wire(&ext),
             XValue::Ext(ExtHandle {
                 langtype: "rwfunc".into(),
                 locator: "/lib/f/".into()
@@ -664,13 +680,13 @@ mod tests {
     #[test]
     fn head_fields() {
         let bytes = new_float64(&[1.0, 2.0, 3.0]).to_wire();
-        assert_eq!(bytes.len(), 8 + 24); // 固定头 8 + 3×f64 body
-        let h = from_wire_head(&bytes, "[3]float64");
+        assert_eq!(bytes.len(), 8 + 24 + 15); // 固定头 8 + 3×f64 body + attr("[3]float64")
+        let h = from_wire_head(&bytes);
         assert_eq!(h.kind(), "float64");
         assert_eq!(h.dims(), vec![3]);
         assert_eq!(h.array_len(), 3);
         assert!(!h.is_ptr());
         assert_eq!(h.r#ref(), 0);
-        assert_eq!(h.head_len() as usize + h.body_len as usize, bytes.len());
+        assert_eq!(h.head_len() as usize + h.body_len as usize + 15, bytes.len());
     }
 }

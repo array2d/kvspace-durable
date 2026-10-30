@@ -15,7 +15,6 @@ use crate::kvspace_common::{
 };
 use crate::r#const::*;
 use crate::xvalue::*;
-use crate::xvalue_byte::char_byte_to_wire;
 const SELF_MARKER: &str = "__self__";
 const DIR_MARKER: &str = "__dir__";
 
@@ -93,34 +92,6 @@ impl FsKVSpace {
 
     fn is_dir_key(key: &str) -> bool {
         key.ends_with(DIR_INDEX_SUF) || key.ends_with(OBJ_SEP)
-    }
-
-    /// langtype attr key：`x‥langtype`。
-    fn langtype_key(key: &str) -> String {
-        format!("{key}{RUNTIME_MEMBER_SEP}langtype")
-    }
-
-    /// 读 key 的 langtype attr key：attr key 值是字符串 XValue（char/utf8），
-    /// 解出明文类型串；无/空/解析失败 → 空串。
-    fn langtype_of(&self, key: &str) -> String {
-        self.read_leaf(&Self::langtype_key(key))
-            .map(|data| match from_wire(&data, "[]char/utf8") {
-                XValue::CharByte(b) => String::from_utf8_lossy(&b.data).into_owned(),
-                _ => String::new(),
-            })
-            .unwrap_or_default()
-    }
-
-    /// 写/删 key 的 langtype attr key：attr key 值存字符串 XValue（char/utf8）的 wire 字节；
-    /// 空串 → 删除（无类型）。
-    fn set_langtype(&self, key: &str, langtype: &str) {
-        let ltkey = Self::langtype_key(key);
-        if langtype.is_empty() {
-            self.remove_leaf(&ltkey);
-        } else {
-            let wire = char_byte_to_wire(langtype.as_bytes(), &[]);
-            self.write_leaf(&ltkey, &wire);
-        }
     }
 
     fn leaf_marker(key: &str) -> &'static str {
@@ -292,7 +263,7 @@ impl FsKVSpace {
         for (i, p) in parts.iter().enumerate() {
             cur = join_path(&cur, p);
             if let Some(data) = self.read_leaf(&cur) {
-                let v = from_wire(&data, &self.langtype_of(&cur));
+                let v = from_wire(&data);
                 if is_ptr(&v) {
                     let target = ptr_target(&v);
                     if i + 1 < parts.len() {
@@ -307,7 +278,7 @@ impl FsKVSpace {
 
     fn prefix_ext(&self, prefix: &str) -> String {
         if let Some(data) = self.read_leaf(prefix) {
-            let head = from_wire_head(&data, &self.langtype_of(prefix));
+            let head = from_wire_head(&data);
             if head.r#ref == crate::xvalue::REF_EXT {
                 return String::from_utf8_lossy(head.body(&data)).into_owned();
             }
@@ -391,16 +362,16 @@ impl KVSpace for FsKVSpace {
                 if Self::is_dir_key(&full) {
                     return self
                         .read_leaf(&full)
-                        .map(|raw| from_wire(&raw, &self.langtype_of(&full)))
+                        .map(|raw| from_wire(&raw))
                         .unwrap_or(XValue::None);
                 }
                 if let Some(data) = self.read_leaf(&full) {
-                    return from_wire(&data, &self.langtype_of(&full));
+                    return from_wire(&data);
                 }
                 if !ext_t.is_empty() {
                     let target = join_path(&ext_t, k);
                     if let Some(data) = self.read_leaf(&target) {
-                        return from_wire(&data, &self.langtype_of(&target));
+                        return from_wire(&data);
                     }
                 }
                 XValue::None
@@ -496,16 +467,11 @@ impl KVSpace for FsKVSpace {
             let raw = pair.raw.clone().unwrap_or_else(|| pair.val.to_wire());
             let head = crate::headlenpow::from_wire(&raw)
                 .ok_or_else(|| format!("invalid XValue at {key}"))?;
-            if head.len as usize + crate::headlenpow::PREFIX != raw.len() {
+            let attr = crate::headlenpow::attr_len(&raw, head.len as usize)
+                .ok_or_else(|| format!("invalid XValue at {key}"))?;
+            if head.len as usize + crate::headlenpow::PREFIX + attr as usize != raw.len() {
                 return Err(format!("invalid XValue at {key}"));
             }
-            // 固定头无类型：langtype 走 x‥langtype attr key（值侧写自 val）。
-            // ‥ 后缀 key（系统变量/attr key 本体）是叶子，无类型、不写嵌套 attr key。
-            let langtype = if key.contains(RUNTIME_MEMBER_SEP) {
-                String::new()
-            } else {
-                crate::xvalue::xvalue_langtype(&pair.val)
-            };
             // 指针校验用声明的 target_kindexpr（val 为 Ptr 时可得；raw 直写无类型则跳过）。
             if let XValue::Ptr(ptr) = &pair.val {
                 validate_ptr(self, &ptr.target, &ptr.target_kindexpr)?;
@@ -529,8 +495,7 @@ impl KVSpace for FsKVSpace {
                     return Err(format!("{}: {}", ERR_EXT_WRITE, key));
                 }
             }
-            // 写序固定：attr 先落，x 后落（x 写 = 提交点，x 存在则类型必完整）。
-            self.set_langtype(&key, &langtype);
+            // 单 key 整体写（类型在值 attr 区）：天然原子，无 attr key、无写序。
             self.ensure_dir(&parent);
             if Self::is_dir_key(&key) {
                 self.ensure_dir(&key);
@@ -582,7 +547,6 @@ impl KVSpace for FsKVSpace {
             if crate::r#const::is_reserved(&resolved) {
                 return Err(format!("reserved metadata key: {resolved}"));
             }
-            self.remove_leaf(&Self::langtype_key(&resolved));
             self.remove_leaf(&resolved);
         }
         Ok(())
@@ -603,7 +567,7 @@ impl KVSpace for FsKVSpace {
             &resolved
         };
         if let Some(data) = self.read_leaf(link_key) {
-            if from_wire_head(&data, &self.langtype_of(link_key)).is_ptr() {
+            if from_wire_head(&data).is_ptr() {
                 return self.del(&[resolved]);
             }
         }
@@ -620,8 +584,6 @@ impl KVSpace for FsKVSpace {
                 fs::remove_file(&node).map_err(|e| format!("DelTree {key}: {e}"))?;
             }
         }
-        // base 值（非目录形态）的 langtype attr key 是 base 的兄弟文件，单独清除。
-        self.remove_leaf(&Self::langtype_key(base));
         Ok(())
     }
 
@@ -634,7 +596,7 @@ impl KVSpace for FsKVSpace {
             return Err(format!("Cp: source not found: {}", src));
         }
         // attr key 与值同址：读解析后的物理 src 路径的类型。
-        let v = from_wire(&raw, &self.langtype_of(&self.resolve_parent(src)));
+        let v = from_wire(&raw);
         self.set(&[KVPair {
             key: dst.to_string(),
             val: v,
@@ -682,10 +644,6 @@ impl KVSpace for FsKVSpace {
             Self::copy_recursive(&smem, &dmem)
                 .map_err(|e| format!("CpTree {}→{}: {}", src, dst, e))?;
         }
-        // base 值的 langtype attr key 是 base 的兄弟文件，单独复制。
-        if let Some(lt) = self.read_leaf(&Self::langtype_key(&src_base)) {
-            self.write_leaf(&Self::langtype_key(&dst_base), &lt);
-        }
         // 确保 dst 父目录存在（成员名单结构派生，无需登记）。
         let (parent, _name) = Self::parent_name(&dst_base);
         self.ensure_dir(&parent);
@@ -721,10 +679,6 @@ impl KVSpace for FsKVSpace {
         let _ = self.del_tree(&dst_base);
         if let Some(data) = self.read_leaf(&src_base) {
             self.write_leaf(&dst_base, &data);
-        }
-        // base 值的 langtype attr key 是 base 的兄弟文件，单独复制。
-        if let Some(lt) = self.read_leaf(&Self::langtype_key(&src_base)) {
-            self.write_leaf(&Self::langtype_key(&dst_base), &lt);
         }
         // 一层成员目录：只拷直接条目（marker + 直接成员值），子目录只取其 base 值 __self__，不递归。
         if smem.is_dir() {
@@ -764,10 +718,9 @@ impl KVSpace for FsKVSpace {
         let resolved = self.resolve_path(path);
         self.ensure_dir(&resolved);
         if self.read_leaf(&resolved).is_none() {
-            // 固定头空目录 marker：storetype 0、ptr 0、空 body；类型 "lib" 走 attr key。
-            let value = crate::headlenpow::to_wire(0, 0, &[])
+            // 固定头空目录 marker：storetype 0、ptr 0、空 body；类型 "lib" 在值 attr 区。
+            let value = crate::headlenpow::to_wire(0, 0, &[], "lib")
                 .ok_or_else(|| format!("Mkindex: invalid directory {resolved}"))?;
-            self.set_langtype(&resolved, "lib");
             self.write_leaf(&resolved, &value);
         }
         Ok(())
@@ -788,10 +741,9 @@ impl KVSpace for FsKVSpace {
             return Err(format!("ExtIndex target missing: {ext_path}"));
         }
         let langtype = self.langtype_of(ext_path);
-        // 扩展定位：storetype 3（ST_EXT）+ ptr 2（PTR_EXT）+ 定位串 body。
-        let value = crate::headlenpow::to_wire(3, 2, ext_path.as_bytes())
+        // 扩展定位：storetype 3（ST_EXT）+ ptr 2（PTR_EXT）+ 定位串 body + 类型 attr 区。
+        let value = crate::headlenpow::to_wire(3, 2, ext_path.as_bytes(), &langtype)
             .ok_or_else(|| format!("ExtIndex locator invalid: {ext_path}"))?;
-        self.set_langtype(&resolved, &langtype);
         self.ensure_dir(&resolved);
         self.write_leaf(&resolved, &value);
         Ok(())
@@ -799,7 +751,6 @@ impl KVSpace for FsKVSpace {
 
     fn del_ext_index(&mut self, path: &str) -> Result<(), String> {
         let resolved = self.resolve_parent(path);
-        self.remove_leaf(&Self::langtype_key(&resolved));
         self.remove_leaf(&resolved);
         Ok(())
     }

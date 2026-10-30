@@ -10,13 +10,28 @@
 
 use kvspace_durable::ffi::*;
 
-/// 64KB 级 char/utf8 值：storetype 1 变长、body 全 0（仅用于内存观测）。
-/// wire = [len:u48 @0-5][storetype:u8 @6][ptr:u8 @7][body]，body 偏移恒 8。
+/// attr 区：langtype 记录（#571 单 key 整体）；空 langtype = 空 attr [2,0]。
+fn attr_of(lt: &str) -> Vec<u8> {
+    if lt.is_empty() {
+        return vec![2, 0];
+    }
+    let mut v = Vec::new();
+    let alen = (2u16 + 3 + lt.len() as u16);
+    v.extend_from_slice(&alen.to_le_bytes());
+    v.push(1); // tag = langtype
+    v.extend_from_slice(&(lt.len() as u16).to_le_bytes());
+    v.extend_from_slice(lt.as_bytes());
+    v
+}
+
+/// 64KB 级 char/utf8 值：storetype 1 变长、body 全 0（仅用于内存观测）+ 空 attr。
+/// wire = [len:u48 @0-5][storetype:u8 @6][ptr:u8 @7][body][attr]，body 偏移恒 8。
 fn xvalue_pad(n: usize) -> Vec<u8> {
     let mut v = vec![0u8; 8 + n];
     v[0..6].copy_from_slice(&(n as u64).to_le_bytes()[..6]);
     v[6] = 1; // storetype: slack
     v[7] = 0; // ptr: inline
+    v.extend_from_slice(&attr_of(""));
     v
 }
 
@@ -26,23 +41,14 @@ fn xvalue_i64(n: i64) -> Vec<u8> {
     v[6] = 0; // storetype: short
     v[7] = 0; // ptr: inline
     v[8..16].copy_from_slice(&n.to_le_bytes());
+    v.extend_from_slice(&attr_of("int64"));
     v
 }
 
 unsafe fn set(h: *mut Handle, key: &str, n: i64) {
     let mut k = key.as_bytes().to_vec();
     k.push(0);
-    /* 值用裸 wire 写（测试自构 head），但 watch/read 走 langtype attr key 判定类型，
-       故写值前先落明文 "int64" attr key——对齐生产侧 set 的「attr 先落、x 后落」。 */
-    let mut lt = key.as_bytes().to_vec();
-    lt.extend_from_slice("\u{2025}langtype".as_bytes());
-    lt.push(0);
-    let lt_v = xvalue_utf8("int64");
-    assert_eq!(
-        kvspaceSetValue(h, lt.as_ptr() as *const _, lt_v.as_ptr(), lt_v.len() as u32, std::ptr::null_mut(), 0),
-        0,
-        "set langtype {key}"
-    );
+    /* 值含 attr 区（类型随值整体写，无 attr key）。 */
     let v = xvalue_i64(n);
     let mut err = [0i8; 128];
     let rc = kvspaceSetValue(
@@ -280,12 +286,19 @@ fn xvalue_utf8(s: &str) -> Vec<u8> {
     v[6] = 1; // storetype: slack
     v[7] = 0; // ptr: inline
     v[8..].copy_from_slice(s.as_bytes());
+    v.extend_from_slice(&attr_of(""));
     v
 }
 
 unsafe fn read_str(p: *const u8, l: u32) -> String {
     assert!(l >= 8);
-    String::from_utf8_lossy(std::slice::from_raw_parts(p.add(8), (l - 8) as usize)).into_owned()
+    /* body = head len 字节（head 后接 attr 区，不读入）。 */
+    let b = std::slice::from_raw_parts(p, 6);
+    let mut n = 0u64;
+    for i in (0..6).rev() {
+        n = (n << 8) | u64::from(b[i]);
+    }
+    String::from_utf8_lossy(std::slice::from_raw_parts(p.add(8), n as usize)).into_owned()
 }
 
 unsafe fn set_str(h: *mut Handle, key: &str, s: &str) {

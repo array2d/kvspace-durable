@@ -11,9 +11,8 @@ use crate::kvspace_common::{
 use crate::r#const::*;
 use crate::store::KVStore;
 use crate::xvalue::{
-    from_wire, from_wire_head, is_ptr, ptr_target, xvalue_langtype, XValue, REF_EXT, REF_PTR,
+    from_wire, from_wire_head, is_ptr, ptr_target, XValue, REF_EXT, REF_PTR,
 };
-use crate::xvalue_byte::char_byte_to_wire;
 
 pub struct Backend<S: KVStore> {
     store: S,
@@ -22,35 +21,6 @@ pub struct Backend<S: KVStore> {
 impl<S: KVStore> Backend<S> {
     pub fn new(store: S) -> Self {
         Backend { store }
-    }
-
-    /// langtype attr key key：`x‥langtype`。
-    fn langtype_key(key: &str) -> String {
-        format!("{key}{RUNTIME_MEMBER_SEP}langtype")
-    }
-
-    /// 读 key 的 langtype attr key：attr key 值是字符串 XValue（char/utf8），
-    /// 解出明文类型串；无/空/解析失败 → 空串。
-    fn langtype_of(&self, key: &str) -> String {
-        self.store
-            .get(&Self::langtype_key(key))
-            .map(|data| match from_wire(&data, "[]char/utf8") {
-                XValue::CharByte(b) => String::from_utf8_lossy(&b.data).into_owned(),
-                _ => String::new(),
-            })
-            .unwrap_or_default()
-    }
-
-    /// 写/删 key 的 langtype attr key：attr key 值存字符串 XValue（char/utf8）的 wire 字节；
-    /// 空串 → 删除（无类型）。
-    fn set_langtype(&self, key: &str, langtype: &str) {
-        let ltkey = Self::langtype_key(key);
-        if langtype.is_empty() {
-            self.store.del(&[&ltkey]);
-        } else {
-            let wire = char_byte_to_wire(langtype.as_bytes(), &[]);
-            self.store.set(&ltkey, &wire);
-        }
     }
 
     // ── 目录与路径工具 ──────────────────────────────────────────────
@@ -119,8 +89,7 @@ impl<S: KVStore> Backend<S> {
         let vals = self.store.get_many(&refs);
         for (i, data) in vals.iter().enumerate() {
             if let Some(data) = data {
-                let lt = self.langtype_of(&prefixes[i]);
-                let v = from_wire(data, &lt);
+                let v = from_wire(data);
                 if is_ptr(&v) {
                     let target = ptr_target(&v);
                     if i + 1 < parts.len() {
@@ -185,15 +154,14 @@ impl<S: KVStore> Backend<S> {
         match self.store.get(dir) {
             None => XValue::None,
             Some(data) => {
-                let langtype = self.langtype_of(dir);
-                from_wire(&data, &langtype)
+                from_wire(&data)
             }
         }
     }
 
     fn prefix_ext(&self, prefix: &str) -> String {
         if let Some(data) = self.store.get(prefix) {
-            let head = from_wire_head(&data, &self.langtype_of(prefix));
+            let head = from_wire_head(&data);
             if head.r#ref == REF_EXT {
                 return String::from_utf8_lossy(head.body(&data)).into_owned();
             }
@@ -229,10 +197,9 @@ impl<S: KVStore> KVSpace for Backend<S> {
         // ext-index 仅是主存未命中键的回退目标：延迟到确有缺失键才查 prefix_ext——
         // 否则每次读都为它多付一次 GET（frame 槽恒命中，曾是最热的一条无谓往返）。
         let mut missing: Vec<usize> = Vec::new();
-        for (idx, (i, full)) in full_keys.iter().enumerate() {
+        for (idx, (i, _full)) in full_keys.iter().enumerate() {
             if let Some(data) = &full_vals[idx] {
-                let langtype = self.langtype_of(full);
-                results[*i] = Some(from_wire(data, &langtype));
+                results[*i] = Some(from_wire(data));
             } else {
                 missing.push(*i);
             }
@@ -253,10 +220,9 @@ impl<S: KVStore> KVSpace for Backend<S> {
         if !ext_keys.is_empty() {
             let ext_refs: Vec<&str> = ext_keys.iter().map(|(_, t)| t.as_str()).collect();
             let ext_vals = self.store.get_many(&ext_refs);
-            for (idx, (i, t)) in ext_keys.iter().enumerate() {
+            for (idx, (i, _t)) in ext_keys.iter().enumerate() {
                 results[*i] = Some(if let Some(data) = &ext_vals[idx] {
-                    let langtype = self.langtype_of(t);
-                    from_wire(data, &langtype)
+                    from_wire(data)
                 } else {
                     XValue::None
                 });
@@ -360,16 +326,11 @@ impl<S: KVStore> KVSpace for Backend<S> {
             let raw = pair.raw.clone().unwrap_or_else(|| pair.val.to_wire());
             let head = crate::headlenpow::from_wire(&raw)
                 .ok_or_else(|| format!("invalid XValue at {key}"))?;
-            if head.len as usize + crate::headlenpow::PREFIX != raw.len() {
+            let attr = crate::headlenpow::attr_len(&raw, head.len as usize)
+                .ok_or_else(|| format!("invalid XValue at {key}"))?;
+            if head.len as usize + crate::headlenpow::PREFIX + attr as usize != raw.len() {
                 return Err(format!("invalid XValue at {key}"));
             }
-            // 固定头无类型：langtype 走 x‥langtype attr key（值侧写自 val）。
-            // ‥ 后缀 key（系统变量/attr key 本体）是叶子，无类型、不写嵌套 attr key。
-            let langtype = if key.contains(RUNTIME_MEMBER_SEP) {
-                String::new()
-            } else {
-                xvalue_langtype(&pair.val)
-            };
             // 指针校验用声明的 target_kindexpr（val 为 Ptr 时可得；raw 直写无类型则跳过）。
             if let XValue::Ptr(ptr) = &pair.val {
                 validate_ptr(self, &ptr.target, &ptr.target_kindexpr)?;
@@ -393,8 +354,7 @@ impl<S: KVStore> KVSpace for Backend<S> {
                     return Err(format!("{}: {}", ERR_EXT_WRITE, key));
                 }
             }
-            // 写序固定：attr 先落，x 后落（x 写 = 提交点，x 存在则类型必完整）。
-            self.set_langtype(&key, &langtype);
+            // 单 key 整体写（类型在值 attr 区）：天然原子，无 attr key、无写序。
             self.store.set(&key, &raw);
         }
         Ok(())
@@ -482,14 +442,9 @@ impl<S: KVStore> KVSpace for Backend<S> {
 
             if Self::is_dir(&resolved) {
                 let link_key = strip_dir_suf(&resolved);
-                self.store.del(&[
-                    &Self::langtype_key(link_key),
-                    &Self::langtype_key(&resolved),
-                    link_key,
-                    &resolved,
-                ]);
+                self.store.del(&[link_key, &resolved]);
             } else {
-                self.store.del(&[&Self::langtype_key(&resolved), &resolved]);
+                self.store.del(&[&resolved]);
             }
         }
         Ok(())
@@ -504,7 +459,7 @@ impl<S: KVStore> KVSpace for Backend<S> {
             link_key = strip_dir_suf(prefix);
         }
         if let Some(data) = self.store.get(link_key) {
-            let head = from_wire_head(&data, &self.langtype_of(link_key));
+            let head = from_wire_head(&data);
             if head.is_ptr() {
                 return self.del(&[prefix.to_string()]);
             }
@@ -525,10 +480,10 @@ impl<S: KVStore> KVSpace for Backend<S> {
             .filter(|key| !crate::r#const::is_reserved(key))
             .collect();
 
-        self.store.del(&[&Self::langtype_key(&resolved), &resolved]);
-        for k in &keys {
-            self.store.del(&[&Self::langtype_key(k), k]);
-        }
+        let mut del_keys: Vec<&str> = Vec::with_capacity(keys.len() + 1);
+        del_keys.push(&resolved);
+        del_keys.extend(keys.iter().map(String::as_str));
+        self.store.del(&del_keys);
 
         Ok(())
     }
@@ -543,7 +498,7 @@ impl<S: KVStore> KVSpace for Backend<S> {
             return Err(format!("Cp: source not found: {}", src));
         }
         // attr key 与值同址：读解析后的物理 src 路径的类型。
-        let v = from_wire(&raw, &self.langtype_of(&self.resolve_parent(src)));
+        let v = from_wire(&raw);
         self.set(&[KVPair {
             key: dst.to_string(),
             val: v,
@@ -657,11 +612,10 @@ impl<S: KVStore> KVSpace for Backend<S> {
         }
         let _ = capacity;
         let resolved = self.resolve_path(path);
-        // 固定头空目录 marker：storetype 0、ptr 0、空 body；类型 "lib" 走 attr key。
-        let value = crate::headlenpow::to_wire(0, 0, &[])
+        // 固定头空目录 marker：storetype 0、ptr 0、空 body；类型 "lib" 在值 attr 区。
+        let value = crate::headlenpow::to_wire(0, 0, &[], "lib")
             .ok_or_else(|| format!("Mkindex: invalid directory {resolved}"))?;
         if self.store.get(&resolved).is_none() {
-            self.set_langtype(&resolved, "lib");
             self.store.set(&resolved, &value);
         }
         Ok(())
@@ -683,10 +637,9 @@ impl<S: KVStore> KVSpace for Backend<S> {
             return Err(format!("ExtIndex target missing: {ext_path}"));
         }
         let langtype = self.langtype_of(ext_path);
-        // 扩展定位：storetype 3（ST_EXT）+ ptr 2（PTR_EXT）+ 定位串 body。
-        let value = crate::headlenpow::to_wire(3, 2, ext_path.as_bytes())
+        // 扩展定位：storetype 3（ST_EXT）+ ptr 2（PTR_EXT）+ 定位串 body + 类型 attr 区。
+        let value = crate::headlenpow::to_wire(3, 2, ext_path.as_bytes(), &langtype)
             .ok_or_else(|| format!("ExtIndex locator invalid: {ext_path}"))?;
-        self.set_langtype(&resolved, &langtype);
         self.store.set(&resolved, &value);
         Ok(())
     }
@@ -699,14 +652,14 @@ impl<S: KVStore> KVSpace for Backend<S> {
             link_key = strip_dir_suf(&resolved);
         }
         if let Some(data) = self.store.get(link_key) {
-            let head = from_wire_head(&data, &self.langtype_of(link_key));
+            let head = from_wire_head(&data);
             if head.is_ptr() {
-                self.store.del(&[&Self::langtype_key(link_key), link_key]);
+                self.store.del(&[link_key]);
                 return Ok(());
             }
         }
 
-        self.store.del(&[&Self::langtype_key(&resolved), &resolved]);
+        self.store.del(&[&resolved]);
         Ok(())
     }
 
