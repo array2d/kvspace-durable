@@ -4,10 +4,15 @@
 // ── 路径结构 ──────────────────────────────────────────────────────────────
 
 pub const PATH_SEP: &str = "/"; // 路径分隔符
-pub const META_ROOT_NAME: &str = ".kvspace-meta";
+pub const META_ROOT_NAME: &str = ".kvspace-meta"; // 保留区（不再有 meta sidecar，仅守卫防业务写）
 pub const DIR_INDEX_SUF: &str = "/"; // 目录索引键后缀（尾斜杠 = 目录，必须以 / 开头的 key 保证不冲突）
 pub const RUNTIME_MEMBER_SEP: &str = "‥"; // 运行时保留字段前缀（U+2025）——‥ 的唯一定义处，List 时隐藏
 pub const EXT_INDEX_HEAD: &str = "…"; // Directory display marker.
+
+/// `/.kvspace-meta` 保留区判定（原 metadata::is_reserved，随 meta 删除迁至常量模块）。
+pub fn is_reserved(key: &str) -> bool {
+    key == "/.kvspace-meta" || key.starts_with("/.kvspace-meta/")
+}
 
 // ── 错误消息 ────────────────────────────────────────────────────────────
 

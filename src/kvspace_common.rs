@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use crate::kvspace::KVSpace;
 use crate::r#const::*;
-use crate::xvalue::{body_bytes, is_none, plain, XValue};
+use crate::xvalue::{body_bytes, is_none, plain, xvalue_langtype, XValue};
 
 /// JoinPath 拼接父子路径。
 pub fn join_path(parent: &str, child: &str) -> String {
@@ -136,7 +136,9 @@ pub fn validate_ptr(
     // 比 **kind 层**（剥 `[dims]`），不比整串：`[5]char/utf32` 与声明 `[]char/utf32`
     // 是同一个 kind 的不同形状，语义兼容。整串相等曾把「定长实参传给变长形参」
     // 这类合法场景误判为类型不符而拒绝写入。
-    let actual = norm_langtype(&crate::xvalue::decode_xvalue_head(&v.encode()).langtype);
+    let actual = norm_langtype(
+        &crate::xvalue::from_wire_head(&v.to_wire(), &xvalue_langtype(&v)).langtype,
+    );
     let expect = norm_langtype(target_kindexpr);
     if actual != expect {
         return Err(format!(

@@ -7,7 +7,7 @@
 //   - 句柄：kvspaceConnect 返回 *mut Handle（Box<dyn KVSpace>），kvspaceClose 释放。
 //   - 输入字符串：*const c_char（NUL 终止）；输入字节：*const u8 + u32 len。
 //   - 读出字节：kvspaceGet/ListAt 返回句柄内常驻/回收缓冲的借用偏移指针，调用方不得 free；
-//     codec（XvalueEncode/New*）产出为 frontend malloc 缓冲，调用方以 libc free 释放。
+//     codec（New*）产出为 frontend malloc 缓冲，调用方以 libc free 释放。
 //   - 错误：返回 c_int（0=成功，1=失败），失败信息写入 err 缓冲（err_cap 上限）。
 //
 // 注意：本层函数不得 panic 跨边界（panic 会 abort 进程）；调用方保证入参合法。
@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use crate::conn::conn;
 use crate::kvspace::{KVPair, KVSpace};
-use crate::xvalue::{decode_xvalue, decode_xvalue_head, encode_head, new_ptr};
+use crate::xvalue::{from_wire, from_wire_head, new_ptr};
 use crate::xvalue_bool::new_bool;
 use crate::xvalue_byte::new_char_byte;
 use crate::xvalue_float::new_float64;
@@ -56,24 +56,20 @@ pub struct Handle {
     retired: Vec<Vec<u8>>,
     write_buf: Vec<u8>,
     pending_key: Option<String>,
-    pending_meta: Option<(bool, u32)>,
 }
 
 impl Handle {
     /// 落盘上一笔惰性写（调用方已把 body 填进 write_buf），并失效该 key 的读缓存。
     fn flush(&mut self) -> Result<(), String> {
         if let Some(key) = self.pending_key.take() {
-            let meta = self.pending_meta.take();
             let xv = std::mem::take(&mut self.write_buf);
-            let val = decode_xvalue(&xv);
+            let langtype = self.kv.langtype_of(&key);
+            let val = from_wire(&xv, &langtype);
             self.kv.set(&[KVPair {
                 key: key.clone(),
                 val,
                 raw: Some(xv),
             }])?;
-            if let Some((ro, vid)) = meta {
-                self.kv.set_metadata(&key, ro, vid)?;
-            }
             self.read_cache.remove(&key);
         }
         Ok(())
@@ -181,20 +177,24 @@ unsafe fn kv_flush<'a>(h: *mut Handle) -> Result<&'a mut dyn KVSpace, String> {
     Ok(&mut *hd.kv)
 }
 
+/// 固定头预留：langtype 不入 head（由调用方写 x‥langtype attr key），
+/// wire = [storetype][ptr][reserved:u16=0][len:u32]，body 偏移恒 = PREFIX。
 fn build_xvalue_head(
     r#ref: u8,
     storetype: u8,
-    langtype: &str,
     body_len: usize,
     body_cap: usize,
 ) -> Option<Vec<u8>> {
-    let flags = match (r#ref, storetype) {
-        (0, 0..=2) => storetype,
-        (1, 1) => 5,
-        (2, 3) => 3,
+    if body_len > body_cap {
+        return None;
+    }
+    let (st, ptr) = match (r#ref, storetype) {
+        (0, 0..=3) => (storetype, 0),
+        (1, 1) => (1, 1),
+        (2, 3) => (3, 2),
         _ => return None,
     };
-    crate::headlenpow::reserve(flags, langtype, body_len, body_cap)
+    crate::headlenpow::reserve(st, ptr, body_len)
 }
 
 // ── 内部助手 ─────────────────────────────────────────────────────────
@@ -269,8 +269,6 @@ pub struct kvspaceHead_t {
     pub headlen: u16,        // head 总字节数
     pub r#ref: u8,           // 存储位置：0=inline 1=ptr 2=@ext
     pub storetype: u8,       // Wire storage class.
-    pub ro: u8,              // 1=只读，0=可写
-    pub vid: u32,            // vthread id
     pub body_len: i32,       // body 字节数
     pub ndim: i32,           // 物理维数（标量=0）
     pub dims: [i32; 8],      // 物理字段 dims（X_MAX_NDIM=8）
@@ -298,8 +296,6 @@ fn fill_head(head: &crate::xvalue::XValueHead, out: *mut kvspaceHead_t) {
         for (i, d) in dims.iter().take(8).enumerate() {
             o.dims[i] = *d;
         }
-        o.ro = head.ro as u8;
-        o.vid = head.vid;
         o.body_len = head.body_len;
         o.body_offset = head.head_len();
         o.body_cap = head.body_cap;
@@ -319,7 +315,6 @@ pub extern "C" fn kvspaceConnect(dsn: *const c_char) -> *mut Handle {
             retired: Vec::new(),
             write_buf: Vec::new(),
             pending_key: None,
-            pending_meta: None,
         })),
         Err(_) => std::ptr::null_mut(),
     }
@@ -406,8 +401,6 @@ pub extern "C" fn kvspaceSetValue(
     key: *const c_char,
     value: *const u8,
     value_len: u32,
-    ro: u8,
-    vid: u32,
     err: *mut c_char,
     err_cap: u32,
 ) -> c_int {
@@ -424,19 +417,19 @@ pub extern "C" fn kvspaceSetValue(
     }
     let key = unsafe { cstr(key) }.to_string();
     let raw = unsafe { std::slice::from_raw_parts(value, value_len as usize) };
-    if crate::headlenpow::decode(raw).map(|head| head.total) != Some(raw.len()) {
+    if crate::headlenpow::from_wire(raw).is_none() {
         write_err(err, err_cap, "invalid XValue");
         return 1;
     }
     let raw = raw.to_vec();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let val = decode_xvalue(&raw);
+        let langtype = hd.kv.langtype_of(&key);
+        let val = from_wire(&raw, &langtype);
         hd.kv.set(&[KVPair {
             key: key.clone(),
             val,
             raw: Some(raw),
-        }])?;
-        hd.kv.set_metadata(&key, ro != 0, vid)
+        }])
     }));
     match result {
         Ok(result) => {
@@ -573,20 +566,18 @@ pub extern "C" fn kvspaceGetHead(
     if value.is_empty() {
         return 1;
     }
-    let head = crate::xvalue::decode_xvalue_head(&value);
+    /* langtype 在 x‥langtype attr key（明文事实源）；attr key 缺失 = None/无类型。 */
+    let langtype = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        hd.kv.langtype_of(&key)
+    })) {
+        Ok(lt) => lt,
+        Err(_) => return 1,
+    };
+    let head = crate::xvalue::from_wire_head(&value, &langtype);
     if head.headlen == 0 {
         return 1;
     }
-    let (ro, vid) =
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hd.kv.get_metadata(&key))) {
-            Ok(Ok(meta)) => meta,
-            _ => return 1,
-        };
     fill_head(&head, out);
-    unsafe {
-        (*out).ro = ro as u8;
-        (*out).vid = vid;
-    }
     0
 }
 
@@ -616,7 +607,8 @@ pub extern "C" fn kvspaceWriteInPlace(
         write_err(err, err_cap, "kvspace: write-in-place on missing key");
         return 1;
     }
-    let head = decode_xvalue_head(&existing);
+    let langtype = hd.kv.langtype_of(&key);
+    let head = from_wire_head(&existing, &langtype);
     let head_len = head.head_len() as usize;
     if head.headlen == 0
         || head.body_len < 0
@@ -627,31 +619,21 @@ pub extern "C" fn kvspaceWriteInPlace(
         write_err(err, err_cap, "kvspace: write-in-place body_len mismatch");
         return 1;
     }
-    let meta = match hd.kv.get_metadata(&key) {
-        Ok(value) => value,
-        Err(e) => {
-            write_err(err, err_cap, &e);
-            return 1;
-        }
-    };
     hd.read_cache.remove(&key);
     hd.write_buf = existing;
     hd.pending_key = Some(key);
-    hd.pending_meta = Some(meta);
     unsafe { *body = hd.write_buf.as_mut_ptr().add(head_len) };
     0
 }
 
-/// 新位置写：按 (ref, storetype, langtype, body_len) 攒好 head 到 write_buf、置 pending，返回 body 偏移指针。
+/// 新位置写：按 (ref, storetype, body_len, body_cap) 攒好 head 到 write_buf、置 pending，返回 body 偏移指针。
+/// kvspace 层不写 attr key——`x‥langtype` 归属上层：需要类型时调用方自写 attr key（attr 先落、x 后落）。
 #[no_mangle]
 pub extern "C" fn kvspaceWriteNewPlace(
     h: *mut Handle,
     key: *const c_char,
     r#ref: u8,
     storetype: u8,
-    ro: u8,
-    vid: u32,
-    langtype: *const c_char,
     body_len: u32,
     body_cap: u64,
     body: *mut *mut u8,
@@ -667,20 +649,19 @@ pub extern "C" fn kvspaceWriteNewPlace(
         return 1;
     }
     let key = unsafe { cstr(key) }.to_string();
-    let lt = unsafe { cstr(langtype) };
     let Ok(cap) = usize::try_from(body_cap) else {
         write_err(err, err_cap, "capacity exceeds platform size");
         return 1;
     };
-    let Some(xv) = build_xvalue_head(r#ref, storetype, lt, body_len as usize, cap) else {
+    let Some(xv) = build_xvalue_head(r#ref, storetype, body_len as usize, cap) else {
         write_err(err, err_cap, "invalid XValue geometry");
         return 1;
     };
-    let head_len = xv.len() - cap;
+    /* 固定头：body 偏移恒 = PREFIX（=8）。 */
+    let head_len = crate::headlenpow::PREFIX;
     hd.read_cache.remove(&key);
     hd.write_buf = xv;
     hd.pending_key = Some(key);
-    hd.pending_meta = Some((ro != 0, vid));
     unsafe { *body = hd.write_buf.as_mut_ptr().add(head_len) };
     0
 }
@@ -970,13 +951,17 @@ pub extern "C" fn kvspaceWatch(
         return 1;
     }
     let key = unsafe { cstr(key) }.to_string();
-    let target_v =
-        decode_xvalue(unsafe { std::slice::from_raw_parts(target, target_len as usize) });
+    /* watch 目标与 key 值同型（相等判据），langtype 取 key 的 attr key。 */
+    let langtype = hd.kv.langtype_of(&key);
+    let target_v = from_wire(
+        unsafe { std::slice::from_raw_parts(target, target_len as usize) },
+        &langtype,
+    );
     let v = hd.kv.watch(&key, &target_v, Duration::from_nanos(tick_ns));
     if let Some(old) = hd.read_cache.remove(&key) {
         hd.retired.push(old); /* 旧视图保活到 Close（watch 是冷路径） */
     }
-    hd.read_cache.insert(key.clone(), v.encode());
+    hd.read_cache.insert(key.clone(), v.to_wire());
     let b = hd.read_cache.get_mut(&key).unwrap();
     unsafe {
         *out = b.as_mut_ptr();
@@ -1005,80 +990,6 @@ pub extern "C" fn kvspaceClear(h: *mut Handle, err: *mut c_char, err_cap: u32) -
 
 // ── XValue 编解码（head + 标准标量构造器） ─────────────────────────────
 
-/// 通用 XValue 编码（内联，ref=0）。dims/ndim 直接落盘：ndim=0 标量，dims 可为 NULL。
-/// kvlang 的自有 kind（rwir/rwfunc/scope）经此构造：body 由 kvlang 自己编码。
-#[no_mangle]
-pub extern "C" fn kvspaceXvalueEncode(
-    kind: *const c_char,
-    raw: *const u8,
-    raw_len: u32,
-    dims: *const i32,
-    ndim: i32,
-    out: *mut *mut u8,
-    out_len: *mut u32,
-) -> c_int {
-    let raw = unsafe { std::slice::from_raw_parts(raw, raw_len as usize) };
-    let dims = ffi_dims(dims, ndim);
-    alloc(
-        encode_head(unsafe { cstr(kind) }, 0, dims, raw),
-        out,
-        out_len,
-    )
-}
-
-/// 带权限编码：显式指定 ref（0/1/2）、ro（1=只读）、vid。用于权限位落盘。
-#[no_mangle]
-pub extern "C" fn kvspaceXvalueEncodeMode(
-    kind: *const c_char,
-    raw: *const u8,
-    raw_len: u32,
-    dims: *const i32,
-    ndim: i32,
-    r#ref: c_int,
-    ro: u8,
-    vid: u32,
-    out: *mut *mut u8,
-    out_len: *mut u32,
-) -> c_int {
-    let raw = unsafe { std::slice::from_raw_parts(raw, raw_len as usize) };
-    let dims = ffi_dims(dims, ndim);
-    if ro != 0 || vid != 0 {
-        return 1;
-    }
-    alloc(
-        encode_head(unsafe { cstr(kind) }, r#ref, dims, raw),
-        out,
-        out_len,
-    )
-}
-
-#[inline]
-fn ffi_dims<'a>(dims: *const i32, ndim: i32) -> &'a [i32] {
-    if dims.is_null() || ndim <= 0 {
-        &[]
-    } else {
-        unsafe { std::slice::from_raw_parts(dims, ndim as usize) }
-    }
-}
-
-/// 解码 XValueHead（不解析 body）。返回 kindexpr/ro/vid/body_len/body_offset。
-#[no_mangle]
-pub extern "C" fn kvspaceDecodeHead(
-    data: *const u8,
-    data_len: u32,
-    out: *mut kvspaceHead_t,
-) -> c_int {
-    if data.is_null() || out.is_null() {
-        return 1;
-    }
-    let head = decode_xvalue_head(unsafe { std::slice::from_raw_parts(data, data_len as usize) });
-    if head.headlen == 0 {
-        return 1;
-    }
-    fill_head(&head, out);
-    0
-}
-
 // ── 标准标量构造器（返回完整 XValue 字节） ─────────────────────────────
 
 #[no_mangle]
@@ -1094,7 +1005,7 @@ pub extern "C" fn kvspaceNewPtr(
         return 1;
     }
     let v = new_ptr(kindexpr, unsafe { cstr(target) });
-    alloc(v.encode(), out, out_len)
+    alloc(v.to_wire(), out, out_len)
 }
 
 #[no_mangle]
@@ -1105,25 +1016,25 @@ pub extern "C" fn kvspaceNewChar(
     out_len: *mut u32,
 ) -> c_int {
     let v = new_char_byte(unsafe { std::slice::from_raw_parts(bytes, len as usize) });
-    alloc(v.encode(), out, out_len)
+    alloc(v.to_wire(), out, out_len)
 }
 
 #[no_mangle]
 pub extern "C" fn kvspaceNewBool(v: u8, out: *mut *mut u8, out_len: *mut u32) -> c_int {
     let x = new_bool(&[v != 0]);
-    alloc(x.encode(), out, out_len)
+    alloc(x.to_wire(), out, out_len)
 }
 
 #[no_mangle]
 pub extern "C" fn kvspaceNewInt64(v: i64, out: *mut *mut u8, out_len: *mut u32) -> c_int {
     let x = new_int64(&[v]);
-    alloc(x.encode(), out, out_len)
+    alloc(x.to_wire(), out, out_len)
 }
 
 #[no_mangle]
 pub extern "C" fn kvspaceNewFloat64(v: f64, out: *mut *mut u8, out_len: *mut u32) -> c_int {
     let x = new_float64(&[v]);
-    alloc(x.encode(), out, out_len)
+    alloc(x.to_wire(), out, out_len)
 }
 
 // ── slot view（shm-only）─────────────────────────────────────────────

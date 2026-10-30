@@ -2,8 +2,10 @@ pub(crate) fn is_subtree_key(prefix: &str, key: &str) -> bool {
     if prefix.is_empty() || prefix == "/" {
         return key.starts_with('/');
     }
-    key.strip_prefix(prefix)
-        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/') || rest.starts_with('·'))
+    // '/'（层级）、'·'（成员）、'‥'（系统变量/langtype attr key）都是子树边界。
+    key.strip_prefix(prefix).is_some_and(|rest| {
+        rest.is_empty() || rest.starts_with('/') || rest.starts_with('·') || rest.starts_with('‥')
+    })
 }
 
 pub trait KVStore {

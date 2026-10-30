@@ -1,12 +1,18 @@
 // xvalue.rs — 对齐 xvalue.go
 // XValue 是所有值的统一枚举（Go 的 interface + 具体类型 → 枚举变体）。
-// XValueHead + XValue 编解码（head + body）。
+// XValueHead + XValue wire 转换（head + body）。
 
 use crate::r#const::*;
 
 pub const REF_INLINE: u8 = 0;
 pub const REF_PTR: u8 = 1;
 pub const REF_EXT: u8 = 2;
+
+// 固定 8 字节 head 的 storetype（存储形态，对齐 kvspace 三正交轴 ST_*）。
+pub const ST_SHORT: u8 = 0; // 短定长：None/标量/目录/map 头/空 rwfunc 目录值
+pub const ST_SLACK: u8 = 1; // 变长：字符/字节数组/代码槽/指针路径
+pub const ST_LARGE: u8 = 2; // 大定长：张量
+pub const ST_EXT: u8 = 3; // 扩展定位 @ext
 
 pub fn is_map_langtype(kind: &str) -> bool {
     kind.contains(OBJ_SEP)
@@ -54,8 +60,6 @@ pub struct XValueHead {
     pub storetype: u8, // Storage class.
     pub langtype: String,
     pub phys_dims: Vec<i32>,
-    pub ro: bool,
-    pub vid: u32,
     pub body_len: i32,
     pub body_cap: u64,
 }
@@ -98,8 +102,8 @@ impl XValueHead {
         &data[off..off + self.body_len as usize]
     }
 
-    /// 用 body 字节解码为 XValue。
-    pub fn decode(&self, body: &[u8]) -> XValue {
+    /// 用 body 字节组装为 XValue。
+    pub fn from_wire(&self, body: &[u8]) -> XValue {
         if self.is_ptr() {
             return XValue::Ptr(Ptr {
                 target_kindexpr: self.langtype.clone(),
@@ -119,22 +123,22 @@ impl XValueHead {
             return XValue::Map(MapValue { langtype: kind });
         }
         match kind.as_str() {
-            KIND_BOOL => XValue::Bool(crate::xvalue_bool::decode_bool(body, &dims)),
-            KIND_INT8 => XValue::Int8(crate::xvalue_int::decode_int8(body, &dims)),
-            KIND_INT16 => XValue::Int16(crate::xvalue_int::decode_int16(body, &dims)),
-            KIND_INT32 => XValue::Int32(crate::xvalue_int::decode_int32(body, &dims)),
-            KIND_INT64 => XValue::Int64(crate::xvalue_int::decode_int64(body, &dims)),
-            KIND_UINT8 => XValue::Uint8(crate::xvalue_uint::decode_uint8(body, &dims)),
-            KIND_UINT16 => XValue::Uint16(crate::xvalue_uint::decode_uint16(body, &dims)),
-            KIND_UINT32 => XValue::Uint32(crate::xvalue_uint::decode_uint32(body, &dims)),
-            KIND_UINT64 => XValue::Uint64(crate::xvalue_uint::decode_uint64(body, &dims)),
-            KIND_FLOAT32 => XValue::Float32(crate::xvalue_float::decode_float32(body, &dims)),
-            KIND_FLOAT64 => XValue::Float64(crate::xvalue_float::decode_float64(body, &dims)),
-            KIND_CHAR_UTF8 => XValue::CharByte(crate::xvalue_byte::decode_char_byte(body, &dims)),
+            KIND_BOOL => XValue::Bool(crate::xvalue_bool::bool_from_wire(body, &dims)),
+            KIND_INT8 => XValue::Int8(crate::xvalue_int::int8_from_wire(body, &dims)),
+            KIND_INT16 => XValue::Int16(crate::xvalue_int::int16_from_wire(body, &dims)),
+            KIND_INT32 => XValue::Int32(crate::xvalue_int::int32_from_wire(body, &dims)),
+            KIND_INT64 => XValue::Int64(crate::xvalue_int::int64_from_wire(body, &dims)),
+            KIND_UINT8 => XValue::Uint8(crate::xvalue_uint::uint8_from_wire(body, &dims)),
+            KIND_UINT16 => XValue::Uint16(crate::xvalue_uint::uint16_from_wire(body, &dims)),
+            KIND_UINT32 => XValue::Uint32(crate::xvalue_uint::uint32_from_wire(body, &dims)),
+            KIND_UINT64 => XValue::Uint64(crate::xvalue_uint::uint64_from_wire(body, &dims)),
+            KIND_FLOAT32 => XValue::Float32(crate::xvalue_float::float32_from_wire(body, &dims)),
+            KIND_FLOAT64 => XValue::Float64(crate::xvalue_float::float64_from_wire(body, &dims)),
+            KIND_CHAR_UTF8 => XValue::CharByte(crate::xvalue_byte::char_byte_from_wire(body, &dims)),
             KIND_CHAR_ASCII => {
-                XValue::CharAscii(crate::xvalue_byte::decode_char_ascii(body, &dims))
+                XValue::CharAscii(crate::xvalue_byte::char_ascii_from_wire(body, &dims))
             }
-            KIND_CHAR => XValue::Char32(crate::xvalue_byte::decode_char32(body, &dims)),
+            KIND_CHAR => XValue::Char32(crate::xvalue_byte::char32_from_wire(body, &dims)),
             _ => XValue::Opaque(Opaque {
                 kind: kind.clone(),
                 body: body.to_vec(),
@@ -146,7 +150,7 @@ impl XValueHead {
 
 // ── Arr：定长/多维数组的 shape 载体 ─────────────────────────────────────
 /// 定长/多维数组 = 连续元素 + 形状。dims 空 = 标量（ndim 0），[n] = 一维，
-/// [d0,d1] = 二维。decode 时从 head 透传，encode 时原样落盘，保证往返不丢 shape。
+/// [d0,d1] = 二维。from_wire 时从 head 透传，to_wire 时原样落盘，保证往返不丢 shape。
 #[derive(Clone, Debug, PartialEq)]
 pub struct Arr<T> {
     pub data: Vec<T>,
@@ -239,27 +243,27 @@ impl XValue {
         }
     }
 
-    pub fn encode(&self) -> Vec<u8> {
+    pub fn to_wire(&self) -> Vec<u8> {
         match self {
-            XValue::None => encode_head("None", 0, &[], &[]),
-            XValue::Ptr(p) => xvalue_encode_ptr(&p.target_kindexpr, p.target.as_bytes()),
-            XValue::Bool(d) => crate::xvalue_bool::encode_bool(&d.data, &d.dims),
-            XValue::Int8(d) => crate::xvalue_int::encode_int8(&d.data, &d.dims),
-            XValue::Int16(d) => crate::xvalue_int::encode_int16(&d.data, &d.dims),
-            XValue::Int32(d) => crate::xvalue_int::encode_int32(&d.data, &d.dims),
-            XValue::Int64(d) => crate::xvalue_int::encode_int64(&d.data, &d.dims),
-            XValue::Uint8(d) => crate::xvalue_uint::encode_uint8(&d.data, &d.dims),
-            XValue::Uint16(d) => crate::xvalue_uint::encode_uint16(&d.data, &d.dims),
-            XValue::Uint32(d) => crate::xvalue_uint::encode_uint32(&d.data, &d.dims),
-            XValue::Uint64(d) => crate::xvalue_uint::encode_uint64(&d.data, &d.dims),
-            XValue::Float32(d) => crate::xvalue_float::encode_float32(&d.data, &d.dims),
-            XValue::Float64(d) => crate::xvalue_float::encode_float64(&d.data, &d.dims),
-            XValue::CharByte(d) => crate::xvalue_byte::encode_char_byte(&d.data, &d.dims),
-            XValue::CharAscii(d) => crate::xvalue_byte::encode_char_ascii(&d.data, &d.dims),
-            XValue::Char32(d) => crate::xvalue_byte::encode_char32(&d.data, &d.dims),
-            XValue::Map(m) => encode_head(&m.langtype, 0, &[], &[]),
-            XValue::Ext(e) => encode_head(&e.langtype, 2, &[], e.locator.as_bytes()),
-            XValue::Opaque(o) => xvalue_encode(&o.kind, &o.body, o.array_len),
+            XValue::None => to_wire_head("None", 0, &[], &[]),
+            XValue::Ptr(p) => xvalue_to_wire_ptr(&p.target_kindexpr, p.target.as_bytes()),
+            XValue::Bool(d) => crate::xvalue_bool::bool_to_wire(&d.data, &d.dims),
+            XValue::Int8(d) => crate::xvalue_int::int8_to_wire(&d.data, &d.dims),
+            XValue::Int16(d) => crate::xvalue_int::int16_to_wire(&d.data, &d.dims),
+            XValue::Int32(d) => crate::xvalue_int::int32_to_wire(&d.data, &d.dims),
+            XValue::Int64(d) => crate::xvalue_int::int64_to_wire(&d.data, &d.dims),
+            XValue::Uint8(d) => crate::xvalue_uint::uint8_to_wire(&d.data, &d.dims),
+            XValue::Uint16(d) => crate::xvalue_uint::uint16_to_wire(&d.data, &d.dims),
+            XValue::Uint32(d) => crate::xvalue_uint::uint32_to_wire(&d.data, &d.dims),
+            XValue::Uint64(d) => crate::xvalue_uint::uint64_to_wire(&d.data, &d.dims),
+            XValue::Float32(d) => crate::xvalue_float::float32_to_wire(&d.data, &d.dims),
+            XValue::Float64(d) => crate::xvalue_float::float64_to_wire(&d.data, &d.dims),
+            XValue::CharByte(d) => crate::xvalue_byte::char_byte_to_wire(&d.data, &d.dims),
+            XValue::CharAscii(d) => crate::xvalue_byte::char_ascii_to_wire(&d.data, &d.dims),
+            XValue::Char32(d) => crate::xvalue_byte::char32_to_wire(&d.data, &d.dims),
+            XValue::Map(m) => to_wire_head(&m.langtype, 0, &[], &[]),
+            XValue::Ext(e) => to_wire_head(&e.langtype, 2, &[], e.locator.as_bytes()),
+            XValue::Opaque(o) => xvalue_to_wire(&o.kind, &o.body, o.array_len),
         }
     }
 
@@ -384,16 +388,16 @@ fn bool_string(b: bool) -> String {
     }
 }
 
-// Headlenpow XValue encoding.
+// Headlenpow XValue wire 转换。
 
-pub fn xvalue_encode(kind: &str, raw: &[u8], array_len: i32) -> Vec<u8> {
-    encode_head(kind, 0, &array_to_header(kind, array_len), raw)
+pub fn xvalue_to_wire(kind: &str, raw: &[u8], array_len: i32) -> Vec<u8> {
+    to_wire_head(kind, 0, &array_to_header(kind, array_len), raw)
 }
 
-/// 指针编码：langtype = 目标完整 kindexpr（含其 [dims]/引用性），storetype = 目标语义 storetype，
-/// 物理字段恒空，body = 目标 key 路径。
-pub fn xvalue_encode_ptr(target_kindexpr: &str, raw: &[u8]) -> Vec<u8> {
-    encode_head(target_kindexpr, 1, &[], raw)
+/// 指针 wire 转换：固定头恒 ST_SLACK + PTR_PTR，body = 目标 key 路径。目标 kindexpr 不进 head
+/// （由调用方写 x‥langtype attr key）。
+pub fn xvalue_to_wire_ptr(_target_kindexpr: &str, raw: &[u8]) -> Vec<u8> {
+    crate::headlenpow::to_wire(ST_SLACK, REF_PTR, raw).unwrap_or_default()
 }
 
 /// array_len → dims：char/* 恒一维（含空串/单字符）；其余标量(≤1)=0 维、多元素=1 维。
@@ -407,132 +411,132 @@ fn array_to_header(kind: &str, array_len: i32) -> Vec<i32> {
     }
 }
 
-pub fn encode_head(kind: &str, r#ref: i32, dims: &[i32], raw: &[u8]) -> Vec<u8> {
-    let (pow, flags, a, b, langtype) = if r#ref == 1 || r#ref == 2 {
-        let pow = (5..=31).find(|&p| kind.len() + crate::headlenpow::PREFIX <= 1usize << p);
-        let Some(pow) = pow else { return Vec::new() };
-        (
-            pow,
-            if r#ref == 1 { 5 } else { 3 },
-            raw.len() as u64,
-            raw.len() as u64,
-            kind.to_string(),
-        )
+/// 固定 8 字节 head 落盘：storetype 按 kind/dims 判定，ptr 按 ref 判定，body = raw 原样。
+/// langtype 不进 head（调用方写 x‥langtype attr key）。
+///
+/// storetype 判定（对齐 kvspace 三正交轴与 C codec）：
+/// - ref==1（指针）→ ST_SLACK；ref==2（@ext）→ ST_EXT；
+/// - rwir/def langtype 或带 body 的 rwfunc（代码槽）→ ST_SLACK；
+/// - char/*（字符/字节数组）→ ST_SLACK；
+/// - dims 非空且非 map/struct → ST_LARGE（张量）；
+/// - 否则 ST_SHORT（None/标量/目录/map 头/空 rwfunc 目录值）。
+pub fn to_wire_head(kind: &str, r#ref: i32, dims: &[i32], raw: &[u8]) -> Vec<u8> {
+    let storetype = if r#ref == 2 {
+        ST_EXT
+    } else if r#ref == 1 {
+        ST_SLACK
     } else if r#ref != 0 {
         return Vec::new();
-    } else if kind.is_empty() || kind == "None" {
-        (5, 0, 0, 0, String::new())
-    } else if matches!(kind, "char/utf8" | "char/ascii" | "char/utf32") {
-        let count = match kind {
-            "char/utf8" => std::str::from_utf8(raw).ok().map(|s| s.chars().count()),
-            "char/ascii" if raw.is_ascii() => Some(raw.len()),
-            "char/utf32"
-                if raw.len() % 4 == 0
-                    && raw.chunks_exact(4).all(|c| {
-                        char::from_u32(u32::from_le_bytes(c.try_into().unwrap())).is_some()
-                    }) =>
-            {
-                Some(raw.len() / 4)
-            }
-            _ => None,
-        };
-        let Some(count) = count else {
-            return Vec::new();
-        };
-        (
-            6,
-            1,
-            raw.len() as u64,
-            raw.len() as u64,
-            format!("[{count}]{kind}"),
-        )
-    } else if matches!(kind, "rwir" | "rwfunc") && raw.len() >= 5 || kind == "def langtype" {
-        (5, 1, raw.len() as u64, raw.len() as u64, kind.to_string())
+    } else if matches!(kind, "rwir" | "def langtype") || (kind == "rwfunc" && !raw.is_empty()) {
+        ST_SLACK
+    } else if kind.starts_with("char/") {
+        ST_SLACK
     } else if !dims.is_empty() && !kind.contains('·') && !kind.starts_with('/') {
-        let Some(numel) = dims.iter().try_fold(1u64, |n, &d| {
-            u64::try_from(d).ok().and_then(|d| n.checked_mul(d))
-        }) else {
-            return Vec::new();
-        };
-        let width = elem_size(kind);
-        if width <= 0 {
-            return Vec::new();
-        }
-        (
-            7,
-            2,
-            numel,
-            width as u64,
-            format!(
-                "[{}]{kind}",
-                dims.iter()
-                    .map(i32::to_string)
-                    .collect::<Vec<_>>()
-                    .join(",")
-            ),
-        )
+        ST_LARGE
     } else {
-        let pow = (5..=31).find(|&p| kind.len() + crate::headlenpow::PREFIX <= 1usize << p);
-        let Some(pow) = pow else { return Vec::new() };
-        (pow, 0, 0, 0, kind.to_string())
+        ST_SHORT
     };
-    crate::headlenpow::encode(pow, flags, a, b, &langtype, raw, raw.len()).unwrap_or_default()
+    let ptr = match r#ref {
+        1 => REF_PTR,
+        2 => REF_EXT,
+        _ => REF_INLINE,
+    };
+    crate::headlenpow::to_wire(storetype, ptr, raw).unwrap_or_default()
 }
 
-pub fn decode_xvalue_head(data: &[u8]) -> XValueHead {
-    let Some(h) = crate::headlenpow::decode(data) else {
+/// 从固定 8 字节 head + 侧写 langtype 解析 XValueHead（langtype 从 x‥langtype attr key 读）。
+pub fn from_wire_head(data: &[u8], langtype: &str) -> XValueHead {
+    let Some(h) = crate::headlenpow::from_wire(data) else {
         return XValueHead::default();
     };
-    if h.total != data.len() {
+    let Ok(headlen) = u16::try_from(crate::headlenpow::PREFIX) else {
+        return XValueHead::default();
+    };
+    let body_len = i32::try_from(h.len).unwrap_or(-1);
+    if body_len < 0 {
         return XValueHead::default();
     }
-    let (Ok(headlen), Ok(body_len)) =
-        (u16::try_from(1usize << h.pow), i32::try_from(h.content_len))
-    else {
-        return XValueHead::default();
-    };
-    let dims = if h.flags == 2 || (h.flags == 1 && h.langtype.starts_with('[')) {
-        parse_kindexpr(h.langtype).0
+    let dims = if h.storetype == 2 || (h.storetype == 1 && langtype.starts_with('[')) {
+        parse_kindexpr(langtype).0
     } else {
         Vec::new()
     };
     XValueHead {
         headlen,
-        r#ref: if h.flags == 5 {
+        r#ref: if h.ptr == REF_PTR {
             REF_PTR
-        } else if h.flags == 3 {
+        } else if h.ptr == REF_EXT {
             REF_EXT
         } else {
             REF_INLINE
         },
-        storetype: h.flags & 3,
-        langtype: h.langtype.to_string(),
+        storetype: h.storetype,
+        langtype: langtype.to_string(),
         phys_dims: dims,
-        ro: false,
-        vid: 0,
         body_len,
-        body_cap: (h.total - headlen as usize) as u64,
+        body_cap: h.len as u64,
     }
 }
 
-/// 解析完整 XValue（head + body）为 XValue。
-pub fn decode_xvalue(data: &[u8]) -> XValue {
-    let h = decode_xvalue_head(data);
-    // An empty inline langtype denotes None；Ptr/Ext 的空 langtype 表示「目标不约束」。
+/// 从完整 XValue 字节（固定 head + 侧写 langtype + body）组装 XValue。
+pub fn from_wire(data: &[u8], langtype: &str) -> XValue {
+    let h = from_wire_head(data, langtype);
+    // 空 langtype 表示 None（head 固定后 attr key 缺失 = 无类型）。
     if h.langtype.is_empty() && !h.is_ptr() && h.r#ref() != REF_EXT as i32 {
         return XValue::None;
     }
-    h.decode(h.body(data))
+    h.from_wire(h.body(data))
 }
 
-/// 返回 XValue 的 body 字节。
+/// 返回 XValue 的 body 字节（固定头：body 偏移恒 8）。
 pub fn body_bytes(v: &XValue) -> Vec<u8> {
     if is_none(v) {
         return Vec::new();
     }
-    let data = v.encode();
-    let h = decode_xvalue_head(&data);
-    h.body(&data).to_vec()
+    let data = v.to_wire();
+    match crate::headlenpow::from_wire(&data) {
+        Some(h) => h.body.to_vec(),
+        None => Vec::new(),
+    }
+}
+
+/// 返回 XValue 的完整 langtype 串（含 [dims] 形状段），用于写 x‥langtype attr key。
+/// None → 空串；Ptr/Ext → 目标 kindexpr；Map → 完整 map 类型；Opaque → 自定义 kind；
+/// 数组 → `[d0,d1]kind`（无 dims 则裸 kind）。
+pub fn xvalue_langtype(v: &XValue) -> String {
+    let dims: &[i32] = match v {
+        XValue::None => return String::new(),
+        XValue::Ptr(p) => return p.target_kindexpr.clone(),
+        XValue::Ext(e) => return e.langtype.clone(),
+        XValue::Map(m) => return m.langtype.clone(),
+        XValue::Opaque(o) => return o.kind.clone(),
+        XValue::Bool(d) => &d.dims,
+        XValue::Int8(d) => &d.dims,
+        XValue::Int16(d) => &d.dims,
+        XValue::Int32(d) => &d.dims,
+        XValue::Int64(d) => &d.dims,
+        XValue::Uint8(d) => &d.dims,
+        XValue::Uint16(d) => &d.dims,
+        XValue::Uint32(d) => &d.dims,
+        XValue::Uint64(d) => &d.dims,
+        XValue::Float32(d) => &d.dims,
+        XValue::Float64(d) => &d.dims,
+        XValue::CharByte(d) => &d.dims,
+        XValue::CharAscii(d) => &d.dims,
+        XValue::Char32(d) => &d.dims,
+    };
+    if dims.is_empty() {
+        v.kind().to_string()
+    } else {
+        format!(
+            "[{}]{}",
+            dims.iter()
+                .map(i32::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+            v.kind()
+        )
+    }
 }
 
 /// ElemSize 返回 kind 的单元素字节数；≤0 表示非定长类型（非 byte 派生）。
@@ -573,8 +577,13 @@ mod tests {
     use crate::xvalue_int::new_int64;
 
     fn roundtrip(v: &XValue) {
-        let bytes = v.encode();
-        assert_eq!(*v, decode_xvalue(&bytes), "roundtrip {:?}", v);
+        let bytes = v.to_wire();
+        assert_eq!(
+            *v,
+            from_wire(&bytes, &xvalue_langtype(v)),
+            "roundtrip {:?}",
+            v
+        );
     }
 
     #[test]
@@ -623,21 +632,28 @@ mod tests {
 
     #[test]
     fn directory_and_extension_wire() {
-        let dir = encode_head("lib", 0, &[], &[]);
-        let head = crate::headlenpow::decode(&dir).unwrap();
-        assert_eq!((head.flags, head.langtype, head.content_len), (0, "lib", 0));
+        // 目录值：SHORT、inline、空 body，固定 8 字节 head。
+        let dir = to_wire_head("lib", 0, &[], &[]);
+        assert_eq!(dir.len(), 8);
+        let head = crate::headlenpow::from_wire(&dir).unwrap();
+        assert_eq!(
+            (head.storetype, head.ptr, head.len, head.body.len()),
+            (ST_SHORT, REF_INLINE, 0, 0)
+        );
+        // @ext：ST_EXT + PTR_EXT，body = 定位串（8 + body）。
         let ext = XValue::Ext(ExtHandle {
             langtype: "rwfunc".into(),
             locator: "/lib/f/".into(),
         })
-        .encode();
-        let head = crate::headlenpow::decode(&ext).unwrap();
+        .to_wire();
+        assert_eq!(ext.len(), 8 + "/lib/f/".len());
+        let head = crate::headlenpow::from_wire(&ext).unwrap();
         assert_eq!(
-            (head.flags, head.langtype, head.body),
-            (3, "rwfunc", b"/lib/f/".as_slice())
+            (head.storetype, head.ptr, head.body),
+            (ST_EXT, REF_EXT, b"/lib/f/".as_slice())
         );
         assert_eq!(
-            decode_xvalue(&ext),
+            from_wire(&ext, "rwfunc"),
             XValue::Ext(ExtHandle {
                 langtype: "rwfunc".into(),
                 locator: "/lib/f/".into()
@@ -647,8 +663,9 @@ mod tests {
 
     #[test]
     fn head_fields() {
-        let bytes = new_float64(&[1.0, 2.0, 3.0]).encode();
-        let h = decode_xvalue_head(&bytes);
+        let bytes = new_float64(&[1.0, 2.0, 3.0]).to_wire();
+        assert_eq!(bytes.len(), 8 + 24); // 固定头 8 + 3×f64 body
+        let h = from_wire_head(&bytes, "[3]float64");
         assert_eq!(h.kind(), "float64");
         assert_eq!(h.dims(), vec![3]);
         assert_eq!(h.array_len(), 3);
