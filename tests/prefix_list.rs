@@ -46,9 +46,9 @@ impl KVStore for MemoryStore {
 fn frame_pointer_shadows_code_operand() {
     let store = MemoryStore::default();
     let mut kv = Backend::new(store);
-    let dir = kvspace_durable::headlenpow::to_wire(0, 0, &[]).unwrap();
+    let dir = kvspace_durable::headlenpow::to_wire(0, 0, &[], "").unwrap();
     let code =
-        kvspace_durable::headlenpow::to_wire(1, 0, &[0, 0, 0, 0, 0, b'x']).unwrap();
+        kvspace_durable::headlenpow::to_wire(1, 0, &[0, 0, 0, 0, 0, b'x'], "").unwrap();
     for (key, raw) in [
         ("/lib/f/", dir),
         ("/lib/f/[1,-1]", code.clone()),
@@ -62,7 +62,7 @@ fn frame_pointer_shadows_code_operand() {
         .unwrap();
     }
     kv.ext_index("/vthread/1/[1]/", "/lib/f/").unwrap();
-    let ptr = kvspace_durable::headlenpow::to_wire(1, 1, b"/x").unwrap();
+    let ptr = kvspace_durable::headlenpow::to_wire(1, 1, b"/x", "").unwrap();
     assert!(kv
         .set(&[KVPair {
             key: "/vthread/1/[1]/[1,0]".into(),
@@ -107,12 +107,12 @@ fn new_wire_directories_and_extensions_use_physical_keys() {
     let inspect = store.clone();
     let mut backend = Backend::new(store);
     backend.mkindex("/lib/", 32).unwrap();
-    let dir = kvspace_durable::headlenpow::to_wire(0, 0, &[]).unwrap();
+    let dir = kvspace_durable::headlenpow::to_wire(0, 0, &[], "").unwrap();
     let slot =
-        kvspace_durable::headlenpow::to_wire(1, 0, &[0, 0, 0, 0, 0]).unwrap();
-    let map = kvspace_durable::headlenpow::to_wire(0, 0, &[]).unwrap();
+        kvspace_durable::headlenpow::to_wire(1, 0, &[0, 0, 0, 0, 0], "").unwrap();
+    let map = kvspace_durable::headlenpow::to_wire(0, 0, &[], "").unwrap();
     let scalar =
-        kvspace_durable::headlenpow::to_wire(0, 0, &7i64.to_le_bytes()).unwrap();
+        kvspace_durable::headlenpow::to_wire(0, 0, &7i64.to_le_bytes(), "").unwrap();
     for (key, raw) in [
         ("/lib/f/", dir),
         ("/lib/f/[1,0]", slot.clone()),
