@@ -17,7 +17,6 @@ pub mod fs;
 pub mod headlenpow;
 pub mod kvspace;
 pub mod kvspace_common;
-pub mod metadata;
 pub mod redis;
 pub mod s3;
 pub mod store;

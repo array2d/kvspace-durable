@@ -1,7 +1,7 @@
 // xvalue_float.rs — 对齐 xvalue_float.go
 
 use crate::r#const::*;
-use crate::xvalue::{dims_from_len, encode_head, Arr, XValue};
+use crate::xvalue::{dims_from_len, to_wire_head, Arr, XValue};
 
 pub fn new_float32(v: &[f32]) -> XValue {
     XValue::Float32(Arr {
@@ -16,7 +16,7 @@ pub fn new_float64(v: &[f64]) -> XValue {
     })
 }
 
-pub fn decode_float32(body: &[u8], dims: &[i32]) -> Arr<f32> {
+pub fn float32_from_wire(body: &[u8], dims: &[i32]) -> Arr<f32> {
     Arr {
         data: body
             .chunks_exact(4)
@@ -25,7 +25,7 @@ pub fn decode_float32(body: &[u8], dims: &[i32]) -> Arr<f32> {
         dims: dims.to_vec(),
     }
 }
-pub fn decode_float64(body: &[u8], dims: &[i32]) -> Arr<f64> {
+pub fn float64_from_wire(body: &[u8], dims: &[i32]) -> Arr<f64> {
     Arr {
         data: body
             .chunks_exact(8)
@@ -35,17 +35,17 @@ pub fn decode_float64(body: &[u8], dims: &[i32]) -> Arr<f64> {
     }
 }
 
-pub fn encode_float32(data: &[f32], dims: &[i32]) -> Vec<u8> {
+pub fn float32_to_wire(data: &[f32], dims: &[i32]) -> Vec<u8> {
     let raw: Vec<u8> = data
         .iter()
         .flat_map(|&v| v.to_bits().to_le_bytes())
         .collect();
-    encode_head(KIND_FLOAT32, 0, dims, &raw)
+    to_wire_head(KIND_FLOAT32, 0, dims, &raw)
 }
-pub fn encode_float64(data: &[f64], dims: &[i32]) -> Vec<u8> {
+pub fn float64_to_wire(data: &[f64], dims: &[i32]) -> Vec<u8> {
     let raw: Vec<u8> = data
         .iter()
         .flat_map(|&v| v.to_bits().to_le_bytes())
         .collect();
-    encode_head(KIND_FLOAT64, 0, dims, &raw)
+    to_wire_head(KIND_FLOAT64, 0, dims, &raw)
 }

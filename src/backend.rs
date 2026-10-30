@@ -10,7 +10,10 @@ use crate::kvspace_common::{
 };
 use crate::r#const::*;
 use crate::store::KVStore;
-use crate::xvalue::{decode_xvalue, decode_xvalue_head, is_ptr, ptr_target, XValue, REF_EXT};
+use crate::xvalue::{
+    from_wire, from_wire_head, is_ptr, ptr_target, xvalue_langtype, XValue, REF_EXT, REF_PTR,
+};
+use crate::xvalue_byte::char_byte_to_wire;
 
 pub struct Backend<S: KVStore> {
     store: S,
@@ -21,22 +24,32 @@ impl<S: KVStore> Backend<S> {
         Backend { store }
     }
 
-    fn sync_metadata(&mut self, key: &str, raw: &[u8]) -> Result<(), String> {
-        let head = decode_xvalue_head(raw);
-        if !raw.is_empty() && head.headlen == 0 {
-            return Err(format!("invalid XValue at {key}"));
-        }
-        self.set_metadata(key, head.ro, head.vid)
+    /// langtype attr key key：`x‥langtype`。
+    fn langtype_key(key: &str) -> String {
+        format!("{key}{RUNTIME_MEMBER_SEP}langtype")
     }
 
-    fn metadata_at(&self, key: &str) -> Result<(bool, u32), String> {
-        let meta =
-            crate::metadata::key_for(key).ok_or_else(|| format!("reserved metadata key: {key}"))?;
-        match self.store.get(&meta) {
-            None => Ok((false, 0)),
-            Some(data) => {
-                crate::metadata::decode(&data).ok_or_else(|| format!("invalid metadata at {key}"))
-            }
+    /// 读 key 的 langtype attr key：attr key 值是字符串 XValue（char/utf8），
+    /// 解出明文类型串；无/空/解析失败 → 空串。
+    fn langtype_of(&self, key: &str) -> String {
+        self.store
+            .get(&Self::langtype_key(key))
+            .map(|data| match from_wire(&data, "[]char/utf8") {
+                XValue::CharByte(b) => String::from_utf8_lossy(&b.data).into_owned(),
+                _ => String::new(),
+            })
+            .unwrap_or_default()
+    }
+
+    /// 写/删 key 的 langtype attr key：attr key 值存字符串 XValue（char/utf8）的 wire 字节；
+    /// 空串 → 删除（无类型）。
+    fn set_langtype(&self, key: &str, langtype: &str) {
+        let ltkey = Self::langtype_key(key);
+        if langtype.is_empty() {
+            self.store.del(&[&ltkey]);
+        } else {
+            let wire = char_byte_to_wire(langtype.as_bytes(), &[]);
+            self.store.set(&ltkey, &wire);
         }
     }
 
@@ -106,7 +119,8 @@ impl<S: KVStore> Backend<S> {
         let vals = self.store.get_many(&refs);
         for (i, data) in vals.iter().enumerate() {
             if let Some(data) = data {
-                let v = decode_xvalue(data);
+                let lt = self.langtype_of(&prefixes[i]);
+                let v = from_wire(data, &lt);
                 if is_ptr(&v) {
                     let target = ptr_target(&v);
                     if i + 1 < parts.len() {
@@ -137,7 +151,9 @@ impl<S: KVStore> Backend<S> {
             let end = rest.find(['/', '·']).unwrap_or(rest.len());
             if end > 0 {
                 let name = &rest[..end];
-                if dir != PATH_SEP || name != META_ROOT_NAME {
+                // RUNTIME_MEMBER_SEP（‥）前缀键是系统变量/langtype attr key，List 时隐藏。
+                if (dir != PATH_SEP || name != META_ROOT_NAME) && !name.contains(RUNTIME_MEMBER_SEP)
+                {
                     let direct_dir =
                         rest.as_bytes().get(end) == Some(&b'/') && rest.len() == end + 1;
                     names
@@ -168,13 +184,16 @@ impl<S: KVStore> Backend<S> {
     fn get_dir(&self, dir: &str) -> XValue {
         match self.store.get(dir) {
             None => XValue::None,
-            Some(data) => decode_xvalue(&data),
+            Some(data) => {
+                let langtype = self.langtype_of(dir);
+                from_wire(&data, &langtype)
+            }
         }
     }
 
     fn prefix_ext(&self, prefix: &str) -> String {
         if let Some(data) = self.store.get(prefix) {
-            let head = decode_xvalue_head(&data);
+            let head = from_wire_head(&data, &self.langtype_of(prefix));
             if head.r#ref == REF_EXT {
                 return String::from_utf8_lossy(head.body(&data)).into_owned();
             }
@@ -184,18 +203,6 @@ impl<S: KVStore> Backend<S> {
 }
 
 impl<S: KVStore> KVSpace for Backend<S> {
-    fn set_metadata(&mut self, key: &str, ro: bool, vid: u32) -> Result<(), String> {
-        let meta =
-            crate::metadata::key_for(key).ok_or_else(|| format!("reserved metadata key: {key}"))?;
-        if ro || vid != 0 {
-            let value = crate::metadata::encode(ro, vid)
-                .ok_or_else(|| format!("cannot encode metadata at {key}"))?;
-            self.store.set(&meta, &value);
-        } else {
-            self.store.del(&[&meta]);
-        }
-        Ok(())
-    }
     fn get(&mut self, prefix: &str, keys: &[String], resolve: bool) -> Vec<XValue> {
         Self::assert_dir(prefix);
         let prefix = if resolve {
@@ -207,7 +214,7 @@ impl<S: KVStore> KVSpace for Backend<S> {
         let mut full_keys: Vec<(usize, String)> = Vec::new();
         for (i, k) in keys.iter().enumerate() {
             let full = join_path(&prefix, k);
-            if crate::metadata::is_reserved(&full) {
+            if crate::r#const::is_reserved(&full) {
                 results[i] = Some(XValue::None);
                 continue;
             }
@@ -222,9 +229,10 @@ impl<S: KVStore> KVSpace for Backend<S> {
         // ext-index 仅是主存未命中键的回退目标：延迟到确有缺失键才查 prefix_ext——
         // 否则每次读都为它多付一次 GET（frame 槽恒命中，曾是最热的一条无谓往返）。
         let mut missing: Vec<usize> = Vec::new();
-        for (idx, (i, _)) in full_keys.iter().enumerate() {
+        for (idx, (i, full)) in full_keys.iter().enumerate() {
             if let Some(data) = &full_vals[idx] {
-                results[*i] = Some(decode_xvalue(data));
+                let langtype = self.langtype_of(full);
+                results[*i] = Some(from_wire(data, &langtype));
             } else {
                 missing.push(*i);
             }
@@ -245,9 +253,10 @@ impl<S: KVStore> KVSpace for Backend<S> {
         if !ext_keys.is_empty() {
             let ext_refs: Vec<&str> = ext_keys.iter().map(|(_, t)| t.as_str()).collect();
             let ext_vals = self.store.get_many(&ext_refs);
-            for (idx, (i, _)) in ext_keys.iter().enumerate() {
+            for (idx, (i, t)) in ext_keys.iter().enumerate() {
                 results[*i] = Some(if let Some(data) = &ext_vals[idx] {
-                    decode_xvalue(data)
+                    let langtype = self.langtype_of(t);
+                    from_wire(data, &langtype)
                 } else {
                     XValue::None
                 });
@@ -260,7 +269,7 @@ impl<S: KVStore> KVSpace for Backend<S> {
     }
 
     fn get_raw(&mut self, key: &str) -> Vec<u8> {
-        if crate::metadata::is_reserved(key) {
+        if crate::r#const::is_reserved(key) {
             return Vec::new();
         }
         let (mut p, l) = sep_path(key);
@@ -269,7 +278,7 @@ impl<S: KVStore> KVSpace for Backend<S> {
         }
         let p = self.resolve_path(&p);
         let full = join_path(&p, &l);
-        if crate::metadata::is_reserved(&full) {
+        if crate::r#const::is_reserved(&full) {
             return Vec::new();
         }
         if let Some(data) = self.store.get(&full) {
@@ -285,13 +294,8 @@ impl<S: KVStore> KVSpace for Backend<S> {
         Vec::new()
     }
 
-    fn get_metadata(&mut self, key: &str) -> Result<(bool, u32), String> {
-        let resolved = self.resolve_path(key);
-        self.metadata_at(&resolved)
-    }
-
     fn get_part(&mut self, key: &str, off: u32, len: u32) -> Vec<u8> {
-        if crate::metadata::is_reserved(key) {
+        if crate::r#const::is_reserved(key) {
             return Vec::new();
         }
         let (mut p, l) = sep_path(key);
@@ -300,7 +304,7 @@ impl<S: KVStore> KVSpace for Backend<S> {
         }
         let p = self.resolve_path(&p);
         let full = join_path(&p, &l);
-        if crate::metadata::is_reserved(&full) {
+        if crate::r#const::is_reserved(&full) {
             return Vec::new();
         }
         if self.store.exists(&full) {
@@ -317,7 +321,7 @@ impl<S: KVStore> KVSpace for Backend<S> {
     }
 
     fn set_part(&mut self, key: &str, off: u32, buf: &[u8]) -> Result<(), String> {
-        if crate::metadata::is_reserved(key) {
+        if crate::r#const::is_reserved(key) {
             return Err(format!("reserved metadata key: {key}"));
         }
         let (mut p, l) = sep_path(key);
@@ -326,7 +330,7 @@ impl<S: KVStore> KVSpace for Backend<S> {
         }
         let p = self.resolve_path(&p);
         let full = join_path(&p, &l);
-        if crate::metadata::is_reserved(&full) {
+        if crate::r#const::is_reserved(&full) {
             return Err(format!("reserved metadata key: {full}"));
         }
         if self.store.exists(&full) {
@@ -346,20 +350,28 @@ impl<S: KVStore> KVSpace for Backend<S> {
 
     fn set(&mut self, pairs: &[KVPair]) -> Result<(), String> {
         for pair in pairs {
-            if crate::metadata::is_reserved(&pair.key) {
+            if crate::r#const::is_reserved(&pair.key) {
                 return Err(format!("reserved metadata key: {}", pair.key));
             }
             let key = self.resolve_parent(&pair.key);
-            if key.contains("//") || crate::metadata::is_reserved(&key) {
+            if key.contains("//") || crate::r#const::is_reserved(&key) {
                 return Err(format!("invalid key: {key}"));
             }
-            let raw = pair.raw.clone().unwrap_or_else(|| pair.val.encode());
-            let head = crate::headlenpow::decode(&raw)
+            let raw = pair.raw.clone().unwrap_or_else(|| pair.val.to_wire());
+            let head = crate::headlenpow::from_wire(&raw)
                 .ok_or_else(|| format!("invalid XValue at {key}"))?;
-            if head.total != raw.len() {
+            if head.len as usize + crate::headlenpow::PREFIX != raw.len() {
                 return Err(format!("invalid XValue at {key}"));
             }
-            if let XValue::Ptr(ptr) = decode_xvalue(&raw) {
+            // 固定头无类型：langtype 走 x‥langtype attr key（值侧写自 val）。
+            // ‥ 后缀 key（系统变量/attr key 本体）是叶子，无类型、不写嵌套 attr key。
+            let langtype = if key.contains(RUNTIME_MEMBER_SEP) {
+                String::new()
+            } else {
+                xvalue_langtype(&pair.val)
+            };
+            // 指针校验用声明的 target_kindexpr（val 为 Ptr 时可得；raw 直写无类型则跳过）。
+            if let XValue::Ptr(ptr) = &pair.val {
                 validate_ptr(self, &ptr.target, &ptr.target_kindexpr)?;
             }
             let (parent, _, _) = split_index(&key);
@@ -376,19 +388,20 @@ impl<S: KVStore> KVSpace for Backend<S> {
             if !ext_target.is_empty() && self.store.get(&key).is_none() {
                 let suffix = key.strip_prefix(&parent).unwrap_or("");
                 if self.store.get(&format!("{ext_target}{suffix}")).is_some()
-                    && !(head.flags & 4 != 0 && is_frame_operand_key(&key))
+                    && !(head.ptr == REF_PTR && is_frame_operand_key(&key))
                 {
                     return Err(format!("{}: {}", ERR_EXT_WRITE, key));
                 }
             }
-            self.sync_metadata(&key, &raw)?;
+            // 写序固定：attr 先落，x 后落（x 写 = 提交点，x 存在则类型必完整）。
+            self.set_langtype(&key, &langtype);
             self.store.set(&key, &raw);
         }
         Ok(())
     }
 
     fn list(&mut self, prefix: &str, expand_ext: bool, resolve: bool) -> Vec<String> {
-        if crate::metadata::is_reserved(prefix) {
+        if crate::r#const::is_reserved(prefix) {
             return Vec::new();
         }
         Self::assert_dir(prefix);
@@ -400,7 +413,7 @@ impl<S: KVStore> KVSpace for Backend<S> {
         if !Self::is_dir(&resolved) {
             return Vec::new();
         }
-        if crate::metadata::is_reserved(&resolved) {
+        if crate::r#const::is_reserved(&resolved) {
             return Vec::new();
         }
 
@@ -451,11 +464,11 @@ impl<S: KVStore> KVSpace for Backend<S> {
 
     fn del(&mut self, keys: &[String]) -> Result<(), String> {
         for key in keys {
-            if crate::metadata::is_reserved(key) {
+            if crate::r#const::is_reserved(key) {
                 return Err(format!("reserved metadata key: {key}"));
             }
             let resolved = self.resolve_parent(key);
-            if crate::metadata::is_reserved(&resolved) {
+            if crate::r#const::is_reserved(&resolved) {
                 return Err(format!("reserved metadata key: {resolved}"));
             }
             let (parent, _, _) = split_index(&resolved);
@@ -469,19 +482,21 @@ impl<S: KVStore> KVSpace for Backend<S> {
 
             if Self::is_dir(&resolved) {
                 let link_key = strip_dir_suf(&resolved);
-                self.store.del(&[link_key, &resolved]);
-                self.sync_metadata(link_key, &[])?;
-                self.sync_metadata(&resolved, &[])?;
+                self.store.del(&[
+                    &Self::langtype_key(link_key),
+                    &Self::langtype_key(&resolved),
+                    link_key,
+                    &resolved,
+                ]);
             } else {
-                self.store.del(&[&resolved]);
-                self.sync_metadata(&resolved, &[])?;
+                self.store.del(&[&Self::langtype_key(&resolved), &resolved]);
             }
         }
         Ok(())
     }
 
     fn del_tree(&mut self, prefix: &str) -> Result<(), String> {
-        if crate::metadata::is_reserved(prefix) {
+        if crate::r#const::is_reserved(prefix) {
             return Err(format!("reserved metadata key: {prefix}"));
         }
         let mut link_key = prefix;
@@ -489,14 +504,14 @@ impl<S: KVStore> KVSpace for Backend<S> {
             link_key = strip_dir_suf(prefix);
         }
         if let Some(data) = self.store.get(link_key) {
-            let head = decode_xvalue_head(&data);
+            let head = from_wire_head(&data, &self.langtype_of(link_key));
             if head.is_ptr() {
                 return self.del(&[prefix.to_string()]);
             }
         }
 
         let resolved = self.resolve_path(prefix);
-        if crate::metadata::is_reserved(&resolved) {
+        if crate::r#const::is_reserved(&resolved) {
             return Err(format!("reserved metadata key: {resolved}"));
         }
         let mut scan = resolved.clone();
@@ -507,14 +522,12 @@ impl<S: KVStore> KVSpace for Backend<S> {
             .store
             .scan_keys(&scan)
             .into_iter()
-            .filter(|key| !crate::metadata::is_reserved(key))
+            .filter(|key| !crate::r#const::is_reserved(key))
             .collect();
 
-        self.store.del(&[&resolved]);
-        self.sync_metadata(&resolved, &[])?;
+        self.store.del(&[&Self::langtype_key(&resolved), &resolved]);
         for k in &keys {
-            self.store.del(&[k]);
-            self.sync_metadata(k, &[])?;
+            self.store.del(&[&Self::langtype_key(k), k]);
         }
 
         Ok(())
@@ -522,32 +535,31 @@ impl<S: KVStore> KVSpace for Backend<S> {
 
     /// 单 key 拷贝：src 处 XValue（head+body 原样）写到 dst，并注册进 dst 父 index；不触碰 src·/成员。
     fn cp(&mut self, src: &str, dst: &str) -> Result<(), String> {
-        if crate::metadata::is_reserved(src) || crate::metadata::is_reserved(dst) {
+        if crate::r#const::is_reserved(src) || crate::r#const::is_reserved(dst) {
             return Err("reserved metadata key".into());
         }
         let raw = self.get_raw(src);
         if raw.is_empty() {
             return Err(format!("Cp: source not found: {}", src));
         }
-        let (ro, vid) = self.metadata_at(src)?;
-        let v = decode_xvalue(&raw);
+        // attr key 与值同址：读解析后的物理 src 路径的类型。
+        let v = from_wire(&raw, &self.langtype_of(&self.resolve_parent(src)));
         self.set(&[KVPair {
             key: dst.to_string(),
             val: v,
             raw: Some(raw),
-        }])?;
-        self.set_metadata(dst, ro, vid)
+        }])
     }
 
     /// 递归子树拷贝：以 src 为根，把整棵物理子树（base + 所有 ·/ 后代 key）字节级重映射到 dst。
     /// extindex 成员的 marker（含 ext_path）原样复制 → 在 dst 侧生成指向同一只读扩展的新 extindex。
     fn cp_tree(&mut self, src: &str, dst: &str) -> Result<(), String> {
-        if crate::metadata::is_reserved(src) || crate::metadata::is_reserved(dst) {
+        if crate::r#const::is_reserved(src) || crate::r#const::is_reserved(dst) {
             return Err("reserved metadata key".into());
         }
         let src_res = self.resolve_path(src);
         let dst_res = self.resolve_path(dst);
-        if crate::metadata::is_reserved(&src_res) || crate::metadata::is_reserved(&dst_res) {
+        if crate::r#const::is_reserved(&src_res) || crate::r#const::is_reserved(&dst_res) {
             return Err("reserved metadata key".into());
         }
         let mut src_scan = src_res.clone();
@@ -568,7 +580,7 @@ impl<S: KVStore> KVSpace for Backend<S> {
             .store
             .scan_keys(&src_scan)
             .into_iter()
-            .filter(|key| !crate::metadata::is_reserved(key))
+            .filter(|key| !crate::r#const::is_reserved(key))
             .collect();
         if keys.is_empty() {
             return Err(format!("CpTree: source not found: {}", src));
@@ -579,9 +591,7 @@ impl<S: KVStore> KVSpace for Backend<S> {
             let suffix = &k[src_scan.len()..];
             let new_key = format!("{}{}", dst_base, suffix);
             if let Some(data) = self.store.get(k) {
-                let (ro, vid) = self.metadata_at(k)?;
                 self.store.set(&new_key, &data);
-                self.set_metadata(&new_key, ro, vid)?;
             }
         }
         Ok(())
@@ -589,7 +599,7 @@ impl<S: KVStore> KVSpace for Backend<S> {
 
     /// 浅拷贝：base 值 + 一层 · 成员（不递归成员子树、不遍历 / 子节点）。用于单 struct/扁平容器。
     fn cp_list(&mut self, src: &str, dst: &str) -> Result<(), String> {
-        if crate::metadata::is_reserved(src) || crate::metadata::is_reserved(dst) {
+        if crate::r#const::is_reserved(src) || crate::r#const::is_reserved(dst) {
             return Err("reserved metadata key".into());
         }
         let mut src_base = self.resolve_path(src);
@@ -597,7 +607,7 @@ impl<S: KVStore> KVSpace for Backend<S> {
             src_base.pop();
         }
         let mut dst_base = self.resolve_path(dst);
-        if crate::metadata::is_reserved(&src_base) || crate::metadata::is_reserved(&dst_base) {
+        if crate::r#const::is_reserved(&src_base) || crate::r#const::is_reserved(&dst_base) {
             return Err("reserved metadata key".into());
         }
         if Self::is_dir(&dst_base) && dst_base != PATH_SEP {
@@ -610,7 +620,7 @@ impl<S: KVStore> KVSpace for Backend<S> {
             .store
             .scan_keys(&src_base)
             .into_iter()
-            .filter(|key| !crate::metadata::is_reserved(key))
+            .filter(|key| !crate::r#const::is_reserved(key))
             .collect();
         if keys.is_empty() {
             return Err(format!("CpList: source not found: {}", src));
@@ -618,8 +628,9 @@ impl<S: KVStore> KVSpace for Backend<S> {
         let _ = self.del_tree(&dst_base);
         for k in &keys {
             let suffix = &k[src_base.len()..];
-            // Copy the base and direct members, including ext directories.
+            // Copy the base（含其 langtype attr key）、直接 · 成员（含成员 attr key）与 ext 目录。
             let one_level = suffix.is_empty()
+                || suffix == format!("{RUNTIME_MEMBER_SEP}langtype")
                 || (suffix.starts_with(OBJ_SEP) && {
                     let rest = &suffix[OBJ_SEP.len()..];
                     let member = rest.strip_suffix(PATH_SEP).unwrap_or(rest);
@@ -630,9 +641,7 @@ impl<S: KVStore> KVSpace for Backend<S> {
             }
             if let Some(data) = self.store.get(k) {
                 let new_key = format!("{}{}", dst_base, suffix);
-                let (ro, vid) = self.metadata_at(k)?;
                 self.store.set(&new_key, &data);
-                self.set_metadata(&new_key, ro, vid)?;
             }
         }
         Ok(())
@@ -648,9 +657,11 @@ impl<S: KVStore> KVSpace for Backend<S> {
         }
         let _ = capacity;
         let resolved = self.resolve_path(path);
-        let value = crate::headlenpow::encode(5, 0, 0, 0, "lib", &[], 0)
+        // 固定头空目录 marker：storetype 0、ptr 0、空 body；类型 "lib" 走 attr key。
+        let value = crate::headlenpow::to_wire(0, 0, &[])
             .ok_or_else(|| format!("Mkindex: invalid directory {resolved}"))?;
         if self.store.get(&resolved).is_none() {
+            self.set_langtype(&resolved, "lib");
             self.store.set(&resolved, &value);
         }
         Ok(())
@@ -668,25 +679,14 @@ impl<S: KVStore> KVSpace for Backend<S> {
         }
 
         let resolved = self.resolve_parent(path);
-        let source = self
-            .store
-            .get(ext_path)
-            .ok_or_else(|| format!("ExtIndex target missing: {ext_path}"))?;
-        let langtype = decode_xvalue_head(&source).langtype;
-        let pow = (5..=31)
-            .find(|&p| 18 + langtype.len() <= 1usize << p)
-            .ok_or_else(|| format!("ExtIndex type too long: {langtype}"))?;
-        let len = ext_path.len() as u64;
-        let value = crate::headlenpow::encode(
-            pow,
-            3,
-            len,
-            len,
-            &langtype,
-            ext_path.as_bytes(),
-            ext_path.len(),
-        )
-        .ok_or_else(|| format!("ExtIndex locator invalid: {ext_path}"))?;
+        if self.store.get(ext_path).is_none() {
+            return Err(format!("ExtIndex target missing: {ext_path}"));
+        }
+        let langtype = self.langtype_of(ext_path);
+        // 扩展定位：storetype 3（ST_EXT）+ ptr 2（PTR_EXT）+ 定位串 body。
+        let value = crate::headlenpow::to_wire(3, 2, ext_path.as_bytes())
+            .ok_or_else(|| format!("ExtIndex locator invalid: {ext_path}"))?;
+        self.set_langtype(&resolved, &langtype);
         self.store.set(&resolved, &value);
         Ok(())
     }
@@ -699,16 +699,14 @@ impl<S: KVStore> KVSpace for Backend<S> {
             link_key = strip_dir_suf(&resolved);
         }
         if let Some(data) = self.store.get(link_key) {
-            let head = decode_xvalue_head(&data);
+            let head = from_wire_head(&data, &self.langtype_of(link_key));
             if head.is_ptr() {
-                self.store.del(&[link_key]);
-                self.set_metadata(link_key, false, 0)?;
+                self.store.del(&[&Self::langtype_key(link_key), link_key]);
                 return Ok(());
             }
         }
 
-        self.store.del(&[&resolved]);
-        self.set_metadata(&resolved, false, 0)?;
+        self.store.del(&[&Self::langtype_key(&resolved), &resolved]);
         Ok(())
     }
 

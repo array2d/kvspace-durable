@@ -1,7 +1,7 @@
 // xvalue_int.rs — 对齐 xvalue_int.go
 
 use crate::r#const::*;
-use crate::xvalue::{dims_from_len, encode_head, Arr, XValue};
+use crate::xvalue::{dims_from_len, to_wire_head, Arr, XValue};
 
 pub fn new_int64(v: &[i64]) -> XValue {
     XValue::Int64(Arr {
@@ -10,13 +10,13 @@ pub fn new_int64(v: &[i64]) -> XValue {
     })
 }
 
-pub fn decode_int8(body: &[u8], dims: &[i32]) -> Arr<i8> {
+pub fn int8_from_wire(body: &[u8], dims: &[i32]) -> Arr<i8> {
     Arr {
         data: body.iter().map(|&b| b as i8).collect(),
         dims: dims.to_vec(),
     }
 }
-pub fn decode_int16(body: &[u8], dims: &[i32]) -> Arr<i16> {
+pub fn int16_from_wire(body: &[u8], dims: &[i32]) -> Arr<i16> {
     Arr {
         data: body
             .chunks_exact(2)
@@ -25,7 +25,7 @@ pub fn decode_int16(body: &[u8], dims: &[i32]) -> Arr<i16> {
         dims: dims.to_vec(),
     }
 }
-pub fn decode_int32(body: &[u8], dims: &[i32]) -> Arr<i32> {
+pub fn int32_from_wire(body: &[u8], dims: &[i32]) -> Arr<i32> {
     Arr {
         data: body
             .chunks_exact(4)
@@ -34,7 +34,7 @@ pub fn decode_int32(body: &[u8], dims: &[i32]) -> Arr<i32> {
         dims: dims.to_vec(),
     }
 }
-pub fn decode_int64(body: &[u8], dims: &[i32]) -> Arr<i64> {
+pub fn int64_from_wire(body: &[u8], dims: &[i32]) -> Arr<i64> {
     Arr {
         data: body
             .chunks_exact(8)
@@ -44,28 +44,28 @@ pub fn decode_int64(body: &[u8], dims: &[i32]) -> Arr<i64> {
     }
 }
 
-pub fn encode_int8(data: &[i8], dims: &[i32]) -> Vec<u8> {
+pub fn int8_to_wire(data: &[i8], dims: &[i32]) -> Vec<u8> {
     let raw: Vec<u8> = data.iter().map(|&v| v as u8).collect();
-    encode_head(KIND_INT8, 0, dims, &raw)
+    to_wire_head(KIND_INT8, 0, dims, &raw)
 }
-pub fn encode_int16(data: &[i16], dims: &[i32]) -> Vec<u8> {
+pub fn int16_to_wire(data: &[i16], dims: &[i32]) -> Vec<u8> {
     let raw: Vec<u8> = data
         .iter()
         .flat_map(|&v| (v as u16).to_le_bytes())
         .collect();
-    encode_head(KIND_INT16, 0, dims, &raw)
+    to_wire_head(KIND_INT16, 0, dims, &raw)
 }
-pub fn encode_int32(data: &[i32], dims: &[i32]) -> Vec<u8> {
+pub fn int32_to_wire(data: &[i32], dims: &[i32]) -> Vec<u8> {
     let raw: Vec<u8> = data
         .iter()
         .flat_map(|&v| (v as u32).to_le_bytes())
         .collect();
-    encode_head(KIND_INT32, 0, dims, &raw)
+    to_wire_head(KIND_INT32, 0, dims, &raw)
 }
-pub fn encode_int64(data: &[i64], dims: &[i32]) -> Vec<u8> {
+pub fn int64_to_wire(data: &[i64], dims: &[i32]) -> Vec<u8> {
     let raw: Vec<u8> = data
         .iter()
         .flat_map(|&v| (v as u64).to_le_bytes())
         .collect();
-    encode_head(KIND_INT64, 0, dims, &raw)
+    to_wire_head(KIND_INT64, 0, dims, &raw)
 }

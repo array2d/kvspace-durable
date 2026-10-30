@@ -10,29 +10,39 @@
 
 use kvspace_durable::ffi::*;
 
-/// 64KB 级 char/utf8 值：[n]char/utf8，body 全 0（仅用于内存观测）。
+/// 64KB 级 char/utf8 值：storetype 1 变长、body 全 0（仅用于内存观测）。
+/// wire = [len:u48 @0-5][storetype:u8 @6][ptr:u8 @7][body]，body 偏移恒 8。
 fn xvalue_pad(n: usize) -> Vec<u8> {
-    let mut v = vec![0u8; 64 + n];
-    v[0] = 6; // headlen = 64
-    v[1] = 1; // flags: array/storetype 1
-    v[2..10].copy_from_slice(&(n as u64).to_le_bytes());
-    v[10..18].copy_from_slice(&(n as u64).to_le_bytes());
-    let lt = format!("[{n}]char/utf8");
-    v[18..18 + lt.len()].copy_from_slice(lt.as_bytes());
+    let mut v = vec![0u8; 8 + n];
+    v[0..6].copy_from_slice(&(n as u64).to_le_bytes()[..6]);
+    v[6] = 1; // storetype: slack
+    v[7] = 0; // ptr: inline
     v
 }
 
 fn xvalue_i64(n: i64) -> Vec<u8> {
-    let mut v = vec![0u8; 40];
-    v[0] = 5; // headlen = 32
-    v[18..23].copy_from_slice(b"int64");
-    v[32..40].copy_from_slice(&n.to_le_bytes());
+    let mut v = vec![0u8; 16];
+    v[0..6].copy_from_slice(&8u64.to_le_bytes()[..6]);
+    v[6] = 0; // storetype: short
+    v[7] = 0; // ptr: inline
+    v[8..16].copy_from_slice(&n.to_le_bytes());
     v
 }
 
 unsafe fn set(h: *mut Handle, key: &str, n: i64) {
     let mut k = key.as_bytes().to_vec();
     k.push(0);
+    /* 值用裸 wire 写（测试自构 head），但 watch/read 走 langtype attr key 判定类型，
+       故写值前先落明文 "int64" attr key——对齐生产侧 set 的「attr 先落、x 后落」。 */
+    let mut lt = key.as_bytes().to_vec();
+    lt.extend_from_slice("\u{2025}langtype".as_bytes());
+    lt.push(0);
+    let lt_v = xvalue_utf8("int64");
+    assert_eq!(
+        kvspaceSetValue(h, lt.as_ptr() as *const _, lt_v.as_ptr(), lt_v.len() as u32, std::ptr::null_mut(), 0),
+        0,
+        "set langtype {key}"
+    );
     let v = xvalue_i64(n);
     let mut err = [0i8; 128];
     let rc = kvspaceSetValue(
@@ -40,8 +50,6 @@ unsafe fn set(h: *mut Handle, key: &str, n: i64) {
         k.as_ptr() as *const _,
         v.as_ptr(),
         v.len() as u32,
-        0,
-        0,
         err.as_mut_ptr(),
         err.len() as u32,
     );
@@ -58,9 +66,9 @@ unsafe fn get_ptr(h: *mut Handle, key: &str) -> (*mut u8, u32) {
 }
 
 unsafe fn read_i64(p: *const u8, l: u32) -> i64 {
-    assert!(l >= 40, "len={l}");
+    assert!(l >= 16, "len={l}");
     let mut b = [0u8; 8];
-    b.copy_from_slice(std::slice::from_raw_parts(p.add(32), 8));
+    b.copy_from_slice(std::slice::from_raw_parts(p.add(8), 8));
     i64::from_le_bytes(b)
 }
 
@@ -159,7 +167,7 @@ fn read_cache_lifetime_and_invalidation() {
         let mut pp: *mut u8 = std::ptr::null_mut();
         let mut pl: u32 = 0;
         assert_eq!(
-            kvspaceGetPart(h, ckey("/a").as_ptr() as *const _, 32, 8, &mut pp, &mut pl),
+            kvspaceGetPart(h, ckey("/a").as_ptr() as *const _, 8, 8, &mut pp, &mut pl),
             0
         );
         let mut b = [0u8; 8];
@@ -200,8 +208,6 @@ fn memory_growth() {
                     k.as_ptr() as *const _,
                     v.as_ptr(),
                     v.len() as u32,
-                    0,
-                    0,
                     std::ptr::null_mut(),
                     0
                 ),
@@ -212,7 +218,7 @@ fn memory_growth() {
         for i in 0..N {
             let key = format!("/k{i}");
             let (p, l) = get_ptr(h, &key);
-            assert!(!p.is_null() && l == 64 + 64 * 1024);
+            assert!(!p.is_null() && l == 8 + 64 * 1024);
             if i + 1 == 500 || i + 1 == 1000 || i + 1 == N {
                 eprintln!(
                     "rss after {} reads: {} KB (+{})",
@@ -258,7 +264,7 @@ fn same_key_two_reads_and_watch_retire() {
             &mut wl,
         );
         assert_eq!(rc, 0);
-        assert!(!wp.is_null() && wl >= 40);
+        assert!(!wp.is_null() && wl >= 16);
         assert_eq!(read_i64(p1, l1), 7, "old view must stay valid after watch");
         assert_eq!(read_i64(wp, wl), 7);
 
@@ -269,20 +275,17 @@ fn same_key_two_reads_and_watch_retire() {
 
 fn xvalue_utf8(s: &str) -> Vec<u8> {
     let n = s.len();
-    let mut v = vec![0u8; 64 + n];
-    v[0] = 6;
-    v[1] = 1;
-    v[2..10].copy_from_slice(&(n as u64).to_le_bytes());
-    v[10..18].copy_from_slice(&(n as u64).to_le_bytes());
-    let lt = format!("[{n}]char/utf8");
-    v[18..18 + lt.len()].copy_from_slice(lt.as_bytes());
-    v[64..].copy_from_slice(s.as_bytes());
+    let mut v = vec![0u8; 8 + n];
+    v[0..6].copy_from_slice(&(n as u64).to_le_bytes()[..6]);
+    v[6] = 1; // storetype: slack
+    v[7] = 0; // ptr: inline
+    v[8..].copy_from_slice(s.as_bytes());
     v
 }
 
 unsafe fn read_str(p: *const u8, l: u32) -> String {
-    assert!(l >= 64);
-    String::from_utf8_lossy(std::slice::from_raw_parts(p.add(64), (l - 64) as usize)).into_owned()
+    assert!(l >= 8);
+    String::from_utf8_lossy(std::slice::from_raw_parts(p.add(8), (l - 8) as usize)).into_owned()
 }
 
 unsafe fn set_str(h: *mut Handle, key: &str, s: &str) {
@@ -295,8 +298,6 @@ unsafe fn set_str(h: *mut Handle, key: &str, s: &str) {
             k.as_ptr() as *const _,
             v.as_ptr(),
             v.len() as u32,
-            0,
-            0,
             std::ptr::null_mut(),
             0
         ),

@@ -8,7 +8,7 @@ use crate::xvalue::XValue;
 pub struct KVPair {
     pub key: String,
     pub val: XValue,
-    pub raw: Option<Vec<u8>>, // 原始 XValue 字节：Set 透传，保留 head 权限位（ro/vid）
+    pub raw: Option<Vec<u8>>, // 原始 XValue 字节：Set 透传，逐字节保留
 }
 
 /// KVSpace KV 存储接口。
@@ -40,10 +40,17 @@ pub trait KVSpace {
 
     /// 单点读：Get 返回完整 XValue，整存整取。
     fn get(&mut self, prefix: &str, keys: &[String], resolve: bool) -> Vec<XValue>;
-    /// 单点读原始字节（不 decode/re-encode，保 head 权限位 ro/vid）。无值返回空。
+    /// 单点读原始字节（不经 wire 转换）。无值返回空。
     fn get_raw(&mut self, key: &str) -> Vec<u8>;
-    fn get_metadata(&mut self, key: &str) -> Result<(bool, u32), String>;
-    fn set_metadata(&mut self, key: &str, ro: bool, vid: u32) -> Result<(), String>;
+    /// 读 x‥langtype attr key 的明文类型串：attr key 值是字符串 XValue（char/utf8），
+    /// 解出明文；无/空/解析失败 → 空串。
+    fn langtype_of(&mut self, key: &str) -> String {
+        let ltkey = format!("{key}{}langtype", crate::r#const::RUNTIME_MEMBER_SEP);
+        match crate::xvalue::from_wire(&self.get_raw(&ltkey), "[]char/utf8") {
+            XValue::CharByte(b) => String::from_utf8_lossy(&b.data).into_owned(),
+            _ => String::new(),
+        }
+    }
     /// 单点写：Set 写完整 XValue，并维护目录索引；只解析父路径 link，整键不穿透。
     fn set(&mut self, pairs: &[KVPair]) -> Result<(), String>;
 

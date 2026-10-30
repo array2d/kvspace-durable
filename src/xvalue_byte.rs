@@ -1,7 +1,7 @@
 // xvalue_byte.rs — 对齐 xvalue_byte.go（char/utf8、char/ascii、char/utf32）
 
 use crate::r#const::*;
-use crate::xvalue::{encode_head, Arr, XValue};
+use crate::xvalue::{to_wire_head, Arr, XValue};
 
 /// char/* 恒一维序列（含空串/单字符），dims = [len]。
 fn char_dims(n: usize) -> Vec<i32> {
@@ -42,19 +42,19 @@ pub fn new_char(kind: &str, s: &str) -> XValue {
     }
 }
 
-pub fn decode_char_byte(body: &[u8], dims: &[i32]) -> Arr<u8> {
+pub fn char_byte_from_wire(body: &[u8], dims: &[i32]) -> Arr<u8> {
     Arr {
         data: body.to_vec(),
         dims: dims.to_vec(),
     }
 }
-pub fn decode_char_ascii(body: &[u8], dims: &[i32]) -> Arr<u8> {
+pub fn char_ascii_from_wire(body: &[u8], dims: &[i32]) -> Arr<u8> {
     Arr {
         data: body.to_vec(),
         dims: dims.to_vec(),
     }
 }
-pub fn decode_char32(body: &[u8], dims: &[i32]) -> Arr<u32> {
+pub fn char32_from_wire(body: &[u8], dims: &[i32]) -> Arr<u32> {
     Arr {
         data: body
             .chunks_exact(4)
@@ -64,15 +64,15 @@ pub fn decode_char32(body: &[u8], dims: &[i32]) -> Arr<u32> {
     }
 }
 
-pub fn encode_char_byte(data: &[u8], dims: &[i32]) -> Vec<u8> {
-    encode_head(KIND_CHAR_UTF8, 0, dims, data)
+pub fn char_byte_to_wire(data: &[u8], dims: &[i32]) -> Vec<u8> {
+    to_wire_head(KIND_CHAR_UTF8, 0, dims, data)
 }
-pub fn encode_char_ascii(data: &[u8], dims: &[i32]) -> Vec<u8> {
-    encode_head(KIND_CHAR_ASCII, 0, dims, data)
+pub fn char_ascii_to_wire(data: &[u8], dims: &[i32]) -> Vec<u8> {
+    to_wire_head(KIND_CHAR_ASCII, 0, dims, data)
 }
-pub fn encode_char32(data: &[u32], dims: &[i32]) -> Vec<u8> {
+pub fn char32_to_wire(data: &[u32], dims: &[i32]) -> Vec<u8> {
     let raw: Vec<u8> = data.iter().flat_map(|&v| v.to_le_bytes()).collect();
-    encode_head(KIND_CHAR, 0, dims, &raw)
+    to_wire_head(KIND_CHAR, 0, dims, &raw)
 }
 
 /// IsCharKind 判断 kind 是否为字符家族（前缀 char/）。
