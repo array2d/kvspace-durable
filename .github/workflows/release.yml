@@ -19,8 +19,10 @@ jobs:
           v="${GITHUB_REF_NAME}"
           d="kvspace-durable-abi-$v-linux-x86_64"
           mkdir -p "$d/include" "$d/lib"
-          # 头：本仓为 Rust（无 C 头），权威 ABI 头在 kvspace 仓 → 递归整目录
-          git clone --depth 1 https://github.com/array2d/kvspace.git /tmp/kvspace-hdr
+          # Bundle ABI headers pinned to the kvspace tag in deps.json.
+          kvspace_ver=$(jq -r '.kvspace' deps.json)
+          test -n "$kvspace_ver" && test "$kvspace_ver" != null
+          git clone --depth 1 --branch "$kvspace_ver" https://github.com/array2d/kvspace.git /tmp/kvspace-hdr
           cp -R /tmp/kvspace-hdr/include/. "$d/include/"
           # 库：扫 target/release 的 .so*/.dylib（-P 保符号链接）
           find target/release -maxdepth 2 \( -name 'lib*.so*' -o -name 'lib*.dylib' \) -exec cp -P {} "$d/lib/" \;
