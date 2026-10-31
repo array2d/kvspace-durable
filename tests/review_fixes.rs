@@ -359,6 +359,52 @@ unsafe fn run_backend_suite(dsn: &str, root: &str) {
         );
     }
 
+    // 9. /lib/<func>/‥ctime cross-handle hot-reload detection and retired snapshot retention.
+    let func_dir = format!("/lib/rf_hot_{}", std::process::id());
+    let k_ctime = format!("{func_dir}/\u{2025}ctime");
+    let k_insn = format!("{func_dir}/[1,0]");
+    let w_ctime1 = new_int64(&[1000]).to_wire();
+    let w_insn1 = headlenpow::to_wire(ST_SLACK, REF_INLINE, b"ret 10", "").unwrap();
+    set_raw_checked(h, &k_ctime, &w_ctime1);
+    set_raw_checked(h, &k_insn, &w_insn1);
+
+    // Prime handle `h` with ‥ctime and [1,0], keeping a borrowed pointer to the old [1,0] view.
+    let (rc_ct1, p_ct1, l_ct1) = get_raw_c(h, &k_ctime, 0);
+    let (rc_in1, p_in1, l_in1) = get_raw_c(h, &k_insn, 0);
+    assert_eq!((rc_ct1, rc_in1), (0, 0));
+    assert_eq!(std::slice::from_raw_parts(p_ct1, l_ct1 as usize), w_ctime1.as_slice());
+    assert_eq!(std::slice::from_raw_parts(p_in1, l_in1 as usize), w_insn1.as_slice());
+
+    // Simulate external relayout via `h2` updating [1,0] and ‥ctime.
+    let h2 = connect_c(dsn);
+    let w_ctime2 = new_int64(&[2000]).to_wire();
+    let w_insn2 = headlenpow::to_wire(ST_SLACK, REF_INLINE, b"ret 20", "").unwrap();
+    set_raw_checked(h2, &k_insn, &w_insn2);
+    set_raw_checked(h2, &k_ctime, &w_ctime2);
+    kvspaceClose(h2);
+
+    // Re-reading ‥ctime on `h` observes the new timestamp, retires cached [1,0], and keeps p_in1 valid.
+    let (rc_ct2, p_ct2, l_ct2) = get_raw_c(h, &k_ctime, 0);
+    assert_eq!(rc_ct2, 0);
+    assert_eq!(
+        std::slice::from_raw_parts(p_ct2, l_ct2 as usize),
+        w_ctime2.as_slice(),
+        "cross-handle /lib/*/‥ctime update must be visible immediately"
+    );
+    let (rc_in2, p_in2, l_in2) = get_raw_c(h, &k_insn, 0);
+    assert_eq!(rc_in2, 0);
+    assert_eq!(
+        std::slice::from_raw_parts(p_in2, l_in2 as usize),
+        w_insn2.as_slice(),
+        "instructions under func_dir must reload after ‥ctime changes"
+    );
+    assert_eq!(
+        std::slice::from_raw_parts(p_in1, l_in1 as usize),
+        w_insn1.as_slice(),
+        "retired instruction snapshot must remain valid until Close"
+    );
+    deltree_c(h, &func_dir);
+
     deltree_c(h, root);
     kvspaceClose(h);
 }

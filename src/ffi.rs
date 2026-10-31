@@ -40,7 +40,8 @@ pub struct VolatileBuf {
 
 /// 外部可改写、必须每读重读后端的控制键（normative：见 spec CABI）。
 fn is_volatile(key: &str) -> bool {
-    key.starts_with("/vthread/") && key.ends_with("\u{2025}status")
+    (key.starts_with("/vthread/") && key.ends_with("\u{2025}status"))
+        || (key.starts_with("/lib/") && key.ends_with("/\u{2025}ctime"))
 }
 
 pub struct Handle {
@@ -173,20 +174,47 @@ fn under_prefix(key: &str, prefix: &str) -> bool {
 }
 
 /// 控制键重读后端并写入双缓冲的另一块（上一块保活到该 key 下一次读）。
+/// When `/lib/<func>/‥ctime` changes, moves cached entries under `<func>` into `retired`
+/// so cross-handle relayout updates are visible immediately without invalidating borrowed pointers.
 fn volatile_refresh(hd: &mut Handle, key: &str) -> bool {
     let raw = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hd.kv.get_raw(key))) {
         Ok(r) => r,
         Err(_) => return false,
     };
-    let vb = hd
-        .volatile_cache
-        .entry(key.to_string())
-        .or_insert_with(|| VolatileBuf {
-            slots: [Vec::new(), Vec::new()],
-            which: 0,
-        });
-    vb.which ^= 1;
-    vb.slots[vb.which] = raw;
+    let mut ctime_changed_dir: Option<&str> = None;
+    {
+        let vb = hd
+            .volatile_cache
+            .entry(key.to_string())
+            .or_insert_with(|| VolatileBuf {
+                slots: [Vec::new(), Vec::new()],
+                which: 0,
+            });
+        let prev = &vb.slots[vb.which];
+        if !prev.is_empty() && prev.as_slice() != raw.as_slice() {
+            if let Some(func_dir) = key.strip_suffix("/\u{2025}ctime") {
+                if func_dir.starts_with("/lib/") && func_dir.len() > "/lib/".len() {
+                    ctime_changed_dir = Some(func_dir);
+                }
+            }
+        }
+        vb.which ^= 1;
+        vb.slots[vb.which] = raw;
+    }
+    if let Some(func_dir) = ctime_changed_dir {
+        let stale_keys: Vec<String> = hd
+            .read_cache
+            .keys()
+            .filter(|k| under_prefix(k, func_dir))
+            .cloned()
+            .collect();
+        for k in stale_keys {
+            if let Some(old_vec) = hd.read_cache.remove(&k) {
+                hd.retired.push(old_vec);
+            }
+        }
+        hd.list_cache = None;
+    }
     true
 }
 
