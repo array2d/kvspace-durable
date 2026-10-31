@@ -86,7 +86,7 @@ impl Handle {
                     raw: Some(xv),
                 }])
             });
-            self.read_cache.remove(&key);
+            self.cache_invalidate(&key);
             r?;
         }
         Ok(())
@@ -188,59 +188,6 @@ fn volatile_refresh(hd: &mut Handle, key: &str) -> bool {
     vb.which ^= 1;
     vb.slots[vb.which] = raw;
     true
-}
-
-fn volatile_get(hd: &mut Handle, key: &str, out: *mut *mut u8, out_len: *mut u32) -> c_int {
-    if !volatile_refresh(hd, key) {
-        unsafe {
-            *out = std::ptr::null_mut();
-            *out_len = 0;
-        }
-        return 1;
-    }
-    let vb = hd.volatile_cache.get_mut(key).unwrap();
-    let b = &mut vb.slots[vb.which];
-    unsafe {
-        if b.is_empty() {
-            *out = std::ptr::null_mut();
-            *out_len = 0;
-        } else {
-            *out = b.as_mut_ptr();
-            *out_len = b.len() as u32;
-        }
-    }
-    0
-}
-
-fn volatile_get_part(
-    hd: &mut Handle,
-    key: &str,
-    offset: u32,
-    len: u32,
-    out: *mut *mut u8,
-    out_len: *mut u32,
-) -> c_int {
-    if !volatile_refresh(hd, key) {
-        unsafe {
-            *out = std::ptr::null_mut();
-            *out_len = 0;
-        }
-        return 1;
-    }
-    let vb = hd.volatile_cache.get_mut(key).unwrap();
-    let b = &mut vb.slots[vb.which];
-    let s = (offset as usize).min(b.len());
-    let e = (s + len as usize).min(b.len());
-    unsafe {
-        if e <= s {
-            *out = std::ptr::null_mut();
-            *out_len = 0;
-        } else {
-            *out = b.as_mut_ptr().add(s);
-            *out_len = (e - s) as u32;
-        }
-    }
-    0
 }
 
 /// flush 上一笔惰性写后返回后端引用。任一步失败 → Err（调用方转 err/err 返回 1）。
@@ -410,13 +357,97 @@ pub extern "C" fn kvspaceClose(h: *mut Handle) {
 
 // ── KVSpace 原语 ─────────────────────────────────────────────────────
 
-/// 借用读：*out 指向读借用池内本笔缓冲（活到下一次写 flush），调用方不得 free。
-/// resolve 由 get_raw 内部按路径解析（durable 恒穿透父路径 link）；空值 → *out=NULL、out_len=0。
+/// Fetches raw bytes for a single key (using `read_cache`, or `volatile_refresh` for control keys).
+/// Returns `Ok(true)` if present and non-empty, `Ok(false)` if missing/empty, or `Err(())` on backend failure.
+fn fetch_raw_one(hd: &mut Handle, key: &str) -> Result<bool, ()> {
+    if is_volatile(key) {
+        if !volatile_refresh(hd, key) {
+            return Err(());
+        }
+        let vb = hd.volatile_cache.get(key).unwrap();
+        return Ok(!vb.slots[vb.which].is_empty());
+    }
+    if hd.read_cache.contains_key(key) {
+        return Ok(true);
+    }
+    let raw = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hd.kv.get_raw(key)))
+        .map_err(|_| ())?;
+    if raw.is_empty() {
+        return Ok(false);
+    }
+    hd.read_cache.insert(key.to_string(), raw);
+    Ok(true)
+}
+
+fn cached_slice<'a>(hd: &'a Handle, key: &str) -> Option<&'a [u8]> {
+    if is_volatile(key) {
+        let vb = hd.volatile_cache.get(key)?;
+        let s = &vb.slots[vb.which];
+        (!s.is_empty()).then_some(s.as_slice())
+    } else {
+        hd.read_cache.get(key).map(|v| v.as_slice())
+    }
+}
+
+fn cached_mut_slice<'a>(hd: &'a mut Handle, key: &str) -> Option<&'a mut [u8]> {
+    if is_volatile(key) {
+        let vb = hd.volatile_cache.get_mut(key)?;
+        let s = &mut vb.slots[vb.which];
+        (!s.is_empty()).then_some(s.as_mut_slice())
+    } else {
+        hd.read_cache.get_mut(key).map(|v| v.as_mut_slice())
+    }
+}
+
+/// Maximum leaf `Ptr` hops to follow (matches `kvspace-c`).
+const MAX_PTR_HOPS: usize = 16;
+
+/// Resolves `key` in cache (`resolve = true` follows leaf `Ptr` chains up to 16 hops).
+/// Returns `Ok(Some(final_key))` if found, `Ok(None)` if missing/dangling, or `Err(())` on error/cycle/hop limit.
+fn resolve_cached_key(hd: &mut Handle, key: &str, resolve: bool) -> Result<Option<String>, ()> {
+    if !resolve {
+        return match fetch_raw_one(hd, key)? {
+            true => Ok(Some(key.to_string())),
+            false => Ok(None),
+        };
+    }
+    let mut cur = key.to_string();
+    for hop in 0..=MAX_PTR_HOPS {
+        if cur.is_empty() {
+            return Ok(None);
+        }
+        if !fetch_raw_one(hd, &cur)? {
+            return Ok(None);
+        }
+        let next_target = {
+            let bytes = cached_slice(hd, &cur).ok_or(())?;
+            let w = crate::headlenpow::from_wire(bytes).ok_or(())?;
+            if w.ptr != REF_PTR {
+                None
+            } else {
+                if hop == MAX_PTR_HOPS {
+                    return Err(());
+                }
+                let t = std::str::from_utf8(w.body).map_err(|_| ())?;
+                Some(t.to_string())
+            }
+        };
+        match next_target {
+            None => return Ok(Some(cur)),
+            Some(t) => cur = t,
+        }
+    }
+    Err(())
+}
+
+/// Borrowed read: `*out` points into the handle's cache (valid until the key is overwritten,
+/// deleted, or the handle is closed; caller must not `free`). `resolve != 0` follows leaf `Ptr`
+/// chains up to 16 hops (cycle/limit returns 1; missing/dangling sets `*out = NULL`, `*out_len = 0`, returns 0).
 #[no_mangle]
 pub extern "C" fn kvspaceGet(
     h: *mut Handle,
     key: *const c_char,
-    _resolve: c_int,
+    resolve: c_int,
     out: *mut *mut u8,
     out_len: *mut u32,
 ) -> c_int {
@@ -432,36 +463,29 @@ pub extern "C" fn kvspaceGet(
         }
         return 1;
     }
-    /* 控制键：每次重读后端，写进双缓冲的另一块；上一块保活到本 key 下一次读。 */
-    if is_volatile(&key) {
-        return volatile_get(hd, &key, out, out_len);
-    }
-    /* 命中：返回同一份常驻快照。绝不重读/替换——同指令两次读同一 key 的视图必须共存。 */
-    if let Some(b) = hd.read_cache.get_mut(&key) {
-        unsafe {
-            *out = b.as_mut_ptr();
-            *out_len = b.len() as u32;
-        }
-        return 0;
-    }
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hd.kv.get_raw(&key))) {
-        Ok(raw) => {
-            if raw.is_empty() {
-                unsafe {
-                    *out = std::ptr::null_mut();
-                    *out_len = 0;
-                }
-            } else {
-                hd.read_cache.insert(key.clone(), raw);
-                let b = hd.read_cache.get_mut(&key).unwrap();
+    match resolve_cached_key(hd, &key, resolve != 0) {
+        Ok(Some(final_key)) => {
+            if let Some(b) = cached_mut_slice(hd, &final_key) {
                 unsafe {
                     *out = b.as_mut_ptr();
                     *out_len = b.len() as u32;
                 }
+            } else {
+                unsafe {
+                    *out = std::ptr::null_mut();
+                    *out_len = 0;
+                }
             }
             0
         }
-        Err(_) => {
+        Ok(None) => {
+            unsafe {
+                *out = std::ptr::null_mut();
+                *out_len = 0;
+            }
+            0
+        }
+        Err(()) => {
             unsafe {
                 *out = std::ptr::null_mut();
                 *out_len = 0;
@@ -493,11 +517,26 @@ pub extern "C" fn kvspaceSetValue(
     }
     let key = unsafe { cstr(key) }.to_string();
     let raw = unsafe { std::slice::from_raw_parts(value, value_len as usize) };
-    if crate::headlenpow::from_wire(raw).is_none() {
+    let Some(whead) = crate::headlenpow::from_wire(raw) else {
+        write_err(err, err_cap, "invalid XValue");
+        return 1;
+    };
+    let Some(attr) = crate::headlenpow::attr_len(raw, whead.len as usize) else {
+        write_err(err, err_cap, "invalid XValue");
+        return 1;
+    };
+    let Some(total) = (whead.len as usize)
+        .checked_add(crate::headlenpow::PREFIX)
+        .and_then(|x| x.checked_add(attr as usize))
+    else {
+        write_err(err, err_cap, "invalid XValue");
+        return 1;
+    };
+    if attr < 2 || total > raw.len() {
         write_err(err, err_cap, "invalid XValue");
         return 1;
     }
-    let raw = raw.to_vec();
+    let raw = raw[..total].to_vec();
     hd.list_cache = None;
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let val = from_wire(&raw);
@@ -512,7 +551,7 @@ pub extern "C" fn kvspaceSetValue(
             let code = result_to_code(result, err, err_cap);
             if code == 0 {
                 /* 写后失效：不把写值留在读缓存里，避免写密集负载无界占用。 */
-                hd.read_cache.remove(&key);
+                hd.cache_invalidate(&key);
             }
             code
         }
@@ -524,7 +563,7 @@ pub extern "C" fn kvspaceSetValue(
 }
 
 /// 定位读：借用读 key 值的 [offset, offset+len) 字节，*out 指向该 key 读缓存（活到该 key 被写/删或 close，调用方不得 free）。
-/// 空/不存在/越界为空 → *out=NULL、out_len=0。
+/// Always follows leaf `Ptr` chains; sets `*out = NULL` and `*out_len = 0` when missing, empty, or out of range.
 #[no_mangle]
 pub extern "C" fn kvspaceGetPart(
     h: *mut Handle,
@@ -546,34 +585,32 @@ pub extern "C" fn kvspaceGetPart(
         }
         return 1;
     }
-    if is_volatile(&key) {
-        return volatile_get_part(hd, &key, offset, len, out, out_len);
-    }
-    /* 缓存的是整值：GetPart 未命中先取整值再切片（与后端 get_part 同字节）。 */
-    if !hd.read_cache.contains_key(&key) {
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hd.kv.get_raw(&key))) {
-            Ok(raw) => {
-                if raw.is_empty() {
-                    unsafe {
-                        *out = std::ptr::null_mut();
-                        *out_len = 0;
-                    }
-                    return 0;
-                }
-                hd.read_cache.insert(key.clone(), raw);
+    let final_key = match resolve_cached_key(hd, &key, true) {
+        Ok(Some(k)) => k,
+        Ok(None) => {
+            unsafe {
+                *out = std::ptr::null_mut();
+                *out_len = 0;
             }
-            Err(_) => {
-                unsafe {
-                    *out = std::ptr::null_mut();
-                    *out_len = 0;
-                }
-                return 1;
-            }
+            return 0;
         }
-    }
-    let b = hd.read_cache.get_mut(&key).unwrap();
+        Err(()) => {
+            unsafe {
+                *out = std::ptr::null_mut();
+                *out_len = 0;
+            }
+            return 1;
+        }
+    };
+    let Some(b) = cached_mut_slice(hd, &final_key) else {
+        unsafe {
+            *out = std::ptr::null_mut();
+            *out_len = 0;
+        }
+        return 0;
+    };
     let s = (offset as usize).min(b.len());
-    let e = (s + len as usize).min(b.len());
+    let e = s.saturating_add(len as usize).min(b.len());
     unsafe {
         if e <= s {
             *out = std::ptr::null_mut();
@@ -586,7 +623,7 @@ pub extern "C" fn kvspaceGetPart(
     0
 }
 
-/// 定位写：就地写 buf 到 key 值的 [offset, offset+buf_len)（key 须已存在、不改结构）。立即持久，非惰性。
+/// Positional write into `[offset, offset + buf_len)` of an existing key (follows leaf `Ptr` chains; synchronous).
 #[no_mangle]
 pub extern "C" fn kvspaceSetPart(
     h: *mut Handle,
@@ -601,26 +638,46 @@ pub extern "C" fn kvspaceSetPart(
         Some(x) => x,
         None => return 1,
     };
+    if buf_len > 0 && buf.is_null() {
+        write_err(err, err_cap, "invalid SetPart buffer");
+        return 1;
+    }
     if let Err(e) = hd.flush() {
         write_err(err, err_cap, &e);
         return 1;
     }
     let key = unsafe { cstr(key) }.to_string();
-    let data = unsafe { std::slice::from_raw_parts(buf, buf_len as usize) };
+    let target_key = match resolve_cached_key(hd, &key, true) {
+        Ok(Some(k)) => k,
+        Ok(None) => {
+            write_err(err, err_cap, &format!("set_part: missing key {key}"));
+            return 1;
+        }
+        Err(()) => {
+            write_err(err, err_cap, &format!("set_part: ptr resolve failed at {key}"));
+            return 1;
+        }
+    };
+    let data: &[u8] = if buf_len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(buf, buf_len as usize) }
+    };
     hd.list_cache = None;
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        hd.kv.set_part(&key, offset, data)
+        hd.kv.set_part(&target_key, offset, data)
     }))
     .map_err(panic_msg)
     .and_then(|x| x);
     let code = result_to_code(r, err, err_cap);
     if code == 0 {
-        hd.read_cache.remove(&key);
+        hd.cache_invalidate(&target_key);
     }
     code
 }
 
-/// 读 head：只读值前缀并解码三正交轴 head（不取 body）。空/不存在 → 返回 1。
+/// Decodes the value header using `read_cache` and following leaf `Ptr` chains (up to 16 hops).
+/// Returns 1 when missing, empty, dangling, or exceeding the hop limit.
 #[no_mangle]
 pub extern "C" fn kvspaceGetHead(
     h: *mut Handle,
@@ -635,16 +692,15 @@ pub extern "C" fn kvspaceGetHead(
         return 1;
     }
     let key = unsafe { cstr(key) }.to_string();
-    let value = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hd.kv.get_raw(&key)))
-    {
-        Ok(p) => p,
-        Err(_) => return 1,
+    let final_key = match resolve_cached_key(hd, &key, true) {
+        Ok(Some(k)) => k,
+        _ => return 1,
     };
-    if value.is_empty() {
+    let Some(value) = cached_slice(hd, &final_key) else {
         return 1;
-    }
+    };
     /* langtype 在值 attr 区（单 key 整体）；无类型 = 空 attr。 */
-    let head = crate::xvalue::from_wire_head(&value);
+    let head = crate::xvalue::from_wire_head(value);
     if head.headlen == 0 {
         return 1;
     }
@@ -654,11 +710,12 @@ pub extern "C" fn kvspaceGetHead(
 
 /// 就地写：key 必须已存在、body_len 必须等于原 body_len——把原 head+body 攒进 write_buf、
 /// 置 pending，返回 write_buf 内 body 偏移指针供直接写；违反前置条件 → 非 0 + err。
+/// When `resolve != 0`, follows leaf `Ptr` chains (up to 16 hops) to mutate the terminal target in place.
 #[no_mangle]
 pub extern "C" fn kvspaceWriteInPlace(
     h: *mut Handle,
     key: *const c_char,
-    _resolve: c_int,
+    resolve: c_int,
     body_len: u32,
     body: *mut *mut u8,
     err: *mut c_char,
@@ -668,23 +725,39 @@ pub extern "C" fn kvspaceWriteInPlace(
         Some(x) => x,
         None => return 1,
     };
+    if body.is_null() {
+        write_err(err, err_cap, "kvspace: null body out-pointer");
+        return 1;
+    }
     if let Err(e) = hd.flush() {
         write_err(err, err_cap, &e);
         return 1;
     }
     let key = unsafe { cstr(key) }.to_string();
-    let existing =
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hd.kv.get_raw(&key))) {
-            Ok(v) => v,
-            Err(p) => {
-                write_err(err, err_cap, &panic_msg(p));
+    let target_key = match resolve_cached_key(hd, &key, resolve != 0) {
+        Ok(Some(k)) => k,
+        Ok(None) => {
+            write_err(err, err_cap, "kvspace: write-in-place on missing key");
+            return 1;
+        }
+        Err(()) => {
+            write_err(err, err_cap, "kvspace: write-in-place ptr resolve failed");
+            return 1;
+        }
+    };
+    let existing = match hd.read_cache.remove(&target_key) {
+        Some(v) => v,
+        None => match cached_slice(hd, &target_key).map(|s| s.to_vec()) {
+            Some(v) => {
+                hd.volatile_cache.remove(&target_key);
+                v
+            }
+            None => {
+                write_err(err, err_cap, "kvspace: write-in-place on missing key");
                 return 1;
             }
-        };
-    if existing.is_empty() {
-        write_err(err, err_cap, "kvspace: write-in-place on missing key");
-        return 1;
-    }
+        },
+    };
     let head = from_wire_head(&existing);
     let head_len = head.head_len() as usize;
     let blen = head.body_len.max(0) as usize;
@@ -692,14 +765,15 @@ pub extern "C" fn kvspaceWriteInPlace(
     if head.headlen == 0
         || head.body_len < 0
         || head.body_len as u32 != body_len
+        || attr < 2
         || head_len.checked_add(blen).and_then(|x| x.checked_add(attr)) != Some(existing.len())
     {
         write_err(err, err_cap, "kvspace: write-in-place body_len mismatch");
         return 1;
     }
-    hd.read_cache.remove(&key);
+    hd.cache_invalidate(&target_key);
     hd.write_buf = existing;
-    hd.pending_key = Some(key);
+    hd.pending_key = Some(target_key);
     unsafe { *body = hd.write_buf.as_mut_ptr().add(head_len) };
     0
 }
@@ -739,7 +813,7 @@ pub extern "C" fn kvspaceWriteNewPlace(
     };
     /* 固定头：body 偏移恒 = PREFIX（=8）。 */
     let head_len = crate::headlenpow::PREFIX;
-    hd.read_cache.remove(&key);
+    hd.cache_invalidate(&key);
     hd.write_buf = xv;
     hd.pending_key = Some(key);
     unsafe { *body = hd.write_buf.as_mut_ptr().add(head_len) };
