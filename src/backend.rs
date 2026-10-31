@@ -6,7 +6,7 @@ use std::time::Duration;
 use crate::kvspace::{KVPair, KVSpace};
 use crate::kvspace_common::{
     is_descendant, is_frame_operand_key, join_path, sep_path, split_index, strip_dir_suf,
-    subtree_base, validate_ptr, watch_value,
+    subtree_base, watch_value,
 };
 use crate::r#const::*;
 use crate::store::KVStore;
@@ -329,13 +329,17 @@ impl<S: KVStore> KVSpace for Backend<S> {
                 .ok_or_else(|| format!("invalid XValue at {key}"))?;
             let attr = crate::headlenpow::attr_len(&raw, head.len as usize)
                 .ok_or_else(|| format!("invalid XValue at {key}"))?;
-            if head.len as usize + crate::headlenpow::PREFIX + attr as usize != raw.len() {
+            if attr < 2 {
                 return Err(format!("invalid XValue at {key}"));
             }
-            // 指针校验用声明的 target_kindexpr（val 为 Ptr 时可得；raw 直写无类型则跳过）。
-            if let XValue::Ptr(ptr) = &pair.val {
-                validate_ptr(self, &ptr.target, &ptr.target_kindexpr)?;
+            let total = (head.len as usize)
+                .checked_add(crate::headlenpow::PREFIX)
+                .and_then(|x| x.checked_add(attr as usize))
+                .ok_or_else(|| format!("invalid XValue at {key}"))?;
+            if total > raw.len() {
+                return Err(format!("invalid XValue at {key}"));
             }
+            let raw = &raw[..total];
             let (parent, _, _) = split_index(&key);
             if parent.ends_with(OBJ_SEP) {
                 let base = strip_dir_suf(&parent);
@@ -356,7 +360,7 @@ impl<S: KVStore> KVSpace for Backend<S> {
                 }
             }
             // 单 key 整体写（类型在值 attr 区）：天然原子，无 attr key、无写序。
-            self.store.set(&key, &raw);
+            self.store.set(&key, raw);
         }
         Ok(())
     }

@@ -108,6 +108,9 @@ pub fn split_index(path: &str) -> (String, String, SepKind) {
 /// （见 [[map容器]]：`[float64,float64]` ≠ `[2]float64`），一律原样保留——剥掉会让 map 的
 /// 键类型整个丢失，Ptr 类型检查随即误判。
 fn norm_langtype(s: &str) -> String {
+    if s.contains(OBJ_SEP) {
+        return s.to_string();
+    }
     if let Some(rest) = s.strip_prefix('[') {
         if let Some(end) = rest.find(']') {
             let inner = &rest[..end];

@@ -430,13 +430,15 @@ fn array_to_header(kind: &str, array_len: i32) -> Vec<i32> {
 /// storetype 判定（对齐 kvspace 三正交轴与 C codec）：
 /// - ref==1（指针）→ ST_SLACK；ref==2（@ext）→ ST_EXT；
 /// - rwir/def langtype 或带 body 的 rwfunc（代码槽）→ ST_SLACK；
+/// - untyped variable-length system slots (empty kind, e.g. `‥lib`/`‥status`/`‥pc`) -> ST_SLACK;
 /// - char/*（字符/字节数组）→ ST_SLACK；
 /// - dims 非空且非 map/struct → ST_LARGE（张量）；
 /// - 否则 ST_SHORT（None/标量/目录/map 头/空 rwfunc 目录值）。
 pub fn to_wire_head(kind: &str, r#ref: i32, dims: &[i32], raw: &[u8]) -> Vec<u8> {
     let (storetype, ptr) = match r#ref {
         0 => {
-            let slack = matches!(kind, "rwir" | "def langtype")
+            let slack = kind.is_empty()
+                || matches!(kind, "rwir" | "def langtype")
                 || (kind == "rwfunc" && !raw.is_empty())
                 || kind.starts_with("char/");
             let st = if slack {
@@ -492,8 +494,16 @@ pub fn from_wire_head(data: &[u8]) -> XValueHead {
 /// 从完整 XValue 字节（固定 head + body + attr）组装 XValue。
 pub fn from_wire(data: &[u8]) -> XValue {
     let h = from_wire_head(data);
-    // 空 langtype 表示 None（无类型 = 空 attr）。
-    if h.langtype.is_empty() && !h.is_ptr() && h.r#ref() != REF_EXT as i32 {
+    if h.headlen == 0 {
+        return XValue::None;
+    }
+    // Canonical None is ST_SHORT + REF_INLINE + empty body + empty langtype;
+    // untyped system slots (`‥lib`/`‥status`/`‥pc`) use ST_SLACK and must keep their body.
+    if h.langtype.is_empty()
+        && h.r#ref == REF_INLINE
+        && h.storetype == ST_SHORT
+        && h.body_len == 0
+    {
         return XValue::None;
     }
     h.from_wire(h.body(data))
