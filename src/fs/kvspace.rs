@@ -11,7 +11,7 @@ use crate::coord::cmp_coord;
 use crate::kvspace::{KVPair, KVSpace};
 use crate::kvspace_common::{
     is_descendant, is_frame_operand_key, join_path, sep_path, split_index, strip_dir_suf,
-    validate_ptr, watch_value,
+    subtree_base, validate_ptr, watch_value,
 };
 use crate::r#const::*;
 use crate::xvalue::*;
@@ -611,32 +611,67 @@ impl KVSpace for FsKVSpace {
         if crate::r#const::is_reserved(prefix) {
             return Err(format!("reserved metadata key: {prefix}"));
         }
-        let resolved = self.resolve_path(prefix);
+        // Resolve links only on parent components (POSIX rm semantics); if the final
+        // component is itself a link, delete the link rather than its target subtree.
+        let resolved = self.resolve_parent(prefix);
         if crate::r#const::is_reserved(&resolved) {
             return Err(format!("reserved metadata key: {resolved}"));
         }
-        // 若 prefix 本身是链接（叶 Ptr），只删链接。
-        let link_key = if Self::is_dir_key(&resolved) && resolved != PATH_SEP {
-            strip_dir_suf(&resolved)
-        } else {
-            &resolved
-        };
-        if let Some(data) = self.read_leaf(link_key) {
-            if from_wire_head(&data).is_ptr() {
-                return self.del(&[resolved]);
+        let base = subtree_base(&resolved).to_string();
+        if !base.is_empty() {
+            if let Some(data) = self.read_leaf(&base) {
+                if from_wire_head(&data).is_ptr() {
+                    return self.del(&[base]);
+                }
             }
         }
-        let base = if Self::is_dir_key(&resolved) && resolved != PATH_SEP {
-            strip_dir_suf(&resolved)
+        // Subtree covers base, base/*, base·*, and base‥* across the node path, its
+        // sibling `base·` directory, and sibling `base‥*` entries in the parent directory.
+        let mut doomed = Vec::new();
+        if base.is_empty() {
+            // Root: remove everything except reserved metadata, keeping the root dir itself.
+            if let Ok(entries) = fs::read_dir(&self.root) {
+                for e in entries.flatten() {
+                    if e.file_name() != META_ROOT_NAME {
+                        doomed.push(e.path());
+                    }
+                }
+            }
         } else {
-            &resolved
-        };
-        for key in [base.to_string(), format!("{base}{OBJ_SEP}")] {
-            let node = self.node_path(&key);
-            if node.is_dir() {
-                fs::remove_dir_all(&node).map_err(|e| format!("DelTree {key}: {e}"))?;
+            let node = self.node_path(&base);
+            doomed.push(self.node_path(&format!("{base}{OBJ_SEP}")));
+            if let (Some(parent), Some(name)) = (node.parent(), node.file_name()) {
+                let stem = format!(
+                    "{}{}",
+                    Self::unescape_name(&name.to_string_lossy()),
+                    RUNTIME_MEMBER_SEP
+                );
+                if let Ok(entries) = fs::read_dir(parent) {
+                    for e in entries.flatten() {
+                        if !is_tmp_name(&e.file_name())
+                            && Self::unescape_name(&e.file_name().to_string_lossy())
+                                .starts_with(&stem)
+                        {
+                            doomed.push(e.path());
+                        }
+                    }
+                }
+            }
+            doomed.push(node);
+        }
+        for node in doomed {
+            let r = if node.is_dir() {
+                fs::remove_dir_all(&node)
             } else if node.is_file() {
-                fs::remove_file(&node).map_err(|e| format!("DelTree {key}: {e}"))?;
+                fs::remove_file(&node)
+            } else {
+                continue;
+            };
+            match r {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                    return Err(format!("DelTree {}: {e}", node.display()));
+                }
+                _ => {}
             }
         }
         Ok(())

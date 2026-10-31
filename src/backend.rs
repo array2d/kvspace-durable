@@ -6,7 +6,7 @@ use std::time::Duration;
 use crate::kvspace::{KVPair, KVSpace};
 use crate::kvspace_common::{
     is_descendant, is_frame_operand_key, join_path, sep_path, split_index, strip_dir_suf,
-    validate_ptr, watch_value,
+    subtree_base, validate_ptr, watch_value,
 };
 use crate::r#const::*;
 use crate::store::KVStore;
@@ -436,36 +436,33 @@ impl<S: KVStore> KVSpace for Backend<S> {
         if crate::r#const::is_reserved(prefix) {
             return Err(format!("reserved metadata key: {prefix}"));
         }
-        let mut link_key = prefix;
-        if Self::is_dir(link_key) && link_key != PATH_SEP {
-            link_key = strip_dir_suf(prefix);
-        }
-        if let Some(data) = self.store.get(link_key) {
-            let head = from_wire_head(&data);
-            if head.is_ptr() {
-                return self.del(&[prefix.to_string()]);
-            }
-        }
-
-        let resolved = self.resolve_path(prefix);
+        // Resolve links only on parent components (POSIX rm semantics); if the final
+        // component is itself a link, delete the link rather than its target subtree.
+        let resolved = self.resolve_parent(prefix);
         if crate::r#const::is_reserved(&resolved) {
             return Err(format!("reserved metadata key: {resolved}"));
         }
-        let mut scan = resolved.clone();
-        if Self::is_dir(&scan) && scan != PATH_SEP {
-            scan.pop();
+        let base = subtree_base(&resolved);
+        if !base.is_empty() {
+            if let Some(data) = self.store.get(base) {
+                if from_wire_head(&data).is_ptr() {
+                    return self.del(std::slice::from_ref(&resolved));
+                }
+            }
         }
+
+        // Delete base and all descendants bounded by '/', '·', or '‥' (via is_subtree_key).
+        let scan = if base.is_empty() { PATH_SEP } else { base };
         let keys: Vec<_> = self
             .store
-            .scan_keys(&scan)
+            .scan_keys(scan)
             .into_iter()
             .filter(|key| !crate::r#const::is_reserved(key))
             .collect();
-
-        let mut del_keys: Vec<&str> = Vec::with_capacity(keys.len() + 1);
-        del_keys.push(&resolved);
-        del_keys.extend(keys.iter().map(String::as_str));
-        self.store.del(&del_keys);
+        let del_keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+        if !del_keys.is_empty() {
+            self.store.del(&del_keys);
+        }
 
         Ok(())
     }

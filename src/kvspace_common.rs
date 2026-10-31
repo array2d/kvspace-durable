@@ -28,6 +28,15 @@ pub fn strip_dir_suf(path: &str) -> &str {
     }
 }
 
+/// Subtree root for DelTree: strips a single trailing `/` or `·` (`"/"` maps to `""`).
+/// Deletes every key satisfying `store::is_subtree_key(base, key)`.
+pub fn subtree_base(prefix: &str) -> &str {
+    if prefix == PATH_SEP {
+        ""
+    } else {
+        strip_dir_suf(prefix)
+    }
+}
 pub fn is_descendant(base: &str, path: &str) -> bool {
     if base == PATH_SEP {
         return path != PATH_SEP && path.starts_with(PATH_SEP);
