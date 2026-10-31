@@ -16,7 +16,7 @@ fn attr_of(lt: &str) -> Vec<u8> {
         return vec![2, 0];
     }
     let mut v = Vec::new();
-    let alen = (2u16 + 3 + lt.len() as u16);
+    let alen = 2u16 + 3 + lt.len() as u16;
     v.extend_from_slice(&alen.to_le_bytes());
     v.push(1); // tag = langtype
     v.extend_from_slice(&(lt.len() as u16).to_le_bytes());
@@ -334,8 +334,8 @@ fn volatile_status_observed_and_double_buffered() {
     let dsn = dsn();
     let mut c = dsn.as_bytes().to_vec();
     c.push(0);
-    let a = unsafe { kvspaceConnect(c.as_ptr() as *const _) };
-    let b = unsafe { kvspaceConnect(c.as_ptr() as *const _) };
+    let a = kvspaceConnect(c.as_ptr() as *const _);
+    let b = kvspaceConnect(c.as_ptr() as *const _);
     assert!(!a.is_null() && !b.is_null());
     let st = "/vthread/1\u{2025}status";
     unsafe {
@@ -380,9 +380,7 @@ fn volatile_status_observed_and_double_buffered() {
             "snapshot keys ignore external writes"
         );
     }
-    unsafe {
-        kvspaceClose(a);
-        kvspaceClose(b);
-    }
+    kvspaceClose(a);
+    kvspaceClose(b);
     std::fs::remove_dir_all(dsn.trim_start_matches("fs://")).ok();
 }
