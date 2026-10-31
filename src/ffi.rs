@@ -32,9 +32,10 @@ use crate::xvalue::{from_wire, from_wire_head, REF_INLINE, REF_PTR, ST_SHORT, ST
 // op 或 Close」；漏 Close 的兜底由前端 atexit 兑现（见 kvspace.h 写原语注释、spec [[CABI]]
 // 写侧落盘时机）。调用方从不 free、从不 commit。
 
-/// 控制键的双缓冲：每次读写入另一块，上一块保活到该 key 下一次读。
+/// Ring buffer for volatile control keys: reuses the current slot in place when unchanged,
+/// and advances to the next slot on change so interleaved `Get` / `GetHead` views stay valid.
 pub struct VolatileBuf {
-    slots: [Vec<u8>; 2],
+    slots: [Vec<u8>; 4],
     which: usize,
 }
 
@@ -188,19 +189,21 @@ fn volatile_refresh(hd: &mut Handle, key: &str) -> bool {
             .volatile_cache
             .entry(key.to_string())
             .or_insert_with(|| VolatileBuf {
-                slots: [Vec::new(), Vec::new()],
+                slots: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
                 which: 0,
             });
         let prev = &vb.slots[vb.which];
-        if !prev.is_empty() && prev.as_slice() != raw.as_slice() {
-            if let Some(func_dir) = key.strip_suffix("/\u{2025}ctime") {
-                if func_dir.starts_with("/lib/") && func_dir.len() > "/lib/".len() {
-                    ctime_changed_dir = Some(func_dir);
+        if prev.as_slice() != raw.as_slice() {
+            if !prev.is_empty() {
+                if let Some(func_dir) = key.strip_suffix("/\u{2025}ctime") {
+                    if func_dir.starts_with("/lib/") && func_dir.len() > "/lib/".len() {
+                        ctime_changed_dir = Some(func_dir);
+                    }
                 }
             }
+            vb.which = (vb.which + 1) & 3;
+            vb.slots[vb.which] = raw;
         }
-        vb.which ^= 1;
-        vb.slots[vb.which] = raw;
     }
     if let Some(func_dir) = ctime_changed_dir {
         let stale_keys: Vec<String> = hd

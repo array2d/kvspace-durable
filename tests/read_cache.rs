@@ -353,13 +353,17 @@ fn volatile_status_observed_and_double_buffered() {
             "previous view must survive one more read"
         );
 
-        // 再改回 running：A 看到 running；双缓冲只保证最近一次读（p4）的视图有效。
+        // Switch back to running: handle A sees running, and repeated unchanged reads keep the same pointer.
         set_str(b, st, "running");
-        let (v3, _p3, _l3) = get_str(a, st).unwrap();
+        let (v3, p3, l3) = get_str(a, st).unwrap();
         assert_eq!(v3, "running");
-        let (v4, p4, l4) = get_str(a, st).unwrap();
-        assert_eq!(v4, "running");
-        assert_eq!(read_str(p4, l4), "running");
+        for _ in 0..6 {
+            let (vn, pn, ln) = get_str(a, st).unwrap();
+            assert_eq!(vn, "running");
+            assert_eq!(pn, p3, "unchanged volatile read must keep pointer stable");
+            assert_eq!(ln, l3);
+        }
+        assert_eq!(read_str(p3, l3), "running");
 
         // 外部删除该 key：volatile 每读重读，必须看到 None。
         let del_keys = [ckey(st)];
