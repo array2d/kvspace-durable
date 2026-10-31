@@ -178,6 +178,7 @@ pub fn watch_value(
     tick_duration: Duration,
 ) -> XValue {
     const SPIN_COUNT: i64 = 100;
+    let step_cap = tick_duration.min(Duration::from_millis(10));
     let mut cur = Duration::ZERO;
     let mut i: i64 = 0;
     loop {
@@ -191,8 +192,8 @@ pub fn watch_value(
         }
         if cur.is_zero() {
             cur = Duration::from_micros(1);
-        } else if cur < tick_duration {
-            cur = (cur * 2).min(tick_duration);
+        } else if cur < step_cap {
+            cur = (cur * 2).min(step_cap);
         }
         std::thread::sleep(cur);
     }

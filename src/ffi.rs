@@ -40,8 +40,9 @@ pub struct VolatileBuf {
 
 /// 外部可改写、必须每读重读后端的控制键（normative：见 spec CABI）。
 fn is_volatile(key: &str) -> bool {
-    (key.starts_with("/vthread/") && key.ends_with("\u{2025}status"))
-        || (key.starts_with("/lib/") && key.ends_with("/\u{2025}ctime"))
+    (key.starts_with("/vthread/") && key.contains('\u{2025}'))
+        || (key.starts_with("/lib/")
+            && (key.ends_with("/\u{2025}ctime") || key.contains("/vids/")))
 }
 
 pub struct Handle {
@@ -946,8 +947,20 @@ pub extern "C" fn kvspaceDel(
         .collect();
     let code = result_to_code(catch_panic(|| kv.del(&keys)), err, err_cap);
     if let Some(hd) = unsafe { h.as_mut() } {
+        let mut is_handoff = false;
         for k in &keys {
             hd.cache_invalidate(k);
+            if (k.starts_with("/lib/") && k.contains("/vids/"))
+                || k.starts_with("/vthread/\u{2025}vids/")
+            {
+                is_handoff = true;
+            }
+        }
+        if is_handoff {
+            for (_, old) in hd.read_cache.drain() {
+                hd.retired.push(old);
+            }
+            hd.list_cache = None;
         }
     }
     code
@@ -1151,9 +1164,10 @@ pub extern "C" fn kvspaceWatch(
             return 1;
         }
     };
-    if let Some(old) = hd.read_cache.remove(&key) {
-        hd.retired.push(old); /* 旧视图保活到 Close（watch 是冷路径） */
+    for (_, old) in hd.read_cache.drain() {
+        hd.retired.push(old); /* Cross-process sync boundary: keep old views alive until Close and force fresh reads. */
     }
+    hd.list_cache = None;
     hd.read_cache.insert(key.clone(), v.to_wire());
     let b = hd.read_cache.get_mut(&key).unwrap();
     unsafe {

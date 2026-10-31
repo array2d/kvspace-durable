@@ -40,13 +40,14 @@ impl<S: KVStore> Backend<S> {
 
     fn resolve_path(&self, path: &str) -> String {
         let mut path = path.to_string();
-        loop {
+        for _ in 0..16 {
             let (resolved, changed) = self.resolve_one(&path);
             if !changed {
                 return resolved;
             }
             path = resolved;
         }
+        path
     }
 
     fn resolve_parent(&self, path: &str) -> String {
@@ -72,7 +73,19 @@ impl<S: KVStore> Backend<S> {
         if path == PATH_SEP {
             return (path.to_string(), false);
         }
-        let trimmed = path.trim_matches('/');
+        let dir_suf = if path.ends_with(OBJ_SEP) {
+            Some(OBJ_SEP)
+        } else if path.ends_with(DIR_INDEX_SUF) {
+            Some(DIR_INDEX_SUF)
+        } else {
+            None
+        };
+        let clean = if dir_suf.is_some() {
+            strip_dir_suf(path)
+        } else {
+            path
+        };
+        let trimmed = clean.trim_matches('/');
         let parts: Vec<&str> = if trimmed.is_empty() {
             Vec::new()
         } else {
@@ -93,10 +106,17 @@ impl<S: KVStore> Backend<S> {
                 let v = from_wire(data);
                 if is_ptr(&v) {
                     let target = ptr_target(&v);
-                    if i + 1 < parts.len() {
-                        return (join_path(&target, &parts[i + 1..].join("/")), true);
+                    let mut next = if i + 1 < parts.len() {
+                        join_path(&target, &parts[i + 1..].join("/"))
+                    } else {
+                        target
+                    };
+                    if let Some(suf) = dir_suf {
+                        if !Self::is_dir(&next) {
+                            next.push_str(suf);
+                        }
                     }
-                    return (target, true);
+                    return (next, true);
                 }
             }
         }

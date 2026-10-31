@@ -405,6 +405,58 @@ unsafe fn run_backend_suite(dsn: &str, root: &str) {
     );
     deltree_c(h, &func_dir);
 
+    // 10. List(resolve=1) follows Ptr links to bare targets (e.g. /lib/<op>/vids -> /vthread/‥vids).
+    let k_vids_target = format!("{root}/vthread/‥vids");
+    let k_vids_entry = format!("{k_vids_target}/89");
+    let k_vids_link = format!("{root}/lib/numpy·zeros/vids");
+    let w_vids_head = headlenpow::to_wire(ST_SLACK, REF_INLINE, &[], "[]char/utf32·[]char/utf32").unwrap();
+    let w_vids_pc = headlenpow::to_wire(ST_SLACK, REF_INLINE, b"[1,0]", "[5]char/utf8").unwrap();
+    let w_vids_ptr = new_ptr("[]char/utf32·[]char/utf32", &k_vids_target).to_wire();
+    set_raw_checked(h, &k_vids_target, &w_vids_head);
+    set_raw_checked(h, &k_vids_link, &w_vids_ptr);
+    set_raw_checked(h, &format!("{k_vids_link}/89"), &w_vids_pc);
+
+    let pfx_vids = CString::new(format!("{k_vids_link}/")).unwrap();
+    let mut cnt: i32 = -1;
+    assert_eq!(kvspaceListLen(h, pfx_vids.as_ptr(), 0, 1, &mut cnt), 0);
+    assert_eq!(cnt, 1, "ListLen(resolve=1) must list children through a bare-target Ptr");
+    let mut name_buf = [0u8; 64];
+    let mut name_len: u32 = 0;
+    assert_eq!(
+        kvspaceListAt(
+            h,
+            pfx_vids.as_ptr(),
+            0,
+            1,
+            0,
+            name_buf.as_mut_ptr(),
+            name_buf.len() as u32,
+            &mut name_len,
+        ),
+        0
+    );
+    assert_eq!(&name_buf[..name_len as usize], b"89");
+    let (rc_ve, p_ve, l_ve) = get_raw_c(h, &k_vids_entry, 0);
+    assert_eq!(rc_ve, 0);
+    assert_eq!(
+        std::slice::from_raw_parts(p_ve, l_ve as usize),
+        w_vids_pc.as_slice()
+    );
+
+    // `·` member enumeration also follows a bare-target Ptr (e.g. /rf/m_link· -> /rf/m_real).
+    let k_m_real = format!("{root}/m_real");
+    let k_m_link = format!("{root}/m_link");
+    let w_m_head = headlenpow::to_wire(ST_SHORT, REF_INLINE, &[], "[]char/utf8·int64").unwrap();
+    let w_m_val = new_int64(&[42]).to_wire();
+    let w_m_ptr = new_ptr("[]char/utf8·int64", &k_m_real).to_wire();
+    set_raw_checked(h, &k_m_real, &w_m_head);
+    set_raw_checked(h, &format!("{k_m_real}·n"), &w_m_val);
+    set_raw_checked(h, &k_m_link, &w_m_ptr);
+    let pfx_m = CString::new(format!("{k_m_link}·")).unwrap();
+    let mut m_cnt: i32 = -1;
+    assert_eq!(kvspaceListLen(h, pfx_m.as_ptr(), 0, 1, &mut m_cnt), 0);
+    assert_eq!(m_cnt, 1, "ListLen(resolve=1) must list `·` members through a bare map Ptr");
+
     deltree_c(h, root);
     kvspaceClose(h);
 }
