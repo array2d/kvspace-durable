@@ -56,12 +56,25 @@ pub struct Handle {
     retired: Vec<Vec<u8>>,
     write_buf: Vec<u8>,
     pending_key: Option<String>,
+    /// Cached child list for `ListLen` + sequential `ListAt` traversal.
+    list_cache: Option<ListCache>,
+}
+
+/// Per-traversal child list snapshot reused while `(prefix, expand_ext, resolve)` match and `idx` increases.
+struct ListCache {
+    prefix: String,
+    expand_ext: bool,
+    resolve: bool,
+    names: Vec<String>,
+    /// Last yielded index.
+    cursor: i32,
 }
 
 impl Handle {
     /// 落盘上一笔惰性写（调用方已把 body 填进 write_buf），并失效该 key 的读缓存。
     fn flush(&mut self) -> Result<(), String> {
         if let Some(key) = self.pending_key.take() {
+            self.list_cache = None;
             let xv = std::mem::take(&mut self.write_buf);
             let val = from_wire(&xv);
             self.kv.set(&[KVPair {
@@ -170,9 +183,11 @@ fn volatile_get_part(
 }
 
 /// flush 上一笔惰性写后返回后端引用。任一步失败 → Err（调用方转 err/err 返回 1）。
+/// Flushes pending lazy writes and clears `list_cache` before mutating structure ops.
 unsafe fn kv_flush<'a>(h: *mut Handle) -> Result<&'a mut dyn KVSpace, String> {
     let hd = h.as_mut().ok_or("kvspace: null handle")?;
     hd.flush()?;
+    hd.list_cache = None;
     Ok(&mut *hd.kv)
 }
 
@@ -314,6 +329,7 @@ pub extern "C" fn kvspaceConnect(dsn: *const c_char) -> *mut Handle {
             retired: Vec::new(),
             write_buf: Vec::new(),
             pending_key: None,
+            list_cache: None,
         })),
         Err(_) => std::ptr::null_mut(),
     }
@@ -421,6 +437,7 @@ pub extern "C" fn kvspaceSetValue(
         return 1;
     }
     let raw = raw.to_vec();
+    hd.list_cache = None;
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let val = from_wire(&raw);
         hd.kv.set(&[KVPair {
@@ -529,6 +546,7 @@ pub extern "C" fn kvspaceSetPart(
     }
     let key = unsafe { cstr(key) }.to_string();
     let data = unsafe { std::slice::from_raw_parts(buf, buf_len as usize) };
+    hd.list_cache = None;
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         hd.kv.set_part(&key, offset, data)
     }))
@@ -674,6 +692,8 @@ pub extern "C" fn kvspaceListLen(
         None => return 1,
     };
     let prefix = unsafe { cstr(prefix) }.to_string();
+    // Always re-read backend on ListLen; the first ListAt builds the new traversal snapshot.
+    hd.list_cache = None;
     if hd.flush().is_err() || hd.kv.validate_dir(&prefix).is_err() {
         unsafe { *out_count = 0 };
         return 1;
@@ -717,12 +737,34 @@ pub extern "C" fn kvspaceListAt(
     if hd.flush().is_err() || hd.kv.validate_dir(&prefix).is_err() {
         return 1;
     }
-    let name = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        hd.kv.list_at(&prefix, idx, expand_ext != 0, resolve != 0)
-    })) {
-        Ok(Some(n)) => n,
-        Ok(None) => return 1,
-        Err(_) => return 1,
+    if idx < 0 {
+        return 1;
+    }
+    let (ex, res) = (expand_ext != 0, resolve != 0);
+    // Reuse snapshot when `(prefix, ex, res)` match and `idx` strictly increases without writes;
+    // repeated or non-increasing `idx` re-lists so polling the same `idx` stays fresh.
+    let hit = matches!(&hd.list_cache, Some(c) if c.prefix == prefix
+        && c.expand_ext == ex && c.resolve == res && idx > c.cursor);
+    if !hit {
+        hd.list_cache = None;
+        let names = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            hd.kv.list(&prefix, ex, res)
+        })) {
+            Ok(n) => n,
+            Err(_) => return 1,
+        };
+        hd.list_cache = Some(ListCache {
+            prefix,
+            expand_ext: ex,
+            resolve: res,
+            names,
+            cursor: idx,
+        });
+    }
+    let c = hd.list_cache.as_mut().unwrap();
+    c.cursor = idx;
+    let Some(name) = c.names.get(idx as usize) else {
+        return 1;
     };
     let name = name.as_bytes();
     unsafe {
