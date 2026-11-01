@@ -16,7 +16,7 @@ fn attr_of(lt: &str) -> Vec<u8> {
         return vec![2, 0];
     }
     let mut v = Vec::new();
-    let alen = (2u16 + 3 + lt.len() as u16);
+    let alen = 2u16 + 3 + lt.len() as u16;
     v.extend_from_slice(&alen.to_le_bytes());
     v.push(1); // tag = langtype
     v.extend_from_slice(&(lt.len() as u16).to_le_bytes());
@@ -334,8 +334,8 @@ fn volatile_status_observed_and_double_buffered() {
     let dsn = dsn();
     let mut c = dsn.as_bytes().to_vec();
     c.push(0);
-    let a = unsafe { kvspaceConnect(c.as_ptr() as *const _) };
-    let b = unsafe { kvspaceConnect(c.as_ptr() as *const _) };
+    let a = kvspaceConnect(c.as_ptr() as *const _);
+    let b = kvspaceConnect(c.as_ptr() as *const _);
     assert!(!a.is_null() && !b.is_null());
     let st = "/vthread/1\u{2025}status";
     unsafe {
@@ -353,13 +353,17 @@ fn volatile_status_observed_and_double_buffered() {
             "previous view must survive one more read"
         );
 
-        // 再改回 running：A 看到 running；双缓冲只保证最近一次读（p4）的视图有效。
+        // Switch back to running: handle A sees running, and repeated unchanged reads keep the same pointer.
         set_str(b, st, "running");
-        let (v3, _p3, _l3) = get_str(a, st).unwrap();
+        let (v3, p3, l3) = get_str(a, st).unwrap();
         assert_eq!(v3, "running");
-        let (v4, p4, l4) = get_str(a, st).unwrap();
-        assert_eq!(v4, "running");
-        assert_eq!(read_str(p4, l4), "running");
+        for _ in 0..6 {
+            let (vn, pn, ln) = get_str(a, st).unwrap();
+            assert_eq!(vn, "running");
+            assert_eq!(pn, p3, "unchanged volatile read must keep pointer stable");
+            assert_eq!(ln, l3);
+        }
+        assert_eq!(read_str(p3, l3), "running");
 
         // 外部删除该 key：volatile 每读重读，必须看到 None。
         let del_keys = [ckey(st)];
@@ -380,9 +384,7 @@ fn volatile_status_observed_and_double_buffered() {
             "snapshot keys ignore external writes"
         );
     }
-    unsafe {
-        kvspaceClose(a);
-        kvspaceClose(b);
-    }
+    kvspaceClose(a);
+    kvspaceClose(b);
     std::fs::remove_dir_all(dsn.trim_start_matches("fs://")).ok();
 }

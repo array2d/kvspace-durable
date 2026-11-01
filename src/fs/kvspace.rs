@@ -11,12 +11,61 @@ use crate::coord::cmp_coord;
 use crate::kvspace::{KVPair, KVSpace};
 use crate::kvspace_common::{
     is_descendant, is_frame_operand_key, join_path, sep_path, split_index, strip_dir_suf,
-    validate_ptr, watch_value,
+    subtree_base, watch_value,
 };
 use crate::r#const::*;
 use crate::xvalue::*;
 const SELF_MARKER: &str = "__self__";
 const DIR_MARKER: &str = "__dir__";
+/// Prefix for atomic-write temp files (`~~` cannot collide with `~` + hex escaped key names)
+/// and is skipped during directory listing and copies.
+const TMP_PREFIX: &str = "~~tmp.";
+static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Replaces a full value without exposing a missing or truncated file to concurrent readers:
+/// overwrites the body in place when length, header, and attr match; otherwise writes a temp
+/// file in the same directory and renames it over `path`.
+fn write_atomic(path: &Path, val: &[u8]) -> std::io::Result<()> {
+    if overwrite_body_in_place(path, val)? {
+        return Ok(());
+    }
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = dir.join(format!("{TMP_PREFIX}{}.{seq}", std::process::id()));
+    fs::write(&tmp, val)?;
+    fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = fs::remove_file(&tmp);
+    })
+}
+
+/// Overwrites only the body if `path` already has the same size, header, and attr bytes.
+fn overwrite_body_in_place(path: &Path, val: &[u8]) -> std::io::Result<bool> {
+    let Some(head) = crate::headlenpow::from_wire(val) else {
+        return Ok(false);
+    };
+    let attr_off = crate::headlenpow::PREFIX + head.body.len();
+    let f = match fs::OpenOptions::new().read(true).write(true).open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    if f.metadata()?.len() != val.len() as u64 {
+        return Ok(false);
+    }
+    let mut old = vec![0u8; crate::headlenpow::PREFIX + (val.len() - attr_off)];
+    let (old_head, old_attr) = old.split_at_mut(crate::headlenpow::PREFIX);
+    f.read_exact_at(old_head, 0)?;
+    f.read_exact_at(old_attr, attr_off as u64)?;
+    if old_head != &val[..crate::headlenpow::PREFIX] || old_attr != &val[attr_off..] {
+        return Ok(false);
+    }
+    f.write_all_at(head.body, crate::headlenpow::PREFIX as u64)?;
+    Ok(true)
+}
+
+fn is_tmp_name(name: &std::ffi::OsStr) -> bool {
+    name.to_str().is_some_and(|n| n.starts_with(TMP_PREFIX))
+}
 
 pub struct FsKVSpace {
     root: PathBuf,
@@ -161,13 +210,13 @@ impl FsKVSpace {
         }
         let p = self.fs_path(key);
         if p.is_dir() {
-            fs::write(p.join(Self::leaf_marker(key)), val)
+            write_atomic(&p.join(Self::leaf_marker(key)), val)
                 .unwrap_or_else(|e| panic!("kvspace-fs: set {}: {}", key, e));
         } else {
             if let Some(parent) = p.parent() {
                 let _ = fs::create_dir_all(parent);
             }
-            fs::write(p, val).unwrap_or_else(|e| panic!("kvspace-fs: set {}: {}", key, e));
+            write_atomic(&p, val).unwrap_or_else(|e| panic!("kvspace-fs: set {}: {}", key, e));
         }
     }
 
@@ -221,13 +270,14 @@ impl FsKVSpace {
 
     fn resolve_path(&self, path: &str) -> String {
         let mut path = path.to_string();
-        loop {
+        for _ in 0..16 {
             let (resolved, changed) = self.resolve_one(&path);
             if !changed {
                 return resolved;
             }
             path = resolved;
         }
+        path
     }
 
     fn resolve_parent(&self, path: &str) -> String {
@@ -253,7 +303,19 @@ impl FsKVSpace {
         if path == PATH_SEP {
             return (path.to_string(), false);
         }
-        let trimmed = path.trim_matches('/');
+        let dir_suf = if path.ends_with(OBJ_SEP) {
+            Some(OBJ_SEP)
+        } else if path.ends_with(DIR_INDEX_SUF) {
+            Some(DIR_INDEX_SUF)
+        } else {
+            None
+        };
+        let clean = if dir_suf.is_some() {
+            strip_dir_suf(path)
+        } else {
+            path
+        };
+        let trimmed = clean.trim_matches('/');
         let parts: Vec<&str> = if trimmed.is_empty() {
             Vec::new()
         } else {
@@ -266,10 +328,17 @@ impl FsKVSpace {
                 let v = from_wire(&data);
                 if is_ptr(&v) {
                     let target = ptr_target(&v);
-                    if i + 1 < parts.len() {
-                        return (join_path(&target, &parts[i + 1..].join("/")), true);
+                    let mut next = if i + 1 < parts.len() {
+                        join_path(&target, &parts[i + 1..].join("/"))
+                    } else {
+                        target
+                    };
+                    if let Some(suf) = dir_suf {
+                        if !Self::is_dir_key(&next) {
+                            next.push_str(suf);
+                        }
                     }
-                    return (target, true);
+                    return (next, true);
                 }
             }
         }
@@ -296,6 +365,9 @@ impl FsKVSpace {
         let mut children = Vec::new();
         if let Ok(entries) = fs::read_dir(&p) {
             for e in entries.flatten() {
+                if is_tmp_name(&e.file_name()) {
+                    continue;
+                }
                 let fname = e.file_name().to_string_lossy().into_owned();
                 if fname == SELF_MARKER
                     || fname == DIR_MARKER
@@ -304,14 +376,19 @@ impl FsKVSpace {
                     continue;
                 }
                 let name = Self::unescape_name(&fname);
-                // RUNTIME_MEMBER_SEP（‥）前缀键是系统变量/langtype attr key，List 时隐藏。
+                // Hide runtime system keys containing RUNTIME_MEMBER_SEP (‥) from List.
                 if name.contains(RUNTIME_MEMBER_SEP) {
                     continue;
                 }
                 if name.ends_with(OBJ_SEP) {
                     children.push(name.trim_end_matches(OBJ_SEP).to_string());
                 } else if e.path().is_dir() {
-                    children.push(format!("{}/", name));
+                    let dp = e.path();
+                    if dp.join(SELF_MARKER).is_file() && !dp.join(DIR_MARKER).is_file() {
+                        children.push(name);
+                    } else {
+                        children.push(format!("{}/", name));
+                    }
                 } else {
                     children.push(name);
                 }
@@ -329,6 +406,9 @@ impl FsKVSpace {
             fs::create_dir_all(dst)?;
             for e in fs::read_dir(src)? {
                 let e = e?;
+                if is_tmp_name(&e.file_name()) {
+                    continue;
+                }
                 Self::copy_recursive(&e.path(), &dst.join(e.file_name()))?;
             }
         } else {
@@ -469,13 +549,17 @@ impl KVSpace for FsKVSpace {
                 .ok_or_else(|| format!("invalid XValue at {key}"))?;
             let attr = crate::headlenpow::attr_len(&raw, head.len as usize)
                 .ok_or_else(|| format!("invalid XValue at {key}"))?;
-            if head.len as usize + crate::headlenpow::PREFIX + attr as usize != raw.len() {
+            if attr < 2 {
                 return Err(format!("invalid XValue at {key}"));
             }
-            // 指针校验用声明的 target_kindexpr（val 为 Ptr 时可得；raw 直写无类型则跳过）。
-            if let XValue::Ptr(ptr) = &pair.val {
-                validate_ptr(self, &ptr.target, &ptr.target_kindexpr)?;
+            let total = (head.len as usize)
+                .checked_add(crate::headlenpow::PREFIX)
+                .and_then(|x| x.checked_add(attr as usize))
+                .ok_or_else(|| format!("invalid XValue at {key}"))?;
+            if total > raw.len() {
+                return Err(format!("invalid XValue at {key}"));
             }
+            let raw = &raw[..total];
             let (parent, _, _) = split_index(&key);
             if parent.ends_with(OBJ_SEP) {
                 let base = strip_dir_suf(&parent);
@@ -500,7 +584,7 @@ impl KVSpace for FsKVSpace {
             if Self::is_dir_key(&key) {
                 self.ensure_dir(&key);
             }
-            self.write_leaf(&key, &raw);
+            self.write_leaf(&key, raw);
         }
         Ok(())
     }
@@ -556,32 +640,67 @@ impl KVSpace for FsKVSpace {
         if crate::r#const::is_reserved(prefix) {
             return Err(format!("reserved metadata key: {prefix}"));
         }
-        let resolved = self.resolve_path(prefix);
+        // Resolve links only on parent components (POSIX rm semantics); if the final
+        // component is itself a link, delete the link rather than its target subtree.
+        let resolved = self.resolve_parent(prefix);
         if crate::r#const::is_reserved(&resolved) {
             return Err(format!("reserved metadata key: {resolved}"));
         }
-        // 若 prefix 本身是链接（叶 Ptr），只删链接。
-        let link_key = if Self::is_dir_key(&resolved) && resolved != PATH_SEP {
-            strip_dir_suf(&resolved)
-        } else {
-            &resolved
-        };
-        if let Some(data) = self.read_leaf(link_key) {
-            if from_wire_head(&data).is_ptr() {
-                return self.del(&[resolved]);
+        let base = subtree_base(&resolved).to_string();
+        if !base.is_empty() {
+            if let Some(data) = self.read_leaf(&base) {
+                if from_wire_head(&data).is_ptr() {
+                    return self.del(&[base]);
+                }
             }
         }
-        let base = if Self::is_dir_key(&resolved) && resolved != PATH_SEP {
-            strip_dir_suf(&resolved)
+        // Subtree covers base, base/*, base·*, and base‥* across the node path, its
+        // sibling `base·` directory, and sibling `base‥*` entries in the parent directory.
+        let mut doomed = Vec::new();
+        if base.is_empty() {
+            // Root: remove everything except reserved metadata, keeping the root dir itself.
+            if let Ok(entries) = fs::read_dir(&self.root) {
+                for e in entries.flatten() {
+                    if e.file_name() != META_ROOT_NAME {
+                        doomed.push(e.path());
+                    }
+                }
+            }
         } else {
-            &resolved
-        };
-        for key in [base.to_string(), format!("{base}{OBJ_SEP}")] {
-            let node = self.node_path(&key);
-            if node.is_dir() {
-                fs::remove_dir_all(&node).map_err(|e| format!("DelTree {key}: {e}"))?;
+            let node = self.node_path(&base);
+            doomed.push(self.node_path(&format!("{base}{OBJ_SEP}")));
+            if let (Some(parent), Some(name)) = (node.parent(), node.file_name()) {
+                let stem = format!(
+                    "{}{}",
+                    Self::unescape_name(&name.to_string_lossy()),
+                    RUNTIME_MEMBER_SEP
+                );
+                if let Ok(entries) = fs::read_dir(parent) {
+                    for e in entries.flatten() {
+                        if !is_tmp_name(&e.file_name())
+                            && Self::unescape_name(&e.file_name().to_string_lossy())
+                                .starts_with(&stem)
+                        {
+                            doomed.push(e.path());
+                        }
+                    }
+                }
+            }
+            doomed.push(node);
+        }
+        for node in doomed {
+            let r = if node.is_dir() {
+                fs::remove_dir_all(&node)
             } else if node.is_file() {
-                fs::remove_file(&node).map_err(|e| format!("DelTree {key}: {e}"))?;
+                fs::remove_file(&node)
+            } else {
+                continue;
+            };
+            match r {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                    return Err(format!("DelTree {}: {e}", node.display()));
+                }
+                _ => {}
             }
         }
         Ok(())
@@ -595,7 +714,7 @@ impl KVSpace for FsKVSpace {
         if raw.is_empty() {
             return Err(format!("Cp: source not found: {}", src));
         }
-        // attr key 与值同址：读解析后的物理 src 路径的类型。
+        // Copy raw wire bytes verbatim (langtype lives in the value's attr trailer).
         let v = from_wire(&raw);
         self.set(&[KVPair {
             key: dst.to_string(),
@@ -686,6 +805,9 @@ impl KVSpace for FsKVSpace {
             let _ = fs::create_dir_all(&dmem);
             if let Ok(rd) = fs::read_dir(&smem) {
                 for e in rd.flatten() {
+                    if is_tmp_name(&e.file_name()) {
+                        continue;
+                    }
                     let sp = e.path();
                     let dp = dmem.join(e.file_name());
                     if sp.is_file() {
@@ -718,8 +840,8 @@ impl KVSpace for FsKVSpace {
         let resolved = self.resolve_path(path);
         self.ensure_dir(&resolved);
         if self.read_leaf(&resolved).is_none() {
-            // 固定头空目录 marker：storetype 0、ptr 0、空 body；类型 "lib" 在值 attr 区。
-            let value = crate::headlenpow::to_wire(0, 0, &[], "lib")
+            // Directory marker: ST_SHORT, inline, empty body, langtype "lib" in attr.
+            let value = crate::headlenpow::to_wire(ST_SHORT, REF_INLINE, &[], "lib")
                 .ok_or_else(|| format!("Mkindex: invalid directory {resolved}"))?;
             self.write_leaf(&resolved, &value);
         }
@@ -741,8 +863,8 @@ impl KVSpace for FsKVSpace {
             return Err(format!("ExtIndex target missing: {ext_path}"));
         }
         let langtype = self.langtype_of(ext_path);
-        // 扩展定位：storetype 3（ST_EXT）+ ptr 2（PTR_EXT）+ 定位串 body + 类型 attr 区。
-        let value = crate::headlenpow::to_wire(3, 2, ext_path.as_bytes(), &langtype)
+        // External locator: ST_EXT + REF_EXT + locator body + target langtype in attr.
+        let value = crate::headlenpow::to_wire(ST_EXT, REF_EXT, ext_path.as_bytes(), &langtype)
             .ok_or_else(|| format!("ExtIndex locator invalid: {ext_path}"))?;
         self.ensure_dir(&resolved);
         self.write_leaf(&resolved, &value);
