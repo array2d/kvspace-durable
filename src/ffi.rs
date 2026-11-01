@@ -528,6 +528,24 @@ pub extern "C" fn kvspaceSetPart(
         return 1;
     }
     let key = unsafe { cstr(key) }.to_string();
+    if crate::r#const::is_reserved(&key) {
+        write_err(err, err_cap, "kvspace: set-part on reserved key");
+        return 1;
+    }
+    /* 原地写只允许改 body [8, 8+len)：读 8 字节 head 取 len，越界一律硬错，
+     * head/attr 不可写。 */
+    let head8 = hd.kv.get_part(&key, 0, crate::headlenpow::PREFIX as u32);
+    let Some(body_len) = crate::headlenpow::read_len(&head8) else {
+        write_err(err, err_cap, "kvspace: set-part on missing key");
+        return 1;
+    };
+    let prefix = crate::headlenpow::PREFIX as u64;
+    if (offset as u64) < prefix
+        || (offset as u64 - prefix) + (buf_len as u64) > body_len
+    {
+        write_err(err, err_cap, "kvspace: set-part outside body");
+        return 1;
+    }
     let data = unsafe { std::slice::from_raw_parts(buf, buf_len as usize) };
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         hd.kv.set_part(&key, offset, data)
@@ -614,7 +632,14 @@ pub extern "C" fn kvspaceWriteInPlace(
     hd.read_cache.remove(&key);
     hd.write_buf = existing;
     hd.pending_key = Some(key);
-    unsafe { *body = hd.write_buf.as_mut_ptr().add(head_len) };
+    /* body 指针供调用方直接写 8 字节标量：对齐是前条件，不是假设。 */
+    let body_ptr = unsafe { hd.write_buf.as_mut_ptr().add(head_len) };
+    debug_assert_eq!(
+        body_ptr as usize % 8,
+        0,
+        "kvspace: write-in-place body pointer is not 8-byte aligned"
+    );
+    unsafe { *body = body_ptr };
     0
 }
 
@@ -656,7 +681,14 @@ pub extern "C" fn kvspaceWriteNewPlace(
     hd.read_cache.remove(&key);
     hd.write_buf = xv;
     hd.pending_key = Some(key);
-    unsafe { *body = hd.write_buf.as_mut_ptr().add(head_len) };
+    /* body 指针供调用方直接写 8 字节标量：对齐是前条件，不是假设。 */
+    let body_ptr = unsafe { hd.write_buf.as_mut_ptr().add(head_len) };
+    debug_assert_eq!(
+        body_ptr as usize % 8,
+        0,
+        "kvspace: write-new-place body pointer is not 8-byte aligned"
+    );
+    unsafe { *body = body_ptr };
     0
 }
 
