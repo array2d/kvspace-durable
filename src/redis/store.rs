@@ -1,13 +1,18 @@
 // redis/store.rs — Redis 存储原语（最小 RESP 客户端，仅 GET/SET/DEL/SCAN/FLUSHDB）。
 
 use std::cell::RefCell;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 
 use crate::store::{is_subtree_key, KVStore};
 
+type Conn = BufReader<TcpStream>;
+
 pub struct RedisStore {
-    stream: RefCell<BufReader<TcpStream>>,
+    addr: String,
+    /// Set to `None` on I/O error or timeout so the next command reconnects instead of
+    /// reading a delayed response left in the stream.
+    stream: RefCell<Option<Conn>>,
 }
 
 pub fn connect(addr: &str) -> RedisStore {
@@ -21,91 +26,129 @@ pub fn connect(addr: &str) -> RedisStore {
 
 impl RedisStore {
     pub fn new(addr: &str) -> Self {
-        let stream = TcpStream::connect(addr)
-            .unwrap_or_else(|e| panic!("kvspace-redis: connect {}: {}", addr, e));
-        stream
-            .set_read_timeout(Some(std::time::Duration::from_secs(3)))
-            .ok();
-        stream
-            .set_write_timeout(Some(std::time::Duration::from_secs(3)))
-            .ok();
-        stream.set_nodelay(true).ok(); // 请求/应答 ping-pong，禁 Nagle 避免与延迟 ACK 叠加卡顿
+        let conn =
+            Self::open(addr).unwrap_or_else(|e| panic!("kvspace-redis: connect {}: {}", addr, e));
         RedisStore {
-            stream: RefCell::new(BufReader::new(stream)), // 缓冲读：RESP 逐字节 read_exact 曾致 syscall 风暴
+            addr: addr.to_string(),
+            stream: RefCell::new(Some(conn)),
         }
+    }
+
+    fn open(addr: &str) -> io::Result<Conn> {
+        let stream = TcpStream::connect(addr)?;
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(3)))?;
+        stream.set_write_timeout(Some(std::time::Duration::from_secs(3)))?;
+        stream.set_nodelay(true)?; // disable Nagle for request/reply round-trips
+        Ok(BufReader::new(stream)) // buffer RESP reads to avoid per-byte syscalls
     }
 
     fn cmd(&self, args: &[&[u8]]) -> Resp {
-        {
-            let mut s = self.stream.borrow_mut();
-            let mut out = format!("*{}\r\n", args.len()).into_bytes();
-            for a in args {
-                out.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
-                out.extend_from_slice(a);
-                out.extend_from_slice(b"\r\n");
+        let response = {
+            let mut slot = self.stream.borrow_mut();
+            let r = Self::round_trip(&self.addr, &mut slot, args);
+            if r.is_err() {
+                *slot = None; // drop desynchronized stream; reconnect on next command
             }
-            s.get_mut()
-                .write_all(&out)
-                .unwrap_or_else(|e| panic!("kvspace-redis: write: {}", e));
+            r
+        };
+        match response {
+            // Server error reply is a complete frame; stream remains aligned.
+            Ok(Resp::Error(message)) => panic!("kvspace-redis: {message}"),
+            Ok(r) => r,
+            Err(e) => panic!("kvspace-redis: {}: {e}", self.addr),
         }
-        let response = self.read_resp();
-        if let Resp::Error(message) = &response {
-            panic!("kvspace-redis: {message}");
-        }
-        response
     }
 
-    fn read_line(&self) -> Vec<u8> {
-        let mut s = self.stream.borrow_mut();
-        let mut line = Vec::new();
-        s.read_until(b'\n', &mut line)
-            .unwrap_or_else(|e| panic!("kvspace-redis: read: {}", e));
-        if line.ends_with(b"\n") {
-            line.pop();
+    fn round_trip(addr: &str, slot: &mut Option<Conn>, args: &[&[u8]]) -> io::Result<Resp> {
+        if slot.is_none() {
+            *slot = Some(Self::open(addr)?);
         }
-        if line.ends_with(b"\r") {
-            line.pop();
+        let conn = slot.as_mut().expect("connection just opened");
+        let mut out = format!("*{}\r\n", args.len()).into_bytes();
+        for a in args {
+            out.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+            out.extend_from_slice(a);
+            out.extend_from_slice(b"\r\n");
         }
-        line
+        conn.get_mut().write_all(&out)?;
+        read_resp(conn)
     }
+}
 
-    fn read_resp(&self) -> Resp {
-        let line = self.read_line();
-        if line.is_empty() {
-            return Resp::Error("empty response".to_string());
-        }
-        match line[0] {
-            b'+' => Resp::Simple(String::from_utf8_lossy(&line[1..]).into_owned()),
-            b'-' => Resp::Error(String::from_utf8_lossy(&line[1..]).into_owned()),
-            b':' => Resp::Integer(String::from_utf8_lossy(&line[1..]).parse().unwrap_or(0)),
-            b'$' => {
-                let len: i64 = String::from_utf8_lossy(&line[1..]).parse().unwrap_or(-1);
-                if len < 0 {
-                    return Resp::Bulk(None);
-                }
-                let mut s = self.stream.borrow_mut();
-                let mut data = vec![0u8; len as usize];
-                s.read_exact(&mut data)
-                    .unwrap_or_else(|e| panic!("kvspace-redis: read bulk: {}", e));
-                let mut crlf = [0u8; 2];
-                s.read_exact(&mut crlf)
-                    .unwrap_or_else(|e| panic!("kvspace-redis: read crlf: {}", e));
-                Resp::Bulk(Some(data))
-            }
-            b'*' => {
-                let n: i64 = String::from_utf8_lossy(&line[1..]).parse().unwrap_or(-1);
-                if n < 0 {
-                    return Resp::Array(Vec::new());
-                }
-                let mut arr = Vec::with_capacity(n as usize);
-                for _ in 0..n {
-                    arr.push(self.read_resp());
-                }
-                Resp::Array(arr)
-            }
-            _ => Resp::Error(format!("unexpected RESP type: {}", line[0] as char)),
-        }
+fn read_line(conn: &mut Conn) -> io::Result<Vec<u8>> {
+    let mut line = Vec::new();
+    if conn.read_until(b'\n', &mut line)? == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "connection closed",
+        ));
     }
+    if line.ends_with(b"\n") {
+        line.pop();
+    }
+    if line.ends_with(b"\r") {
+        line.pop();
+    }
+    Ok(line)
+}
+
+fn read_resp(conn: &mut Conn) -> io::Result<Resp> {
+    let line = read_line(conn)?;
+    let Some((&kind, rest)) = line.split_first() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "empty RESP line",
+        ));
+    };
+    let text = || String::from_utf8_lossy(rest).into_owned();
+    Ok(match kind {
+        b'+' => Resp::Simple(text()),
+        b'-' => Resp::Error(text()),
+        b':' => Resp::Integer(text().parse().unwrap_or(0)),
+        b'$' => {
+            let len: i64 = text().parse().unwrap_or(-1);
+            if len < 0 {
+                return Ok(Resp::Bulk(None));
+            }
+            let mut data = vec![0u8; len as usize];
+            conn.read_exact(&mut data)?;
+            let mut crlf = [0u8; 2];
+            conn.read_exact(&mut crlf)?;
+            Resp::Bulk(Some(data))
+        }
+        b'*' => {
+            let n: i64 = text().parse().unwrap_or(-1);
+            if n < 0 {
+                return Ok(Resp::Array(Vec::new()));
+            }
+            let mut arr = Vec::with_capacity(n as usize);
+            for _ in 0..n {
+                arr.push(read_resp(conn)?);
+            }
+            Resp::Array(arr)
+        }
+        // Unrecognized RESP type byte indicates stream desynchronization.
+        other => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unexpected RESP type: {}", other as char),
+            ))
+        }
+    })
+}
+
+/// Builds a SCAN MATCH glob (`* ? [ ] \` escaped, plus trailing `*`; empty prefix -> `/*`).
+fn scan_pattern(prefix: &str) -> Vec<u8> {
+    let base = if prefix.is_empty() { "/" } else { prefix };
+    let mut pat = Vec::with_capacity(base.len() + 1);
+    for &b in base.as_bytes() {
+        if matches!(b, b'*' | b'?' | b'[' | b']' | b'\\') {
+            pat.push(b'\\');
+        }
+        pat.push(b);
+    }
+    pat.push(b'*');
+    pat
 }
 
 enum Resp {
@@ -184,11 +227,20 @@ impl KVStore for RedisStore {
     }
 
     fn scan_keys(&self, prefix: &str) -> Vec<String> {
+        // Filter by prefix server-side via MATCH; check subtree boundaries locally via is_subtree_key.
+        let pattern = scan_pattern(prefix);
         let mut keys = Vec::new();
         let mut cursor: i64 = 0;
         loop {
             let cur = cursor.to_string();
-            match self.cmd(&[b"SCAN", cur.as_bytes(), b"COUNT", b"1000"]) {
+            match self.cmd(&[
+                b"SCAN",
+                cur.as_bytes(),
+                b"MATCH",
+                &pattern,
+                b"COUNT",
+                b"1000",
+            ]) {
                 Resp::Array(parts) if parts.len() == 2 => {
                     cursor = match &parts[0] {
                         Resp::Bulk(Some(bytes)) => {

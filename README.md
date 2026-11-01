@@ -25,24 +25,28 @@ Crate types: `rlib`, `staticlib`, `cdylib` (`libkvspace_durable.so`).
 C ABI exported from the cdylib (`src/ffi.rs`):
 
 - lifecycle: `kvspaceConnect`, `kvspaceClose`
-- KV read/write: `kvspaceGet` (borrow), synchronous `kvspaceSetValue`, `kvspaceWriteInPlace`, `kvspaceWriteNewPlace`
-- enumerate / delete / copy: `kvspaceListLen`, `kvspaceListAt`, `kvspaceDel`, `kvspaceDelTree`, `kvspaceCp`, `kvspaceCpTree`
+- KV read/write: `kvspaceGet` (borrow), `kvspaceGetPart`, `kvspaceGetHead`, synchronous `kvspaceSetValue`, `kvspaceSetPart`, `kvspaceWriteInPlace`, `kvspaceWriteNewPlace`
+- enumerate / delete / copy: `kvspaceListLen`, `kvspaceListAt`, `kvspaceDel`, `kvspaceDelTree`, `kvspaceCp`, `kvspaceCpTree`, `kvspaceCpList`
 - directories / extindex: `kvspaceMkindex`, `kvspaceMkindexExt`, `kvspaceRmindexExt`
 - watch / clear: `kvspaceWatch`, `kvspaceClear`
-- XValue codec (frontend malloc, caller `free()`s): `kvspaceXvalueEncode`, `kvspaceXvalueEncodeMode`, `kvspaceDecodeHead`, `kvspaceNewPtr`, `kvspaceNewChar`, `kvspaceNewBool`, `kvspaceNewInt64`, `kvspaceNewFloat64`
+- XValue constructors (caller `free()`s; same signatures and bytes as the frontend and `kvspace-c`, `langtype` is written verbatim): `kvspaceNewPtr`, `kvspaceNewChar`, `kvspaceNewBool`, `kvspaceNewInt64`, `kvspaceNewFloat64`
+- shm-only views, always `-2` here (callers fall back to the calls above): `kvspaceXvalueBodyView`, `kvspaceView*`
 
 The same ABI is implemented by `kvspace-c` (`shm://`), so a consumer (e.g. the kvlang layout) switches backends by DSN only, with no code change.
 
 ## XValue
 
-The headlenpow wire format is byte-identical across this backend, `kvspace-c`, and the `kvspace` frontend. Its 18-byte prefix is `[headlenpow:u8][flags:u8][a:u64 LE][b:u64 LE]`. The UTF-8 langtype occupies the rest of the `2^headlenpow` head, followed by the body. `flags` uses its low two bits for the storage class and bit 2 for a pointer.
+The wire format is byte-identical across this backend, `kvspace-c`, and the `kvspace` frontend (`kvspace/xvalue_head.h`), and a value is always one key:
 
-- Class 0 stores short fixed values, `None`, maps, structs, and directory markers. `None` has an empty langtype; map members and directory children are enumerated from physical key prefixes.
-- Class 1 stores a byte length and reserved capacity (`a`, `b`) for strings and code slots. UTF-8 records the code point count in its langtype and the byte count in `a`.
-- Class 2 stores tensor element count and width. Its langtype carries the dimensions.
-- Class 3 stores an external locator, with the target's actual langtype. Pointer values use class 1 with the pointer bit set and a target key in the body.
+```
+[len:u48 LE @0-5][storetype:u8 @6][ptr:u8 @7][body: len bytes @8][attr]
+attr   = [attr_len:u16 LE (includes itself)][record...]   empty attr = [2,0]
+record = [tag:u8][len:u16 LE][data]                       tag 1 = langtype, 2+ reserved
+```
 
-`ro` and `vid` live at `/.kvspace-meta/<hex key>` as a separate XValue. Writes and copies preserve the sidecar; its absence means `ro=false, vid=0`.
+- `storetype` 0 short fixed values, `None`, maps, structs and directory markers; 1 variable length (strings, code slots, pointer paths); 2 tensors (the langtype carries the dimensions); 3 external locators (`@ext`).
+- `ptr` 0 inline, 1 pointer (body = target key, langtype = target kindexpr), 2 `@ext` (body = locator).
+- An empty langtype means `None` for inline values. Map members and directory children are enumerated from physical key prefixes.
 
 ## Tutorial
 

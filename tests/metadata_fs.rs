@@ -33,7 +33,7 @@ fn value_and_directory_keys_coexist() {
     kv.mkindex("/node/", 0).unwrap();
     let directory = kv.get_raw("/node/");
     let dh = kvspace_durable::headlenpow::from_wire(&directory).unwrap();
-    assert_eq!(dh.storetype, 0); /* 目录 = storetype 0 空 body；langtype 在 attr key */
+    assert_eq!(dh.storetype, 0); /* directory marker: storetype 0, empty body, langtype in attr */
     assert_eq!(dh.ptr, 0);
     assert_eq!(kv.get_raw("/node"), value);
     for name in ["__dir__", "__self__", "~abc"] {

@@ -1,7 +1,32 @@
 // tests/common/mod.rs — 各集成测试共用的小工具。
 //
-// 只放「不需要真后端就能定义」的东西。语义测试用的 run(dsn) 仍然各自留在
-// cp.rs / map_coord.rs 里，保持每个测试文件自足。
+// Backend-independent helpers shared across integration tests; per-suite `run(dsn, root)`
+// entry points stay in their respective test files (`cp.rs`, `map_coord.rs`, etc.).
+
+/// Returns the Redis test DSN if reachable, or logs and returns `None` to skip.
+/// Tests must never call `clear()` (`FLUSHDB`); always isolate under a unique prefix + `del_tree`.
+#[allow(dead_code)]
+pub fn redis_test_dsn(label: &str) -> Option<String> {
+    let dsn = std::env::var("KVSPACE_TEST_REDIS_DSN")
+        .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+    let host_port = dsn
+        .trim_start_matches("redis://")
+        .split('/')
+        .next()
+        .unwrap_or("");
+    let addr = host_port.rsplit('@').next().unwrap_or(host_port);
+    let reachable = std::net::ToSocketAddrs::to_socket_addrs(&addr)
+        .ok()
+        .and_then(|mut a| a.next())
+        .is_some_and(|a| {
+            std::net::TcpStream::connect_timeout(&a, std::time::Duration::from_millis(300)).is_ok()
+        });
+    if !reachable {
+        eprintln!("skipping redis {label} test: {addr} unreachable");
+        return None;
+    }
+    Some(dsn)
+}
 
 /// S3 集成测试的 DSN 与安全守卫。
 ///
@@ -14,6 +39,7 @@
 /// KVSPACE='s3://AK:SK@bucket/_test/run1/?endpoint=…&region=…' \
 ///   cargo test --test cp -- --ignored --nocapture
 /// ```
+#[allow(dead_code)]
 pub fn s3_test_dsn() -> Option<String> {
     let dsn = match std::env::var("KVSPACE") {
         Ok(v) if !v.is_empty() => v,

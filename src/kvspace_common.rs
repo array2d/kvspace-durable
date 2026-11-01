@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use crate::kvspace::KVSpace;
 use crate::r#const::*;
-use crate::xvalue::{body_bytes, is_none, plain, XValue};
+use crate::xvalue::{body_bytes, is_none, XValue};
 
 /// JoinPath 拼接父子路径。
 pub fn join_path(parent: &str, child: &str) -> String {
@@ -28,6 +28,15 @@ pub fn strip_dir_suf(path: &str) -> &str {
     }
 }
 
+/// Subtree root for DelTree: strips a single trailing `/` or `·` (`"/"` maps to `""`).
+/// Deletes every key satisfying `store::is_subtree_key(base, key)`.
+pub fn subtree_base(prefix: &str) -> &str {
+    if prefix == PATH_SEP {
+        ""
+    } else {
+        strip_dir_suf(prefix)
+    }
+}
 pub fn is_descendant(base: &str, path: &str) -> bool {
     if base == PATH_SEP {
         return path != PATH_SEP && path.starts_with(PATH_SEP);
@@ -99,6 +108,9 @@ pub fn split_index(path: &str) -> (String, String, SepKind) {
 /// （见 [[map容器]]：`[float64,float64]` ≠ `[2]float64`），一律原样保留——剥掉会让 map 的
 /// 键类型整个丢失，Ptr 类型检查随即误判。
 fn norm_langtype(s: &str) -> String {
+    if s.contains(OBJ_SEP) {
+        return s.to_string();
+    }
     if let Some(rest) = s.strip_prefix('[') {
         if let Some(end) = rest.find(']') {
             let inner = &rest[..end];
@@ -166,6 +178,7 @@ pub fn watch_value(
     tick_duration: Duration,
 ) -> XValue {
     const SPIN_COUNT: i64 = 100;
+    let step_cap = tick_duration.min(Duration::from_millis(10));
     let mut cur = Duration::ZERO;
     let mut i: i64 = 0;
     loop {
@@ -179,8 +192,8 @@ pub fn watch_value(
         }
         if cur.is_zero() {
             cur = Duration::from_micros(1);
-        } else if cur < tick_duration {
-            cur = (cur * 2).min(tick_duration);
+        } else if cur < step_cap {
+            cur = (cur * 2).min(step_cap);
         }
         std::thread::sleep(cur);
     }
@@ -191,101 +204,4 @@ pub fn equal_xvalue(a: &XValue, b: &XValue) -> bool {
         return false;
     }
     body_bytes(a) == body_bytes(b)
-}
-
-// Display helpers.
-
-pub fn get_at(kv: &mut dyn KVSpace, dir: &str, name: &str) -> XValue {
-    kv.get(dir, &[name.to_string()], true).remove(0)
-}
-
-pub fn read_prefix_ext(kv: &mut dyn KVSpace, prefix: &str) -> String {
-    if let XValue::Ext(e) = get_one(kv, prefix) {
-        return e.locator;
-    }
-    String::new()
-}
-
-pub fn fprint_list(kv: &mut dyn KVSpace, prefix: &str, show_ext: bool, show_kind: bool) {
-    let children = kv.list(prefix, show_ext, true);
-    for c in children {
-        let mut v = get_at(kv, prefix, &c);
-        let child_dir = format!("{}{}", join_path(prefix, &c), DIR_INDEX_SUF);
-        let mut has_dir = !kv.list(&child_dir, false, true).is_empty();
-        if !has_dir {
-            has_dir = !is_none(&get_at(kv, prefix, &format!("{}{}", c, DIR_INDEX_SUF)));
-        }
-        let mut key = c.clone();
-        if has_dir {
-            key.push_str(DIR_INDEX_SUF);
-            v = XValue::None;
-        }
-        if is_none(&v) {
-            println!("{}", key);
-        } else if show_kind {
-            println!("{}\t{}\t{}", key, v.kind(), plain(&v));
-        } else {
-            println!("{}\t{}", key, plain(&v));
-        }
-    }
-    if !show_ext {
-        let ext = read_prefix_ext(kv, prefix);
-        if !ext.is_empty() {
-            println!("{}{}", EXT_INDEX_HEAD, ext);
-            for c in kv.list(&ext, false, true) {
-                println!("  {}", c);
-            }
-        }
-    }
-}
-
-pub fn fprint_tree(
-    kv: &mut dyn KVSpace,
-    prefix: &str,
-    indent: &str,
-    show_ext: bool,
-    show_kind: bool,
-) {
-    let mut children = kv.list(prefix, show_ext, true);
-    children.sort_by(|a, b| {
-        let (a_, b_) = (a.trim_end_matches('/'), b.trim_end_matches('/'));
-        if a_ == b_ {
-            a.ends_with('/').cmp(&b.ends_with('/'))
-        } else {
-            a_.cmp(b_)
-        }
-    });
-
-    let n = children.len();
-    for (i, c) in children.iter().enumerate() {
-        let v = get_at(kv, prefix, c);
-        let base = c.trim_end_matches('/');
-        let child_dir = format!("{}{}", join_path(prefix, base), DIR_INDEX_SUF);
-        let mut has_child = !kv.list(&child_dir, false, true).is_empty();
-        if !has_child {
-            has_child = !is_none(&get_at(kv, prefix, &format!("{}{}", base, DIR_INDEX_SUF)));
-        }
-
-        let last = i == n - 1;
-        let branch = if last { "└── " } else { "├── " };
-        let next_indent = format!("{}{}", indent, if last { "    " } else { "│   " });
-
-        if has_child && c.ends_with(DIR_INDEX_SUF) {
-            println!("{}{}{}", indent, branch, c);
-            fprint_tree(kv, &child_dir, &next_indent, show_ext, show_kind);
-        } else if is_none(&v) {
-            println!("{}{}{}", indent, branch, c);
-        } else if show_kind {
-            println!("{}{}{}\t{}\t{}", indent, branch, c, v.kind(), plain(&v));
-        } else {
-            println!("{}{}{}\t{}", indent, branch, c, plain(&v));
-        }
-    }
-
-    if !show_ext {
-        let ext = read_prefix_ext(kv, prefix);
-        if !ext.is_empty() {
-            println!("{}└── {}{}", indent, EXT_INDEX_HEAD, ext);
-        }
-    }
 }

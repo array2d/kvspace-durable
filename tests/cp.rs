@@ -22,56 +22,88 @@ fn get_one(kv: &mut dyn KVSpace, key: &str) -> XValue {
     kv.get(&p, &[l], true).remove(0)
 }
 
-fn run(dsn: &str) {
+fn run(dsn: &str, root: &str) {
     let mut kv = conn(dsn);
     let kv: &mut dyn KVSpace = kv.as_mut();
-    kv.clear().unwrap();
+    kv.del_tree(root).unwrap();
+    kv.mkindex(&format!("{root}/"), 0).unwrap();
 
     // 原型 stringkeymap 容器：两个叶成员 + 一个嵌套容器成员。
-    set(kv, "/proto", &new_map_langtype("[]char/utf32·int64"));
-    set(kv, "/proto·x", &new_int64(&[10]));
-    set(kv, "/proto·y", &new_int64(&[20]));
-    set(kv, "/proto·sub", &new_map_langtype("[]char/utf32·int64"));
-    set(kv, "/proto·sub·z", &new_int64(&[30]));
-
-    kv.cp_tree("/proto", "/proto").unwrap();
-    assert!(kv.cp_tree("/proto", "/proto/child").is_err());
-    assert_eq!(get_one(kv, "/proto·x"), new_int64(&[10]));
-
-    // 只读扩展源 + 原型上的 extindex 成员 ov 覆盖 /ext·（extindex 节点落 `/` 目录键 /proto·ov/）。
-    set(kv, "/ext", &new_map_langtype("[]char/utf32·int64"));
     set(
         kv,
-        "/ext·",
+        &format!("{root}/proto"),
+        &new_map_langtype("[]char/utf32·int64"),
+    );
+    set(kv, &format!("{root}/proto·x"), &new_int64(&[10]));
+    set(kv, &format!("{root}/proto·y"), &new_int64(&[20]));
+    set(
+        kv,
+        &format!("{root}/proto·sub"),
+        &new_map_langtype("[]char/utf32·int64"),
+    );
+    set(kv, &format!("{root}/proto·sub·z"), &new_int64(&[30]));
+
+    kv.cp_tree(&format!("{root}/proto"), &format!("{root}/proto"))
+        .unwrap();
+    assert!(kv
+        .cp_tree(&format!("{root}/proto"), &format!("{root}/proto/child"))
+        .is_err());
+    assert_eq!(get_one(kv, &format!("{root}/proto·x")), new_int64(&[10]));
+
+    // Read-only ext source + extindex member `ov` overlaying `{root}/ext·` at `{root}/proto·ov/`.
+    set(
+        kv,
+        &format!("{root}/ext"),
+        &new_map_langtype("[]char/utf32·int64"),
+    );
+    let ext_loc = format!("{root}/ext·");
+    set(
+        kv,
+        &ext_loc,
         &XValue::Opaque(Opaque {
             kind: "lib".into(),
             body: vec![],
             array_len: 1,
         }),
     );
-    set(kv, "/ext·a", &new_int64(&[99]));
-    kv.ext_index("/proto·ov/", "/ext·").unwrap();
+    set(kv, &format!("{root}/ext·a"), &new_int64(&[99]));
+    kv.ext_index(&format!("{root}/proto·ov/"), &ext_loc)
+        .unwrap();
 
     // ── cp：单 key 拷贝，不带成员 ──
-    kv.cp("/proto·x", "/px").unwrap();
-    assert_eq!(get_one(kv, "/px"), new_int64(&[10]), "cp 单 key");
+    kv.cp(&format!("{root}/proto·x"), &format!("{root}/px"))
+        .unwrap();
+    assert_eq!(
+        get_one(kv, &format!("{root}/px")),
+        new_int64(&[10]),
+        "cp single key"
+    );
 
     // ── cp_tree：递归子树拷贝 ──
-    kv.cp_tree("/proto", "/inst").unwrap();
-    assert_eq!(get_one(kv, "/inst·x"), new_int64(&[10]), "cp_tree 叶成员 x");
-    assert_eq!(get_one(kv, "/inst·y"), new_int64(&[20]), "cp_tree 叶成员 y");
+    kv.cp_tree(&format!("{root}/proto"), &format!("{root}/inst"))
+        .unwrap();
     assert_eq!(
-        get_one(kv, "/inst·sub·z"),
+        get_one(kv, &format!("{root}/inst·x")),
+        new_int64(&[10]),
+        "cp_tree leaf member x"
+    );
+    assert_eq!(
+        get_one(kv, &format!("{root}/inst·y")),
+        new_int64(&[20]),
+        "cp_tree leaf member y"
+    );
+    assert_eq!(
+        get_one(kv, &format!("{root}/inst·sub·z")),
         new_int64(&[30]),
         "cp_tree 嵌套成员 z"
     );
-    match get_one(kv, "/inst") {
+    match get_one(kv, &format!("{root}/inst")) {
         XValue::Map(_) => {}
         other => panic!("cp_tree 根值 kind 丢失: {:?}", other),
     }
 
     // 成员表完整（含嵌套与 extindex 成员）。
-    let mut m = kv.list("/inst·", false, true);
+    let mut m = kv.list(&format!("{root}/inst·"), false, true);
     m.sort();
     assert!(
         m.contains(&"x".to_string())
@@ -83,48 +115,62 @@ fn run(dsn: &str) {
 
     // 根登记进父 index。
     assert!(
-        kv.list("/", false, true).contains(&"inst".to_string()),
+        kv.list(&format!("{root}/"), false, true)
+            .contains(&"inst".to_string()),
         "cp_tree 根登记父 index"
     );
 
     // ── 关键：extindex 成员在 target 侧成为新 extindex，overlay 读通 ──
     assert_eq!(
-        kv.get("/inst·ov/", &["a".into()], true).remove(0),
+        kv.get(&format!("{root}/inst·ov/"), &["a".into()], true)
+            .remove(0),
         new_int64(&[99]),
         "cp_tree 的 extindex 成员 overlay 读通"
     );
-    match kv.get("/inst·", &["ov/".into()], true).remove(0) {
-        XValue::Ext(e) => assert_eq!((e.langtype.as_str(), e.locator.as_str()), ("lib", "/ext·")),
+    match kv
+        .get(&format!("{root}/inst·"), &["ov/".into()], true)
+        .remove(0)
+    {
+        XValue::Ext(e) => assert_eq!(
+            (e.langtype.as_str(), e.locator.as_str()),
+            ("lib", ext_loc.as_str())
+        ),
         other => panic!("target 侧应为 extindex: {:?}", other),
     }
 
-    kv.cp_list("/proto", "/shallow").unwrap();
+    kv.cp_list(&format!("{root}/proto"), &format!("{root}/shallow"))
+        .unwrap();
     assert_eq!(
-        kv.get("/shallow·ov/", &["a".into()], true).remove(0),
+        kv.get(&format!("{root}/shallow·ov/"), &["a".into()], true)
+            .remove(0),
         new_int64(&[99])
     );
 
     // 改动源 extindex 目标，target 因共享同一只读扩展而同步可见（非深拷贝底层数据）。
-    set(kv, "/ext·a", &new_int64(&[123]));
+    set(kv, &format!("{root}/ext·a"), &new_int64(&[123]));
     assert_eq!(
-        kv.get("/inst·ov/", &["a".into()], true).remove(0),
+        kv.get(&format!("{root}/inst·ov/"), &["a".into()], true)
+            .remove(0),
         new_int64(&[123]),
         "extindex 共享同一只读扩展"
     );
+
+    kv.del_tree(root).unwrap();
 }
 
 #[test]
 fn cp_redis() {
-    let dsn = std::env::var("KVSPACE_TEST_REDIS_DSN")
-        .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
-    run(&dsn);
+    let Some(dsn) = common::redis_test_dsn("cp") else {
+        return;
+    };
+    run(&dsn, &format!("/kvspace-cp-test-{}", std::process::id()));
 }
 
 #[test]
 fn cp_fs() {
-    let dir = std::env::temp_dir().join("kvspace-cp-test");
+    let dir = std::env::temp_dir().join(format!("kvspace-cp-test-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    run(&format!("fs://{}", dir.display()));
+    run(&format!("fs://{}", dir.display()), "/r");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -134,5 +180,5 @@ fn cp_fs() {
 #[ignore = "需要真桶凭据，cargo test -- --ignored 才跑"]
 fn cp_s3() {
     let Some(dsn) = common::s3_test_dsn() else { return };
-    run(&dsn);
+    run(&dsn, &format!("/kvspace-cp-test-{}", std::process::id()));
 }
