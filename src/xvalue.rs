@@ -470,7 +470,7 @@ pub fn from_wire_head(data: &[u8]) -> XValueHead {
     let Ok(body_len) = i32::try_from(h.len) else {
         return XValueHead::default();
     };
-    let langtype = crate::headlenpow::langtype_from_wire(data, h.len as usize)
+    let langtype = crate::headlenpow::langtype_from_wire(data)
         .map(|b| String::from_utf8_lossy(b).into_owned())
         .unwrap_or_default();
     let has_dims =
@@ -580,21 +580,22 @@ mod tests {
 
     #[test]
     fn directory_and_extension_wire() {
-        // 目录值：SHORT、inline、空 body，固定 8 字节 head + attr（langtype "lib"）。
+        // 目录值：SHORT、inline、空 body，固定 16 字节 head + attr（langtype "lib"）。
+        // attr 无前缀：3 字节记录头 + "lib"。
         let dir = to_wire_head("lib", 0, &[], &[]);
-        assert_eq!(dir.len(), 8 + 2 + 3 + 3);
+        assert_eq!(dir.len(), 16 + 3 + 3);
         let head = crate::headlenpow::from_wire(&dir).unwrap();
         assert_eq!(
             (head.storetype, head.ptr, head.len, head.body.len()),
             (ST_SHORT, REF_INLINE, 0, 0)
         );
-        // @ext：ST_EXT + PTR_EXT，body = 定位串（8 + body）。
+        // @ext：ST_EXT + PTR_EXT，body = 定位串（16 + body）。
         let ext = XValue::Ext(ExtHandle {
             langtype: "rwfunc".into(),
             locator: "/lib/f/".into(),
         })
         .to_wire();
-        assert_eq!(ext.len(), 8 + "/lib/f/".len() + 11); /* + attr（rwfunc 记录） */
+        assert_eq!(ext.len(), 16 + "/lib/f/".len() + 9); /* + attr（3 + "rwfunc"，无前缀） */
         let head = crate::headlenpow::from_wire(&ext).unwrap();
         assert_eq!(
             (head.storetype, head.ptr, head.body),
@@ -612,13 +613,13 @@ mod tests {
     #[test]
     fn head_fields() {
         let bytes = new_float64(&[1.0, 2.0, 3.0]).to_wire();
-        assert_eq!(bytes.len(), 8 + 24 + 15); // 固定头 8 + 3×f64 body + attr("[3]float64")
+        assert_eq!(bytes.len(), 16 + 24 + 13); // 固定头 16 + 3×f64 body + attr(" [3]float64"，3+10 无前缀)
         let h = from_wire_head(&bytes);
         assert_eq!(h.kind(), "float64");
         assert_eq!(h.dims(), vec![3]);
         assert_eq!(h.array_len(), 3);
         assert!(!h.is_ptr());
         assert_eq!(h.r#ref(), 0);
-        assert_eq!(h.head_len() as usize + h.body_len as usize + 15, bytes.len());
+        assert_eq!(h.head_len() as usize + h.body_len as usize + 13, bytes.len());
     }
 }

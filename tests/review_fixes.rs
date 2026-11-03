@@ -219,7 +219,8 @@ unsafe fn run_backend_suite(dsn: &str, root: &str) {
     let mut part_out: *mut u8 = std::ptr::null_mut();
     let mut part_len: u32 = 0;
     assert_eq!(
-        kvspaceGetPart(h, k_wip_p2_c.as_ptr(), 8, 8, &mut part_out, &mut part_len),
+        /* body 偏移 16（head 16 字节）。 */
+        kvspaceGetPart(h, k_wip_p2_c.as_ptr(), 16, 8, &mut part_out, &mut part_len),
         0
     );
     assert_eq!(part_len, 8);
@@ -233,7 +234,7 @@ unsafe fn run_backend_suite(dsn: &str, root: &str) {
         kvspaceSetPart(
             h,
             k_wip_p2_c.as_ptr(),
-            8,
+            16,
             new_body.as_ptr(),
             8,
             err.as_mut_ptr(),
@@ -316,28 +317,44 @@ unsafe fn run_backend_suite(dsn: &str, root: &str) {
         "kvspaceWatch on untyped ST_SLACK must preserve body and ST_SLACK header"
     );
 
-    // 7. SetValue attr trailer validation (matches kvspace-c).
+    // 7. SetValue head/attr validation（16 字节 head，attrslen 在 head 里、无前缀）。
     let k_bad = CString::new(format!("{root}/bad_attr")).unwrap();
-    let noattr: [u8; 16] = [8, 0, 0, 0, 0, 0, 0, 0, 42, 0, 0, 0, 0, 0, 0, 0];
-    assert_ne!(
+    /* bodylen=8 @0-7，attrslen=0 @8-11，storetype/ptr/pad 全零，后接 8 字节 body。
+       空 attr 在新布局里**合法**（旧布局要求 [2,0] 前缀）。 */
+    let noattr: [u8; 24] = [8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                            42, 0, 0, 0, 0, 0, 0, 0];
+    assert_eq!(
         kvspaceSetValue(h, k_bad.as_ptr(), noattr.as_ptr(), noattr.len() as u32, std::ptr::null_mut(), 0),
         0,
-        "wire value without attr trailer must be rejected"
+        "空 attr（attrslen=0）在新布局里合法"
     );
-    let shortattr: [u8; 18] = [8, 0, 0, 0, 0, 0, 0, 0, 42, 0, 0, 0, 0, 0, 0, 0, 1, 0];
+
+    /* 声明 attrslen=4 但只给 2 字节 attr → 总长不足 → 拒绝。 */
+    let mut shortattr = noattr;
+    shortattr[8..12].copy_from_slice(&4u32.to_le_bytes());
     assert_ne!(
-        kvspaceSetValue(h, k_bad.as_ptr(), shortattr.as_ptr(), shortattr.len() as u32, std::ptr::null_mut(), 0),
+        kvspaceSetValue(h, k_bad.as_ptr(), shortattr.as_ptr(), (16 + 8 + 2) as u32, std::ptr::null_mut(), 0),
         0,
-        "attr_len < 2 must be rejected"
+        "与 head 声明的 attrslen 不符的 wire 必须被拒绝"
     );
-    let padded: [u8; 20] = [
-        8, 0, 0, 0, 0, 0, 0, 0, 42, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0xEE, 0xEE,
-    ];
+
+    /* padding 非零 → 拒绝（它是 ABI 的一部分）。 */
+    let mut badpad = noattr;
+    badpad[14] = 1;
+    assert_ne!(
+        kvspaceSetValue(h, k_bad.as_ptr(), badpad.as_ptr(), badpad.len() as u32, std::ptr::null_mut(), 0),
+        0,
+        "非零 padding 必须被拒绝"
+    );
+
+    /* 尾部多余字节按 16 + bodylen + attrslen 截断。 */
+    let mut padded = noattr.to_vec();
+    padded.extend_from_slice(&[0xEE, 0xEE]);
     let k_pad = format!("{root}/padded");
     set_raw_checked(h, &k_pad, &padded);
     let (_, p_pad, l_pad) = get_raw_c(h, &k_pad, 0);
-    assert_eq!(l_pad, 18, "trailing padding bytes must be trimmed to 8 + len + attr");
-    assert_eq!(std::slice::from_raw_parts(p_pad, l_pad as usize), &padded[..18]);
+    assert_eq!(l_pad, 24, "尾部多余字节须截断到 16 + bodylen + attrslen");
+    assert_eq!(std::slice::from_raw_parts(p_pad, l_pad as usize), &noattr[..]);
 
     // 8. Map langtype normalization in validate_ptr (preserve `[1]·int64` key type).
     {

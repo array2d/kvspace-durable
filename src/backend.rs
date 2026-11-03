@@ -347,11 +347,9 @@ impl<S: KVStore> KVSpace for Backend<S> {
             let raw = pair.raw.clone().unwrap_or_else(|| pair.val.to_wire());
             let head = crate::headlenpow::from_wire(&raw)
                 .ok_or_else(|| format!("invalid XValue at {key}"))?;
-            let attr = crate::headlenpow::attr_len(&raw, head.len as usize)
+            /* attr 区长度从 head 读（无前缀）；空 attr 是合法的（=0）。 */
+            let attr = crate::headlenpow::attr_len(&raw)
                 .ok_or_else(|| format!("invalid XValue at {key}"))?;
-            if attr < 2 {
-                return Err(format!("invalid XValue at {key}"));
-            }
             let total = (head.len as usize)
                 .checked_add(crate::headlenpow::PREFIX)
                 .and_then(|x| x.checked_add(attr as usize))

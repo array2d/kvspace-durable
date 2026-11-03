@@ -45,10 +45,11 @@ pub trait KVSpace {
     /// 读 key 值的 attr 区明文类型串（#571 单 key 整体）；无/空/解析失败 → 空串。
     fn langtype_of(&mut self, key: &str) -> String {
         let raw = self.get_raw(key);
-        let Some(h) = crate::headlenpow::from_wire(&raw) else {
+        /* from_wire 兼作合法性闸门（padding/storetype/ptr/边界全在这里拒掉）。 */
+        if crate::headlenpow::from_wire(&raw).is_none() {
             return String::new();
-        };
-        crate::headlenpow::langtype_from_wire(&raw, h.len as usize)
+        }
+        crate::headlenpow::langtype_from_wire(&raw)
             .map(|b| String::from_utf8_lossy(b).into_owned())
             .unwrap_or_default()
     }

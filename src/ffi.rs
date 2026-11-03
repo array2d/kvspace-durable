@@ -553,7 +553,8 @@ pub extern "C" fn kvspaceSetValue(
         write_err(err, err_cap, "invalid XValue");
         return 1;
     };
-    let Some(attr) = crate::headlenpow::attr_len(raw, whead.len as usize) else {
+    /* attr 区长度从 head 读（无前缀）；空 attr 合法（=0）。 */
+    let Some(attr) = crate::headlenpow::attr_len(raw) else {
         write_err(err, err_cap, "invalid XValue");
         return 1;
     };
@@ -564,7 +565,7 @@ pub extern "C" fn kvspaceSetValue(
         write_err(err, err_cap, "invalid XValue");
         return 1;
     };
-    if attr < 2 || total > raw.len() {
+    if total > raw.len() {
         write_err(err, err_cap, "invalid XValue");
         return 1;
     }
@@ -793,11 +794,10 @@ pub extern "C" fn kvspaceWriteInPlace(
     let head = from_wire_head(&existing);
     let head_len = head.head_len() as usize;
     let blen = head.body_len.max(0) as usize;
-    let attr = crate::headlenpow::attr_len(&existing, blen).unwrap_or(0) as usize;
+    let attr = crate::headlenpow::attr_len(&existing).unwrap_or(0) as usize;
     if head.headlen == 0
         || head.body_len < 0
         || head.body_len as u32 != body_len
-        || attr < 2
         || head_len.checked_add(blen).and_then(|x| x.checked_add(attr)) != Some(existing.len())
     {
         write_err(err, err_cap, "kvspace: write-in-place body_len mismatch");
