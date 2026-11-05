@@ -8,11 +8,13 @@ pub const REF_INLINE: u8 = 0;
 pub const REF_PTR: u8 = 1;
 pub const REF_EXT: u8 = 2;
 
-// 固定 8 字节 head 的 storetype（存储形态，对齐 kvspace 三正交轴 ST_*）。
+// 固定 16 字节 head 的 storetype（存储形态，对齐 kvspace 三正交轴 ST_*）。
 pub const ST_SHORT: u8 = 0; // 短定长：None/标量/目录/map 头/空 rwfunc 目录值
 pub const ST_SLACK: u8 = 1; // 变长：字符/字节数组/代码槽/指针路径
 pub const ST_LARGE: u8 = 2; // 大定长：张量
 pub const ST_EXT: u8 = 3; // 扩展定位 @ext
+/// 定容量变长：`bodylen` 是**容量**，有效长度在 attr tag 2（`[0x02][0x08 0x00][u64]`）。
+pub use crate::headlenpow::ST_VARLEN; // = 4；定义点在格式层，这里只做再导出
 
 pub fn is_map_langtype(kind: &str) -> bool {
     kind.contains(OBJ_SEP)
@@ -424,7 +426,7 @@ fn array_to_header(kind: &str, array_len: i32) -> Vec<i32> {
     }
 }
 
-/// 固定 8 字节 head 落盘：storetype 按 kind/dims 判定，ptr 按 ref 判定，body = raw 原样。
+/// 固定 16 字节 head 落盘：storetype 按 kind/dims 判定，ptr 按 ref 判定，body = raw 原样。
 /// langtype 拼入 attr 区（单 key 整体；None 无类型 = 空 attr）。
 ///
 /// storetype 判定（对齐 kvspace 三正交轴与 C codec）：
