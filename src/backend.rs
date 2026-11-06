@@ -11,8 +11,7 @@ use crate::kvspace_common::{
 use crate::r#const::*;
 use crate::store::KVStore;
 use crate::xvalue::{
-    from_wire, from_wire_head, is_ptr, ptr_target, XValue, REF_EXT, REF_INLINE, REF_PTR, ST_EXT,
-    ST_SHORT,
+    from_wire, from_wire_head, is_ptr, ptr_target, XValue, REF_EXT, REF_INLINE, REF_PTR,
 };
 
 pub struct Backend<S: KVStore> {
@@ -321,15 +320,22 @@ impl<S: KVStore> KVSpace for Backend<S> {
             return Err(format!("reserved metadata key: {full}"));
         }
         if self.store.exists(&full) {
-            self.store.set_part(&full, off, buf);
-            return Ok(());
+            /* 内层也要判界：入口层判过一次，但这里可能被别的调用方绕过。 */
+            return if self.store.set_part(&full, off, buf) {
+                Ok(())
+            } else {
+                Err(format!("set_part: out of range at {full}"))
+            };
         }
         let ext_t = self.prefix_ext(&p);
         if !ext_t.is_empty() {
             let ext_full = join_path(&ext_t, &l);
             if self.store.exists(&ext_full) {
-                self.store.set_part(&ext_full, off, buf);
-                return Ok(());
+                return if self.store.set_part(&ext_full, off, buf) {
+                    Ok(())
+                } else {
+                    Err(format!("set_part: out of range at {ext_full}"))
+                };
             }
         }
         Err(format!("set_part: missing key {}", key))
@@ -347,6 +353,10 @@ impl<S: KVStore> KVSpace for Backend<S> {
             let raw = pair.raw.clone().unwrap_or_else(|| pair.val.to_wire());
             let head = crate::headlenpow::from_wire(&raw)
                 .ok_or_else(|| format!("invalid XValue at {key}"))?;
+            /* `‥status` 的 wire 级契约（规范 `02-kvspace模型/04-CABI.kv:33-36`）：
+             * langtype base kind 是 char + 有效长度 ≤16，所有后端都必须校验。
+             * 判据集中在 kvspace_common，shm 与 fs 两侧共用一份。 */
+            crate::kvspace_common::validate_status_wire(&key, &raw)?;
             /* attr 区长度从 head 读（无前缀）；空 attr 是合法的（=0）。 */
             let attr = crate::headlenpow::attr_len(&raw)
                 .ok_or_else(|| format!("invalid XValue at {key}"))?;
@@ -372,7 +382,8 @@ impl<S: KVStore> KVSpace for Backend<S> {
             if !ext_target.is_empty() && self.store.get(&key).is_none() {
                 let suffix = key.strip_prefix(&parent).unwrap_or("");
                 if self.store.get(&format!("{ext_target}{suffix}")).is_some()
-                    && !(head.ptr == REF_PTR && is_frame_operand_key(&key))
+                    && !(head.reference == crate::headlenpow::Reference::Pointer
+                        && is_frame_operand_key(&key))
                 {
                     return Err(format!("{}: {}", ERR_EXT_WRITE, key));
                 }
@@ -612,8 +623,8 @@ impl<S: KVStore> KVSpace for Backend<S> {
         }
         let _ = capacity;
         let resolved = self.resolve_path(path);
-        // Directory marker: ST_SHORT, inline, empty body, langtype "lib" in attr.
-        let value = crate::headlenpow::to_wire(ST_SHORT, REF_INLINE, &[], "lib")
+        // Directory marker: inline, empty body, langtype "lib" in attr.
+        let value = crate::headlenpow::to_wire(&[], "lib")
             .ok_or_else(|| format!("Mkindex: invalid directory {resolved}"))?;
         if self.store.get(&resolved).is_none() {
             self.store.set(&resolved, &value);
@@ -637,8 +648,13 @@ impl<S: KVStore> KVSpace for Backend<S> {
             return Err(format!("ExtIndex target missing: {ext_path}"));
         }
         let langtype = self.langtype_of(ext_path);
-        // External locator: ST_EXT + REF_EXT + locator body + target langtype in attr.
-        let value = crate::headlenpow::to_wire(ST_EXT, REF_EXT, ext_path.as_bytes(), &langtype)
+        // External locator: langtype 带 `@` 前缀（扩展由类型表达，head 无 ptr）。
+        let prefixed = if langtype.starts_with('@') {
+            langtype.clone()
+        } else {
+            format!("@{langtype}")
+        };
+        let value = crate::headlenpow::to_wire(ext_path.as_bytes(), &prefixed)
             .ok_or_else(|| format!("ExtIndex locator invalid: {ext_path}"))?;
         self.store.set(&resolved, &value);
         Ok(())

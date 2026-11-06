@@ -24,13 +24,14 @@ fn attr_of(lt: &str) -> Vec<u8> {
 }
 
 /// 拼 16 字节 head + body + attr；head 的 bodylen/attrslen 由调用方给的实际长度决定。
-fn wire(storetype: u8, ptr: u8, body: &[u8], lt: &str) -> Vec<u8> {
+/// 新 16 字节 head：`[bodylen:u64][attrslen:u32][layout:u8][padding:3]`。
+/// `storetype`/`ptr` 已从 wire 删除——形态由 langtype 表达，故前两个参数不再使用。
+fn wire(_storetype: u8, _ptr: u8, body: &[u8], lt: &str) -> Vec<u8> {
     let attr = attr_of(lt);
     let mut v = vec![0u8; 16];
     v[0..8].copy_from_slice(&(body.len() as u64).to_le_bytes());
     v[8..12].copy_from_slice(&(attr.len() as u32).to_le_bytes());
-    v[12] = storetype;
-    v[13] = ptr;
+    v[12] = 0; /* layout = LENGTH */
     v.extend_from_slice(body);
     v.extend_from_slice(&attr);
     v

@@ -1,38 +1,55 @@
 //! XValue wire 的 head 层：16 字节固定头 + body + attr 区。
 //!
 //! ```text
-//! wire: [bodylen:u64][attrslen:u32][storetype:u8][ptr:u8][pad:2][body][attr records]
+//! wire: [bodylen:u64][attrslen:u32][layout:u8][padding:3][body][attr records]
 //! 总长度 = 16 + bodylen + attrslen
 //! ```
 //!
 //! 长度只从 head 读；attr 区**不带**自带长度前缀（attrslen 已在 head 里，再来一个
 //! 前缀就是第二个事实源）。wire 是小端，读写一律走 `from_le_bytes` /
 //! `to_le_bytes`，不依赖主机字节序。旧 8 字节 head 不做兼容：遇到即失败。
+//!
+//! **没有 `storetype`/`ptr` 字段**：存储形态与引用性都从 langtype 推出
+//! （`*T` = 指针、`@T` = 扩展、形状段 = 张量、其余按种类）。唯一推不出的是
+//! 「bodylen 是容量还是有效长度」，故只保留 `layout` 一个布局标志。
 
 pub const PREFIX: usize = 16;
 
 /// head 字段偏移（唯一定义点；外部一律经 `Head` 访问，不手写偏移）。
 const OFF_BODYLEN: usize = 0;
 const OFF_ATTRSLEN: usize = 8;
-const OFF_STORETYPE: usize = 12;
-const OFF_PTR: usize = 13;
-const OFF_PADDING: usize = 14;
+const OFF_LAYOUT: usize = 12;
+const OFF_PADDING: usize = 13;
 
 const _: () = assert!(
     PREFIX == 16
         && OFF_BODYLEN + 8 == OFF_ATTRSLEN
-        && OFF_ATTRSLEN + 4 == OFF_STORETYPE
-        && OFF_STORETYPE + 1 == OFF_PTR
-        && OFF_PTR + 1 == OFF_PADDING
-        && OFF_PADDING + 2 == PREFIX,
+        && OFF_ATTRSLEN + 4 == OFF_LAYOUT
+        && OFF_LAYOUT + 1 == OFF_PADDING
+        && OFF_PADDING + 3 == PREFIX,
     "head field offsets must tile exactly 16 bytes"
 );
 
-/// 解析出的 head。`body` 借自输入；`attrs` 是 attr 区原始字节（记录序列，无前缀）。
+/// `layout`：bodylen 的语义。这是 head 里唯一的形态标志，其余都从 langtype 推。
+pub const LAYOUT_LENGTH: u8 = 0;
+pub const LAYOUT_CAPACITY: u8 = 1;
+
+/// 引用性：**从 langtype 前缀解出**，不是 head 字段。
+/// `from_wire` 唯一负责产出它；任何构造器或写入路径都不得单独设置——
+/// 写回时 langtype 文本本身仍是唯一来源。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reference {
+    None,
+    Pointer,
+    Extension,
+}
+
+/// 解析出的 head。`body`/`attrs`/`langtype` 借自输入。
 #[derive(Debug, PartialEq)]
 pub struct Head<'a> {
-    pub storetype: u8,
-    pub ptr: u8,
+    pub layout: u8,
+    pub reference: Reference,
+    pub langtype: &'a [u8],
     pub len: u64,
     pub attrs: &'a [u8],
     pub body: &'a [u8],
@@ -41,7 +58,9 @@ pub struct Head<'a> {
 /// padding 必须为零：它是 ABI 的一部分，不是「随便填」。
 #[inline]
 fn padding_is_zero(data: &[u8]) -> bool {
-    data.get(OFF_PADDING) == Some(&0) && data.get(OFF_PADDING + 1) == Some(&0)
+    data.get(OFF_PADDING) == Some(&0)
+        && data.get(OFF_PADDING + 1) == Some(&0)
+        && data.get(OFF_PADDING + 2) == Some(&0)
 }
 
 fn read_u32(data: &[u8], at: usize) -> Option<u32> {
@@ -57,7 +76,7 @@ fn read_u64(data: &[u8], at: usize) -> Option<u64> {
 }
 
 /// 解析 wire。任何一项不成立都返回 `None`：head 不足 16 字节、padding 非零、
-/// storetype/ptr 越界、`16 + bodylen + attrslen` 溢出或超出输入长度。
+/// `layout` 越界、`16 + bodylen + attrslen` 溢出或超出输入长度。
 pub fn from_wire(data: &[u8]) -> Option<Head<'_>> {
     if data.len() < PREFIX {
         return None;
@@ -65,9 +84,8 @@ pub fn from_wire(data: &[u8]) -> Option<Head<'_>> {
     if !padding_is_zero(data) {
         return None;
     }
-    let storetype = *data.get(OFF_STORETYPE)?;
-    let ptr = *data.get(OFF_PTR)?;
-    if storetype > ST_VARLEN || ptr > 2 {
+    let layout = *data.get(OFF_LAYOUT)?;
+    if layout > LAYOUT_CAPACITY {
         return None;
     }
     let len = read_u64(data, OFF_BODYLEN)?;
@@ -83,29 +101,31 @@ pub fn from_wire(data: &[u8]) -> Option<Head<'_>> {
      * tag 2 的归属校验。
      *
      * 未知 tag 一般**忽略**以保持前向兼容；**tag 2 是例外**：它已经分配给
-     * `reallen`，而 `reallen` 只在 storetype 4 下有定义。
-     *   - storetype 4：必须**有** tag 2，且 `reallen <= bodylen`（bodylen = 容量）；
-     *   - 其它 storetype：**不许**出现 tag 2。
+     * `reallen`，而 `reallen` 只在 `layout = CAPACITY` 时有定义。
+     *   - layout = CAPACITY：必须**有** tag 2，且 `reallen <= bodylen`（bodylen = 容量）；
+     *   - 其它 layout：**不许**出现 tag 2。
      *
-     * 「这个 tag 有定义、但在当前 storetype 下无意义」与「这个 tag 我不认识」是两件事：
+     * 「这个 tag 有定义、但在当前 layout 下无意义」与「这个 tag 我不认识」是两件事：
      * 前者说明写方与读方对格式的理解不一致，必须拒绝；后者才该忽略。
      */
     let (has_reallen, reallen) = scan_reallen(attrs)?;
-    match storetype {
-        ST_VARLEN => {
-            if !has_reallen || reallen > len {
-                return None;
-            }
+    if layout == LAYOUT_CAPACITY {
+        if !has_reallen || reallen > len {
+            return None;
         }
-        _ => {
-            if has_reallen {
-                return None;
-            }
-        }
+    } else if has_reallen {
+        return None;
     }
+    let langtype = find_attr(attrs, ATTR_TAG_LANGTYPE).unwrap_or(&[]);
+    let reference = match langtype.first() {
+        Some(b'*') => Reference::Pointer,
+        Some(b'@') => Reference::Extension,
+        _ => Reference::None,
+    };
     Some(Head {
-        storetype,
-        ptr,
+        layout,
+        reference,
+        langtype,
         len,
         body: &data[body_start..body_end],
         attrs,
@@ -115,14 +135,11 @@ pub fn from_wire(data: &[u8]) -> Option<Head<'_>> {
 /// attr 区（无前缀）：`record = [tag:u8][len:u16][data]`，tag 1 = langtype，tag 2 = reallen。
 pub const ATTR_TAG_LANGTYPE: u8 = 1;
 
-/// tag 2：**定容量变长**（storetype 4）的有效长度 `reallen`，data 恒 8 字节 u64 LE。
+/// tag 2：**定容量变长**（`layout = CAPACITY`）的有效长度 `reallen`，data 恒 8 字节 u64 LE。
 ///
-/// 归属是**排他的**：storetype 4 必须带它，其它 storetype 必须不带它——同一份
-/// 「有效长度」不许有两处表示（`head.bodylen` 在 storetype 4 下是**容量**）。
+/// 归属是**排他的**：`layout = CAPACITY` 必须带它，其它 layout 必须不带它——同一份
+/// 「有效长度」不许有两处表示（`head.bodylen` 在 CAPACITY 下是**容量**）。
 pub const ATTR_TAG_REALLEN: u8 = 2;
-
-/// storetype 4：定容量变长。`head.bodylen` 是**容量**，有效长度在 attr tag 2。
-pub const ST_VARLEN: u8 = 4;
 
 /// 构造 attr 区字节（**不含**任何长度前缀）；langtype 空 → 空 attr（零字节）。
 pub fn attr_bytes(langtype: &str) -> Option<Vec<u8>> {
@@ -176,19 +193,19 @@ fn scan_reallen(attrs: &[u8]) -> Option<(bool, u64)> {
     Some((found.is_some(), found.unwrap_or(0)))
 }
 
-/// 取 storetype 4 的 `reallen`；非 4 / 缺 tag 2 / 畸形 → None。
+/// 取 `layout = CAPACITY` 的 `reallen`；其它 layout / 缺 tag 2 / 畸形 → None。
 pub fn reallen_from_wire(data: &[u8]) -> Option<u64> {
     let head = from_wire(data)?;
-    if head.storetype != ST_VARLEN {
+    if head.layout != LAYOUT_CAPACITY {
         return None;
     }
     scan_reallen(head.attrs).and_then(|(has, reallen)| if has { Some(reallen) } else { None })
 }
 
-/// 有效长度：storetype 4 → `reallen`；其它 → `bodylen`（两者的**唯一读取入口**）。
+/// 有效长度：`layout = CAPACITY` → `reallen`；其它 → `bodylen`（两者的**唯一读取入口**）。
 pub fn effective_len(data: &[u8]) -> Option<u64> {
     let head = from_wire(data)?;
-    if head.storetype == ST_VARLEN {
+    if head.layout == LAYOUT_CAPACITY {
         reallen_from_wire(data)
     } else {
         Some(head.len)
@@ -209,11 +226,20 @@ pub fn attr_len(data: &[u8]) -> Option<u32> {
 /// 对齐），截断或畸形记录返回 `None` 而不 panic。
 pub fn langtype_from_wire(data: &[u8]) -> Option<&[u8]> {
     let head = from_wire(data)?;
-    let mut rest = head.attrs;
+    if head.langtype.is_empty() {
+        return None;
+    }
+    Some(head.langtype)
+}
+
+/// 在 attr 区找指定 tag 的 data。缺该 tag → `None`；记录畸形 → `None`（不 panic）。
+/// `from_wire` 用它取 langtype 的前缀，`langtype_from_wire` 也经它绕一圈回到同一判据。
+fn find_attr(attrs: &[u8], wanted: u8) -> Option<&[u8]> {
+    let mut rest = attrs;
     while let [tag, l0, l1, tail @ ..] = rest {
         let rlen = usize::from(u16::from_le_bytes([*l0, *l1]));
         let rec = tail.get(..rlen)?;
-        if *tag == ATTR_TAG_LANGTYPE {
+        if *tag == wanted {
             return Some(rec);
         }
         rest = &tail[rlen..];
@@ -221,22 +247,17 @@ pub fn langtype_from_wire(data: &[u8]) -> Option<&[u8]> {
     None
 }
 
-pub fn to_wire(storetype: u8, ptr: u8, body: &[u8], langtype: &str) -> Option<Vec<u8>> {
-    if storetype == ST_VARLEN {
-        /* storetype 4 的写侧是 `to_wire_varlen`：它必须同时给出容量与 reallen。
-         * 在这里接受 4 等于默认 reallen = bodylen——那是替调用方猜语义。 */
-        return None;
-    }
-    let mut data = reserve(storetype, ptr, body.len(), langtype)?;
+pub fn to_wire(body: &[u8], langtype: &str) -> Option<Vec<u8>> {
+    let mut data = reserve(body.len(), langtype)?;
     data[PREFIX..PREFIX + body.len()].copy_from_slice(body);
     Some(data)
 }
 
-/// 写一个 **storetype 4（定容量变长）** 值：`capacity` 是 head.bodylen，`reallen` 是
-/// 有效长度（`<= capacity`，越界即错，不截断不扩容）。body 前 `reallen` 字节有效，
-/// 其余为容量余量（零填）。
-pub fn to_wire_varlen(ptr: u8, capacity: usize, reallen: u64, langtype: &str) -> Option<Vec<u8>> {
-    if ptr > 2 || reallen > capacity as u64 {
+/// 写一个 **`layout = CAPACITY`（定容量变长）** 值：`capacity` 是 head.bodylen，
+/// `reallen` 是有效长度（`<= capacity`，越界即错，不截断不扩容）。
+/// body 前 `reallen` 字节有效，其余为容量余量（零填）。
+pub fn to_wire_varlen(capacity: usize, reallen: u64, langtype: &str) -> Option<Vec<u8>> {
+    if reallen > capacity as u64 {
         return None;
     }
     let mut attr = attr_bytes(langtype)?;
@@ -248,8 +269,7 @@ pub fn to_wire_varlen(ptr: u8, capacity: usize, reallen: u64, langtype: &str) ->
     data.resize(total, 0);
     data[OFF_BODYLEN..OFF_BODYLEN + 8].copy_from_slice(&(capacity as u64).to_le_bytes());
     data[OFF_ATTRSLEN..OFF_ATTRSLEN + 4].copy_from_slice(&attrslen.to_le_bytes());
-    data[OFF_STORETYPE] = ST_VARLEN;
-    data[OFF_PTR] = ptr;
+    data[OFF_LAYOUT] = LAYOUT_CAPACITY;
     data[PREFIX + capacity..].copy_from_slice(&attr);
     Some(data)
 }
@@ -257,11 +277,7 @@ pub fn to_wire_varlen(ptr: u8, capacity: usize, reallen: u64, langtype: &str) ->
 /// 预留：产 bodylen 字节零 body 的固定头 + attr 区（后由调用方填充 body）。
 /// padding 显式写成 0——`resize` 已零填，这里再写一次是为了让「必须为零」这件事
 /// 在代码里可见，而不是依赖初始化副作用。
-pub fn reserve(storetype: u8, ptr: u8, content: usize, langtype: &str) -> Option<Vec<u8>> {
-    if storetype > 3 || ptr > 2 {
-        /* storetype 4 需要同时给容量与 reallen，走 `to_wire_varlen`。 */
-        return None;
-    }
+pub fn reserve(content: usize, langtype: &str) -> Option<Vec<u8>> {
     let attr = attr_bytes(langtype)?;
     let attrslen = u32::try_from(attr.len()).ok()?;
     let total = PREFIX.checked_add(content)?.checked_add(attr.len())?;
@@ -270,10 +286,10 @@ pub fn reserve(storetype: u8, ptr: u8, content: usize, langtype: &str) -> Option
     data.resize(total, 0);
     data[OFF_BODYLEN..OFF_BODYLEN + 8].copy_from_slice(&(content as u64).to_le_bytes());
     data[OFF_ATTRSLEN..OFF_ATTRSLEN + 4].copy_from_slice(&attrslen.to_le_bytes());
-    data[OFF_STORETYPE] = storetype;
-    data[OFF_PTR] = ptr;
+    data[OFF_LAYOUT] = LAYOUT_LENGTH;
     data[OFF_PADDING] = 0;
     data[OFF_PADDING + 1] = 0;
+    data[OFF_PADDING + 2] = 0;
     data[PREFIX + content..].copy_from_slice(&attr);
     Some(data)
 }
@@ -284,75 +300,57 @@ mod tests {
 
     #[test]
     fn fixtures() {
-        let scalar = to_wire(0, 0, &42i64.to_le_bytes(), "int64").unwrap();
-        /* 16 head + 8 body + 8 attr（3 头 + "int64"） */
-        assert_eq!(scalar.len(), 32);
+        /* 新布局：bodylen@0-7, attrslen@8-11, layout@12, padding@13-15 */
+        let scalar = to_wire(&42i64.to_le_bytes(), "int64").unwrap();
+        assert_eq!(scalar.len(), 32); /* 16 head + 8 body + 8 attr（3 头 + "int64"） */
         assert_eq!(&scalar[0..8], &8u64.to_le_bytes()); /* bodylen @0-7 */
         assert_eq!(&scalar[8..12], &8u32.to_le_bytes()); /* attrslen @8-11 */
-        assert_eq!(scalar[12], 0); /* storetype @12 */
-        assert_eq!(scalar[13], 0); /* ptr @13 */
-        assert_eq!(&scalar[14..16], &[0, 0]); /* padding @14-15 */
+        assert_eq!(scalar[12], LAYOUT_LENGTH); /* layout @12 */
+        assert_eq!(&scalar[13..16], &[0, 0, 0]); /* padding @13-15 */
         let h = from_wire(&scalar).unwrap();
         assert_eq!(h.len, 8);
+        assert_eq!(h.layout, LAYOUT_LENGTH);
+        assert_eq!(h.reference, Reference::None);
         assert_eq!(h.body, &42i64.to_le_bytes());
         assert_eq!(langtype_from_wire(&scalar).unwrap(), b"int64");
 
-        let ptr = to_wire(1, 1, b"/varx", "int64").unwrap();
-        assert_eq!(from_wire(&ptr).unwrap().ptr, 1);
+        /* 指针：head 没有 ptr 字段，指针性来自 langtype 的 `*` 前缀。 */
+        let ptr = to_wire(b"/varx", "*int64").unwrap();
+        assert_eq!(from_wire(&ptr).unwrap().reference, Reference::Pointer);
         assert_eq!(from_wire(&ptr).unwrap().body, b"/varx");
-        assert_eq!(langtype_from_wire(&ptr).unwrap(), b"int64");
+        assert_eq!(langtype_from_wire(&ptr).unwrap(), b"*int64");
 
-        let ext = to_wire(3, 2, b"s3://", "").unwrap();
-        assert_eq!(from_wire(&ext).unwrap().ptr, 2);
+        /* 扩展：`@` 前缀。 */
+        let ext = to_wire(b"s3://", "@").unwrap();
+        assert_eq!(from_wire(&ext).unwrap().reference, Reference::Extension);
         assert_eq!(from_wire(&ext).unwrap().len, 5);
-        assert_eq!(attr_len(&ext).unwrap(), 0); /* 空 attr = 0 字节，不是一个前缀 */
-        assert_eq!(ext.len(), 16 + 5); /* 没有 attr 区 */
+        assert_eq!(attr_len(&ext).unwrap(), 4); /* record 头 3 字节 + "@" */
 
-        let text = to_wire(1, 0, "你😀".as_bytes(), "char/utf8").unwrap();
+        let text = to_wire("你😀".as_bytes(), "char/utf8").unwrap();
         assert_eq!(from_wire(&text).unwrap().len, 7); /* 你(3B)+😀(4B) */
         assert_eq!(langtype_from_wire(&text).unwrap(), b"char/utf8");
     }
 
     #[test]
     fn malformed() {
-        /* **反转记录**：storetype 4 现在是合法形态，但 `to_wire` 不带 reallen，
-         * 所以它仍必须拒绝——写侧的正确入口是 `to_wire_varlen`。 */
-        assert!(to_wire(4, 0, b"", "").is_none());
-        assert!(to_wire(5, 0, b"", "").is_none()); /* 5 仍未定义 */
-        assert!(to_wire(0, 3, b"", "").is_none()); /* ptr > 2 */
-
-        let mut v = to_wire(1, 0, b"x", "").unwrap();
-        v[12] = 4; /* storetype @12 越界 */
+        let mut v = to_wire(b"x", "").unwrap();
+        v[12] = 2; /* layout @12 越界（只允许 0/1） */
         assert!(from_wire(&v).is_none());
-        let mut v2 = to_wire(1, 0, b"x", "").unwrap();
-        v2[13] = 3; /* ptr @13 越界 */
-        assert!(from_wire(&v2).is_none());
-        let mut v3 = to_wire(1, 0, b"xyz", "").unwrap();
+        let mut v3 = to_wire(b"xyz", "").unwrap();
         v3[0] = 0xff; /* bodylen 越界 */
         assert!(from_wire(&v3).is_none());
-        let mut v4 = to_wire(1, 0, b"xyz", "").unwrap();
+        let mut v4 = to_wire(b"xyz", "").unwrap();
         v4[8] = 0xff; /* attrslen 越界 */
         assert!(from_wire(&v4).is_none());
 
-        /* padding 非零即非法（两个字节都测） */
-        for at in [14usize, 15] {
-            let mut p = to_wire(1, 0, b"x", "").unwrap();
+        /* padding 三个字节都必须为零 */
+        for at in [13usize, 14, 15] {
+            let mut p = to_wire(b"x", "").unwrap();
             p[at] = 1;
             assert!(from_wire(&p).is_none(), "padding byte {at} must be zero");
         }
     }
 
-    /// 旧 8 字节 head 不做兼容：**旧 wire 不得被当作合法新 wire 接受**
-    /// ——但必须如实记录这条保证的边界。
-    ///
-    /// 无版本号的定长布局无法从字节本身分辨「旧 head」与「新 head」：旧 wire 的
-    /// body、attr 前缀会被读成新 head 的 bodylen/attrslen/padding。只有当这些
-    /// 字节恰好凑出「padding 为零 + storetype/ptr 合法 + 总长不越界」时，解析器
-    /// **无法拒绝**——因为那个字节串在语法上确实是一个合法的新 wire。
-    ///
-    /// 所以裁决 §4.4 的「不兼容」实际含义是：**不写迁移代码、不双读旧值**，
-    /// 而不是「旧 wire 必然被识别并拒绝」。本测试把两种情形都钉住，避免将来有人
-    /// 以为有强保证。
     #[test]
     fn old_eight_byte_head_is_not_accepted_as_a_legal_wire() {
         /* 情形 A：旧 wire 的 body 使新视角下 attrslen 巨大 → 总长越界 → 拒绝。 */
@@ -386,21 +384,21 @@ mod tests {
 
     #[test]
     fn reserved_body() {
-        let mut v = reserve(1, 0, 3, "char/utf8").unwrap();
+        let mut v = reserve(3, "char/utf8").unwrap();
         v[PREFIX..PREFIX + 3].copy_from_slice(b"\xc3\xa9a");
         assert_eq!(from_wire(&v).unwrap().len, 3);
         assert_eq!(from_wire(&v).unwrap().body, b"\xc3\xa9a");
         assert_eq!(langtype_from_wire(&v).unwrap(), b"char/utf8");
     }
 
-    /// storetype 4 的最小闭环：写 → 解析 → reallen 正确；三种拒绝路径各一条。
+    /// layout=CAPACITY 的最小闭环：写 → 解析 → reallen 正确；三种拒绝路径各一条。
     #[test]
     fn varlen_capacity_roundtrip_and_fail_closed_paths() {
         /* ① 闭环：容量 32、有效 5。body 前 5 字节是数据，其余是容量余量。 */
-        let mut wire = to_wire_varlen(0, 32, 5, "char/utf8").unwrap();
+        let mut wire = to_wire_varlen(32, 5, "char/utf8").unwrap();
         wire[PREFIX..PREFIX + 5].copy_from_slice(b"hello");
         let head = from_wire(&wire).unwrap();
-        assert_eq!(head.storetype, ST_VARLEN);
+        assert_eq!(head.layout, LAYOUT_CAPACITY);
         assert_eq!(head.len, 32, "head.bodylen 是**容量**");
         assert_eq!(head.body.len(), 32);
         assert_eq!(reallen_from_wire(&wire), Some(5));
@@ -411,34 +409,34 @@ mod tests {
         assert!(head.body[5..].iter().all(|b| *b == 0));
 
         /* reallen == 0 合法：容量已分配、当前无内容。 */
-        let empty = to_wire_varlen(0, 16, 0, "char/utf8").unwrap();
+        let empty = to_wire_varlen(16, 0, "char/utf8").unwrap();
         assert_eq!(reallen_from_wire(&empty), Some(0));
         assert_eq!(effective_len(&empty), Some(0));
 
         /* ② 拒绝：storetype 4 缺 tag 2（用 reserve 造一个没有 tag 2 的 4 号 wire）。 */
-        let mut missing = reserve(1, 0, 4, "").unwrap();
-        missing[OFF_STORETYPE] = ST_VARLEN; /* 改成 4，但 attr 里没有 tag 2 */
-        assert!(from_wire(&missing).is_none(), "storetype 4 缺 tag 2 必须拒绝");
+        let mut missing = reserve(4, "").unwrap();
+        missing[OFF_LAYOUT] = LAYOUT_CAPACITY; /* 改成 CAPACITY，但 attr 里没有 tag 2 */
+        assert!(from_wire(&missing).is_none(), "CAPACITY 缺 tag 2 必须拒绝");
 
         /* ③ 拒绝：reallen > 容量（把 tag 2 的 8 字节改大）。 */
-        let mut over = to_wire_varlen(0, 8, 8, "").unwrap();
+        let mut over = to_wire_varlen(8, 8, "").unwrap();
         let attrs_start = PREFIX + 8;
         /* attr = [0x02][0x08 0x00][u64]（无 langtype） */
         over[attrs_start + 3..attrs_start + 11].copy_from_slice(&9u64.to_le_bytes());
         assert!(from_wire(&over).is_none(), "reallen > bodylen 必须拒绝");
 
         /* ④ 拒绝：非 4 带 tag 2。 */
-        let mut wrong = to_wire(1, 0, b"x", "").unwrap();
+        let mut wrong = to_wire(b"x", "").unwrap();
         let attrs_at = PREFIX + 1;
         let record = reallen_record(1);
         wrong.extend_from_slice(&record);
         let attrslen = u32::try_from(record.len()).unwrap();
         wrong[OFF_ATTRSLEN..OFF_ATTRSLEN + 4].copy_from_slice(&attrslen.to_le_bytes());
-        assert!(from_wire(&wrong).is_none(), "非 storetype 4 带 tag 2 必须拒绝");
+        assert!(from_wire(&wrong).is_none(), "非 CAPACITY 带 tag 2 必须拒绝");
         let _ = attrs_at;
 
         /* ⑤ 拒绝：同一 tag 2 出现两次（两个事实源）。 */
-        let mut dup = to_wire_varlen(0, 8, 3, "").unwrap();
+        let mut dup = to_wire_varlen(8, 3, "").unwrap();
         let attrs_start = PREFIX + 8;
         let rec = reallen_record(3);
         dup.extend_from_slice(&rec);
@@ -449,14 +447,14 @@ mod tests {
         assert!(from_wire(&dup).is_none(), "重复 tag 2 必须拒绝");
 
         /* ⑥ 拒绝：写侧 reallen > capacity。 */
-        assert!(to_wire_varlen(0, 4, 5, "").is_none());
+        assert!(to_wire_varlen(4, 5, "").is_none());
     }
 
     #[test]
     fn byte_order_is_little_endian() {
         /* 用非对称值盯住字节序：读出反了就不可能相等。 */
         let body = vec![0xAAu8; 6];
-        let wire = to_wire(1, 0, &body, "int8").unwrap();
+        let wire = to_wire(&body, "int8").unwrap();
         assert_eq!(&wire[0..8], &6u64.to_le_bytes());
         let head = from_wire(&wire).unwrap();
         assert_eq!(head.len, 6);
@@ -471,13 +469,13 @@ mod tests {
             let n = usize::try_from(len).unwrap_or(0);
             if n > 1 << 20 {
                 /* 只验编码：head 里写出的字节必须与 to_le_bytes 一致。 */
-                let mut v = reserve(1, 0, 0, "").unwrap();
+                let mut v = reserve(0, "").unwrap();
                 v[OFF_BODYLEN..OFF_BODYLEN + 8].copy_from_slice(&len.to_le_bytes());
                 assert_eq!(read_u64(&v, OFF_BODYLEN), Some(len), "len={len:#x}");
                 continue;
             }
             let body = vec![0x5Au8; n];
-            let v = to_wire(1, 0, &body, "").unwrap();
+            let v = to_wire(&body, "").unwrap();
             assert_eq!(read_u64(&v, OFF_BODYLEN), Some(len), "len={len:#x}");
             let h = from_wire(&v).unwrap();
             assert_eq!(h.len, len, "len={len:#x}");
@@ -485,7 +483,7 @@ mod tests {
         }
 
         /* 声明长度超出实际数据必须拒绝，且不越界读。 */
-        let mut short = to_wire(1, 0, b"abc", "").unwrap();
+        let mut short = to_wire(b"abc", "").unwrap();
         short[OFF_BODYLEN..OFF_BODYLEN + 8].copy_from_slice(&99u64.to_le_bytes());
         assert!(from_wire(&short).is_none());
     }

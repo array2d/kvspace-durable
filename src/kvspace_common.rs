@@ -205,3 +205,56 @@ pub fn equal_xvalue(a: &XValue, b: &XValue) -> bool {
     }
     body_bytes(a) == body_bytes(b)
 }
+
+/// `‥status` 槽的 wire 级上限（规范 `02-kvspace模型/04-CABI.kv:33`）：有效长度 ≤16。
+pub const STATUS_MAX_LEN: u64 = 16;
+/// 容量形态下 `bodylen` 的下限（同规范：durable 只校验这一条，没有物理 box）。
+pub const STATUS_MIN_CAP: u64 = 80;
+
+/// 该 key 是不是 `‥status` 槽（末段恰为 `‥status`）。
+pub fn is_status_key(key: &str) -> bool {
+    key.rsplit('/').next() == Some("\u{2025}status")
+}
+
+/// 剥掉 langtype 的前导形状段 `[...]`，返回 base kind。
+/// `[]char/utf8` → `char/utf8`；`[16]char/utf8` → `char/utf8`；无形状段原样返回。
+pub fn base_kind(langtype: &[u8]) -> String {
+    let text = String::from_utf8_lossy(langtype);
+    if let Some(rest) = text.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            return rest[end + 1..].to_string();
+        }
+    }
+    text.into_owned()
+}
+
+/// `‥status` 槽的 wire 级校验（规范 `02-kvspace模型/04-CABI.kv:33-36`，**所有后端都必须做**）：
+/// base kind 是 char 族 + 有效长度 ≤16 + 若 `layout = CAPACITY` 则 `bodylen ≥ 80`。
+/// `content_len` 必须用 `effective_len`——容量形态下 `bodylen` 是容量，不是内容长度。
+pub fn validate_status_wire(key: &str, raw: &[u8]) -> Result<(), String> {
+    if !is_status_key(key) {
+        return Ok(());
+    }
+    let head = crate::headlenpow::from_wire(raw)
+        .ok_or_else(|| format!("status slot has a malformed wire at {key}"))?;
+    let effective = crate::headlenpow::effective_len(raw)
+        .ok_or_else(|| format!("status slot has a malformed wire at {key}"))?;
+    if effective > STATUS_MAX_LEN {
+        return Err(format!(
+            "status slot content_len {effective} > {STATUS_MAX_LEN} at {key}"
+        ));
+    }
+    let base = base_kind(head.langtype);
+    if !base.starts_with("char/") {
+        return Err(format!(
+            "status slot langtype must be a character family, got {base:?} at {key}"
+        ));
+    }
+    if head.layout == crate::headlenpow::LAYOUT_CAPACITY && head.len < STATUS_MIN_CAP {
+        return Err(format!(
+            "status slot capacity {} < {STATUS_MIN_CAP} at {key}",
+            head.len
+        ));
+    }
+    Ok(())
+}

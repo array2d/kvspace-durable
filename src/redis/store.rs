@@ -210,9 +210,21 @@ impl KVStore for RedisStore {
         }
     }
 
-    fn set_part(&self, key: &str, off: u32, buf: &[u8]) {
+    fn set_part(&self, key: &str, off: u32, buf: &[u8]) -> bool {
+        /*
+         * **SETRANGE 会自己把字符串撑大**：写越界时它扩展并零填，不报错。
+         * 那正是「原地写变成扩容」的静默错误，所以必须先读当前值判界。
+         * 判界用整条 wire 的长度（`off` 是 wire 的绝对偏移）。
+         */
+        let Some(current) = self.get(key) else {
+            return false;
+        };
+        let end = (off as usize).saturating_add(buf.len());
+        if end > current.len() {
+            return false;
+        }
         let o = off.to_string();
-        let _ = self.cmd(&[b"SETRANGE", key.as_bytes(), o.as_bytes(), buf]);
+        !matches!(self.cmd(&[b"SETRANGE", key.as_bytes(), o.as_bytes(), buf]), Resp::Error(_))
     }
 
     fn del(&self, keys: &[&str]) {

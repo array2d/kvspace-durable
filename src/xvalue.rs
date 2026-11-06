@@ -8,13 +8,8 @@ pub const REF_INLINE: u8 = 0;
 pub const REF_PTR: u8 = 1;
 pub const REF_EXT: u8 = 2;
 
-// 固定 16 字节 head 的 storetype（存储形态，对齐 kvspace 三正交轴 ST_*）。
-pub const ST_SHORT: u8 = 0; // 短定长：None/标量/目录/map 头/空 rwfunc 目录值
-pub const ST_SLACK: u8 = 1; // 变长：字符/字节数组/代码槽/指针路径
-pub const ST_LARGE: u8 = 2; // 大定长：张量
-pub const ST_EXT: u8 = 3; // 扩展定位 @ext
-/// 定容量变长：`bodylen` 是**容量**，有效长度在 attr tag 2（`[0x02][0x08 0x00][u64]`）。
-pub use crate::headlenpow::ST_VARLEN; // = 4；定义点在格式层，这里只做再导出
+/* 没有 ST_* 常量：新 16 字节 head 里没有 storetype 字段，存储形态全部由
+ * langtype 表达（形状段/`*`/`@`/种类）。`layout` 只管「bodylen 是长度还是容量」。 */
 
 pub fn is_map_langtype(kind: &str) -> bool {
     kind.contains(OBJ_SEP)
@@ -107,14 +102,26 @@ impl XValueHead {
     /// 用 body 字节组装为 XValue。
     pub fn from_wire(&self, body: &[u8]) -> XValue {
         if self.is_ptr() {
+            /* wire 上的 langtype 带 `*` 前缀（指针性是类型）。`target_kindexpr` 的
+             * 契约是「目标自身的 kindexpr」，不含这一层——剥掉，否则写回时会再加
+             * 一层 `*`，`*int64` 变成 `**int64`，roundtrip 就不等了。 */
+            let target = self
+                .langtype
+                .strip_prefix('*')
+                .unwrap_or(&self.langtype)
+                .to_string();
             return XValue::Ptr(Ptr {
-                target_kindexpr: self.langtype.clone(),
+                target_kindexpr: target,
                 target: String::from_utf8_lossy(body).into_owned(),
             });
         }
         if self.r#ref == REF_EXT {
             return XValue::Ext(ExtHandle {
-                langtype: self.langtype.clone(),
+                langtype: self
+                    .langtype
+                    .strip_prefix('@')
+                    .unwrap_or(&self.langtype)
+                    .to_string(),
                 locator: String::from_utf8_lossy(body).into_owned(),
             });
         }
@@ -396,10 +403,15 @@ pub fn xvalue_to_wire(kind: &str, raw: &[u8], array_len: i32) -> Vec<u8> {
     to_wire_head(kind, 0, &array_to_header(kind, array_len), raw)
 }
 
-/// 指针 wire 转换：固定头恒 ST_SLACK + PTR_PTR，body = 目标 key 路径。
-/// 目标 kindexpr 拼入 attr 区（单 key 整体）。
+/// 指针 wire 转换：body = 目标 key 路径，langtype 带 `*` 前缀。
+/// **头里没有 ptr 字段**——指针性完全由 langtype 前缀表达，这里负责补上它。
 pub fn xvalue_to_wire_ptr(target_kindexpr: &str, raw: &[u8]) -> Vec<u8> {
-    crate::headlenpow::to_wire(ST_SLACK, REF_PTR, raw, target_kindexpr).unwrap_or_default()
+    let langtype = if target_kindexpr.starts_with('*') {
+        target_kindexpr.to_string()
+    } else {
+        format!("*{target_kindexpr}")
+    };
+    crate::headlenpow::to_wire(raw, &langtype).unwrap_or_default()
 }
 
 /// kind + dims → 完整 langtype 串（`[d0,d1]kind`；dims 空 = 裸 kind）。
@@ -426,42 +438,27 @@ fn array_to_header(kind: &str, array_len: i32) -> Vec<i32> {
     }
 }
 
-/// 固定 16 字节 head 落盘：storetype 按 kind/dims 判定，ptr 按 ref 判定，body = raw 原样。
-/// langtype 拼入 attr 区（单 key 整体；None 无类型 = 空 attr）。
+/// 固定 16 字节 head 落盘：body = raw 原样，langtype 拼入 attr 区
+/// （单 key 整体；None 无类型 = 空 attr）。
 ///
-/// storetype 判定（对齐 kvspace 三正交轴与 C codec）：
-/// - ref==1（指针）→ ST_SLACK；ref==2（@ext）→ ST_EXT；
-/// - rwir/def langtype 或带 body 的 rwfunc（代码槽）→ ST_SLACK；
-/// - untyped variable-length system slots (empty kind, e.g. `‥lib`/`‥status`/`‥pc`) -> ST_SLACK;
-/// - char/*（字符/字节数组）→ ST_SLACK；
-/// - dims 非空且非 map/struct → ST_LARGE（张量）；
-/// - 否则 ST_SHORT（None/标量/目录/map 头/空 rwfunc 目录值）。
+/// **没有 storetype/ptr 判定**：存储形态与引用性全部由 langtype 表达——
+/// - ref==1（指针）→ langtype 加 `*` 前缀；ref==2（@ext）→ 加 `@` 前缀；
+/// - 张量/变长/定长 → 看 langtype 里有没有形状段、是不是字符数组；
+/// - layout 不由 kind 决定，由**调用哪个构造**决定：本函数恒产 LENGTH，
+///   定容量变长走 `to_wire_varlen`。
 pub fn to_wire_head(kind: &str, r#ref: i32, dims: &[i32], raw: &[u8]) -> Vec<u8> {
-    let (storetype, ptr) = match r#ref {
-        0 => {
-            let slack = kind.is_empty()
-                || matches!(kind, "rwir" | "def langtype")
-                || (kind == "rwfunc" && !raw.is_empty())
-                || kind.starts_with("char/");
-            let st = if slack {
-                ST_SLACK
-            } else if !dims.is_empty() && !kind.contains(OBJ_SEP) && !kind.starts_with(PATH_SEP) {
-                ST_LARGE
-            } else {
-                ST_SHORT
-            };
-            (st, REF_INLINE)
-        }
-        1 => (ST_SLACK, REF_PTR),
-        2 => (ST_EXT, REF_EXT),
-        _ => return Vec::new(),
-    };
-    let langtype = if kind == KIND_NONE {
+    let base = if kind == KIND_NONE {
         String::new()
     } else {
         kindexpr_of(kind, dims)
     };
-    crate::headlenpow::to_wire(storetype, ptr, raw, &langtype).unwrap_or_default()
+    let langtype = match r#ref as u8 {
+        REF_INLINE => base,
+        REF_PTR => format!("*{base}"),
+        REF_EXT => format!("@{base}"),
+        _ => return Vec::new(),
+    };
+    crate::headlenpow::to_wire(raw, &langtype).unwrap_or_default()
 }
 
 /// 从完整 XValue 字节（固定 head + body + attr 区）解析 XValueHead（langtype 从 attr 取）。
@@ -472,20 +469,20 @@ pub fn from_wire_head(data: &[u8]) -> XValueHead {
     let Ok(body_len) = i32::try_from(h.len) else {
         return XValueHead::default();
     };
-    let langtype = crate::headlenpow::langtype_from_wire(data)
-        .map(|b| String::from_utf8_lossy(b).into_owned())
-        .unwrap_or_default();
-    let has_dims =
-        h.storetype == ST_LARGE || (h.storetype == ST_SLACK && langtype.starts_with('['));
-    let dims = if has_dims {
-        parse_kindexpr(&langtype).0
-    } else {
-        Vec::new()
-    };
+    let langtype = String::from_utf8_lossy(h.langtype).into_owned();
+    /* 这里不再用 `has_dims` 前置判据：`parse_kindexpr` 自己按 `starts_with('[')` 判，
+     * 多一层 storetype 判断是二次确认，且那个字段已经不在了。 */
+    let dims = parse_kindexpr(&langtype).0;
     XValueHead {
-        headlen: crate::headlenpow::PREFIX as u16, // fixed 8-byte header
-        r#ref: h.ptr, // validated <= 2 by headlenpow::from_wire; matches REF_*
-        storetype: h.storetype,
+        headlen: crate::headlenpow::PREFIX as u16,
+        r#ref: match h.reference {
+            crate::headlenpow::Reference::None => REF_INLINE,
+            crate::headlenpow::Reference::Pointer => REF_PTR,
+            crate::headlenpow::Reference::Extension => REF_EXT,
+        },
+        /* storetype 已从 wire 删除：XValueHead 的这个字段只是给旧调用方看的派生值。
+         * 保留原字段但恒填 0，避免下游误以为它还是 wire 事实——真正的形态在 langtype。 */
+        storetype: 0,
         langtype,
         phys_dims: dims,
         body_len,
@@ -499,12 +496,21 @@ pub fn from_wire(data: &[u8]) -> XValue {
     if h.headlen == 0 {
         return XValue::None;
     }
-    // Canonical None is ST_SHORT + REF_INLINE + empty body + empty langtype;
-    // untyped system slots (`‥lib`/`‥status`/`‥pc`) use ST_SLACK and must keep their body.
+    /*
+     * Canonical None = 空 langtype + 非引用 + 空 body + 空 attr。
+     *
+     * **旧模型用 `storetype == ST_SHORT` 区分「真正的 None」与「无类型系统槽
+     * （`‥lib`/`‥status`/`‥pc`，当时是 ST_SLACK 且 body 为空）」。新头没有
+     * storetype，那个区分在 wire 上已经不存在——这不是放宽判据，是承认信息已丢。
+     *
+     * 补回信息的责任在**写入方**：系统槽必须有显式 langtype（如 `[]char/utf8`），
+     * 于是它们不会落进「空 langtype」这一支。`attrs_len == 0` 是本判据的守门人：
+     * 带 langtype 记录的值 attrs 非空，构不成 None。
+     */
     if h.langtype.is_empty()
         && h.r#ref == REF_INLINE
-        && h.storetype == ST_SHORT
         && h.body_len == 0
+        && crate::headlenpow::attr_len(data).unwrap_or(1) == 0
     {
         return XValue::None;
     }
@@ -588,20 +594,20 @@ mod tests {
         assert_eq!(dir.len(), 16 + 3 + 3);
         let head = crate::headlenpow::from_wire(&dir).unwrap();
         assert_eq!(
-            (head.storetype, head.ptr, head.len, head.body.len()),
-            (ST_SHORT, REF_INLINE, 0, 0)
+            (head.layout, head.reference, head.len, head.body.len()),
+            (crate::headlenpow::LAYOUT_LENGTH, crate::headlenpow::Reference::None, 0, 0)
         );
-        // @ext：ST_EXT + PTR_EXT，body = 定位串（16 + body）。
+        // @ext：langtype 带 `@` 前缀，body = 定位串（16 + body）。
         let ext = XValue::Ext(ExtHandle {
             langtype: "rwfunc".into(),
             locator: "/lib/f/".into(),
         })
         .to_wire();
-        assert_eq!(ext.len(), 16 + "/lib/f/".len() + 9); /* + attr（3 + "rwfunc"，无前缀） */
+        assert_eq!(ext.len(), 16 + "/lib/f/".len() + 10); /* + attr（3 + "@rwfunc"） */
         let head = crate::headlenpow::from_wire(&ext).unwrap();
         assert_eq!(
-            (head.storetype, head.ptr, head.body),
-            (ST_EXT, REF_EXT, b"/lib/f/".as_slice())
+            (head.reference, head.body),
+            (crate::headlenpow::Reference::Extension, b"/lib/f/".as_slice())
         );
         assert_eq!(
             from_wire(&ext),

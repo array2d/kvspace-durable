@@ -39,6 +39,12 @@ unsafe fn set(h: *mut Handle, key: &str, n: i64) {
     set_raw(h, key, &xvalue_i64(n));
 }
 
+/// `‥status` 槽：字符族 langtype（规范 04-CABI:33 的 wire 级契约）。
+unsafe fn set_status(h: *mut Handle, key: &str, text: &str) {
+    let v = kvspace_durable::xvalue::xvalue_to_wire("[]char/utf8", text.as_bytes(), 0);
+    set_raw(h, key, &v);
+}
+
 unsafe fn exists(h: *mut Handle, key: &str) -> bool {
     let k = CString::new(key).unwrap();
     let mut p: *mut u8 = std::ptr::null_mut();
@@ -98,7 +104,13 @@ unsafe fn run(dsn: &str, root: &str) {
             0
         );
         for (i, k) in inside.iter().chain(outside.iter()).enumerate() {
-            set(h, k, i as i64);
+            /* `‥status` 是 wire 级契约槽（规范 04-CABI:33）：必须是字符族、内容 ≤16。
+             * 用 int64 播种会被后端正确拒绝——那是判据在起作用，不是夹具该绕开的东西。 */
+            if k.ends_with("\u{2025}status") {
+                set_status(h, k, "ok");
+            } else {
+                set(h, k, i as i64);
+            }
         }
         for k in inside.iter().chain(outside.iter()) {
             assert!(exists(h, k), "{dsn}: seeded {k}");

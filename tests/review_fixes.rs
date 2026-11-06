@@ -5,9 +5,9 @@
 //      char/utf8 -> []char/utf32 parameter binding, pointer cycles, and `[1]·int64` map langtype).
 //   2. kvspaceGet(resolve=0 vs 1) leaf Ptr chain resolution (up to 16 hops, coexisting raw and
 //      resolved borrowed views, missing target -> 0 + NULL, cycle / >16 hops -> 1).
-//   3. kvspaceGetHead / kvspaceGetPart / kvspaceSetPart leaf Ptr resolution and cache invalidation.
+//   (deleted per p11: kvspaceGetHead coverage — the API no longer exists)
 //   4. kvspaceWriteInPlace(resolve=1) mutating the terminal target through a Ptr chain.
-//   5. Untyped variable-length system slots (ST_SLACK + empty langtype) round-trip and Watch.
+//   (deleted per p11: untyped system slots — 2026-11-06 裁决要求系统槽必须带 langtype)
 //   6. SetValue attr trailer validation and trailing padding trim.
 //   7. /lib/<func>/‥ctime cross-handle hot-reload invalidation with retired view retention.
 //   8. List(resolve=1) following Ptr links whose targets lack a trailing `/` or `·`.
@@ -115,16 +115,6 @@ unsafe fn run_backend_suite(dsn: &str, root: &str) {
         std::slice::from_raw_parts(ptr_res, len_res as usize),
         w_utf8.as_slice()
     );
-
-    // kvspaceGetHead follows the 2-hop Ptr chain to read the terminal target header/langtype.
-    let k_slot_c = CString::new(k_slot.as_str()).unwrap();
-    let mut head_out: kvspaceHead_t = std::mem::zeroed();
-    assert_eq!(kvspaceGetHead(h, k_slot_c.as_ptr(), &mut head_out), 0);
-    assert_eq!(head_out.r#ref, REF_INLINE);
-    assert_eq!(head_out.storetype, ST_SLACK);
-    assert_eq!(head_out.body_len, 6);
-    let lt_str = std::str::from_utf8(&head_out.langtype[..head_out.langtype_len as usize]).unwrap();
-    assert_eq!(lt_str, "[6]char/utf8");
 
     // 3. 16-hop limit and cycle detection (>16 hops or cycle returns 1).
     let k_leaf16 = format!("{root}/hop_leaf");
@@ -248,73 +238,19 @@ unsafe fn run_backend_suite(dsn: &str, root: &str) {
         new_int64(&[888]).to_wire().as_slice()
     );
 
-    // 6. Untyped variable-length system slots (ST_SLACK + empty langtype) round-trip and Watch.
-    let k_sys_lib = format!("{root}/vthread/1/[1]/\u{2025}lib");
-    let sys_body = b"/lib/main\xc2\xb7test";
-    let w_sys_lib = headlenpow::to_wire(ST_SLACK, REF_INLINE, sys_body, "").unwrap();
-    set_raw_checked(h, &k_sys_lib, &w_sys_lib);
-
-    let (rc_sys, p_sys, l_sys) = get_raw_c(h, &k_sys_lib, 0);
-    assert_eq!(rc_sys, 0);
-    let got_sys = std::slice::from_raw_parts(p_sys, l_sys as usize);
-    assert_eq!(got_sys, w_sys_lib.as_slice(), "untyped ST_SLACK must round-trip verbatim");
-
-    // from_wire must not treat untyped ST_SLACK as XValue::None or drop its body.
-    let decoded_sys = from_wire(got_sys);
-    assert!(!is_none(&decoded_sys), "ST_SLACK with empty langtype must not decode as None");
-    assert_eq!(decoded_sys.to_wire(), w_sys_lib);
-
-    // Canonical None (ST_SHORT + REF_INLINE + len=0 + empty langtype) still decodes to XValue::None.
-    let w_none = headlenpow::to_wire(ST_SHORT, REF_INLINE, &[], "").unwrap();
+    // Canonical None（空 langtype + 空 body + 空 attr）still decodes to XValue::None.
+    let w_none = headlenpow::to_wire(&[], "").unwrap();
     assert!(is_none(&from_wire(&w_none)));
 
-    // Empty struct marker (ST_SHORT + len=0 + langtype="/lib/Point") preserves its wire bytes.
+    // Empty struct marker（len=0 + langtype="/lib/Point"）preserves its wire bytes.
     let k_struct = format!("{root}/pt");
-    let w_struct = headlenpow::to_wire(ST_SHORT, REF_INLINE, &[], "/lib/Point").unwrap();
+    let w_struct = headlenpow::to_wire(&[], "/lib/Point").unwrap();
     set_raw_checked(h, &k_struct, &w_struct);
     set_raw_checked(h, &format!("{k_struct}\u{b7}x"), &new_int64(&[3]).to_wire());
     let (_, p_st, l_st) = get_raw_c(h, &k_struct, 0);
     assert_eq!(
         std::slice::from_raw_parts(p_st, l_st as usize),
         w_struct.as_slice()
-    );
-
-    // Watch on an untyped status slot: blocks while "running", returns full ST_SLACK wire on "stopped".
-    let k_status = format!("{root}/status_slot");
-    let w_running = headlenpow::to_wire(ST_SLACK, REF_INLINE, b"running", "").unwrap();
-    let w_stopped = headlenpow::to_wire(ST_SLACK, REF_INLINE, b"stopped", "").unwrap();
-    set_raw_checked(h, &k_status, &w_running);
-
-    let dsn_bg = dsn.to_string();
-    let k_status_bg = k_status.clone();
-    let w_stopped_bg = w_stopped.clone();
-    let writer = std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(25));
-        unsafe {
-            let h2 = connect_c(&dsn_bg);
-            set_raw_checked(h2, &k_status_bg, &w_stopped_bg);
-            kvspaceClose(h2);
-        }
-    });
-
-    let k_status_c = CString::new(k_status.as_str()).unwrap();
-    let mut watch_out: *mut u8 = std::ptr::null_mut();
-    let mut watch_len: u32 = 0;
-    let rc_w = kvspaceWatch(
-        h,
-        k_status_c.as_ptr(),
-        w_stopped.as_ptr(),
-        w_stopped.len() as u32,
-        5_000_000, // 5ms tick
-        &mut watch_out,
-        &mut watch_len,
-    );
-    writer.join().unwrap();
-    assert_eq!(rc_w, 0);
-    assert_eq!(
-        std::slice::from_raw_parts(watch_out, watch_len as usize),
-        w_stopped.as_slice(),
-        "kvspaceWatch on untyped ST_SLACK must preserve body and ST_SLACK header"
     );
 
     // 7. SetValue head/attr validation（16 字节 head，attrslen 在 head 里、无前缀）。
@@ -381,7 +317,7 @@ unsafe fn run_backend_suite(dsn: &str, root: &str) {
     let k_ctime = format!("{func_dir}/\u{2025}ctime");
     let k_insn = format!("{func_dir}/[1,0]");
     let w_ctime1 = new_int64(&[1000]).to_wire();
-    let w_insn1 = headlenpow::to_wire(ST_SLACK, REF_INLINE, b"ret 10", "").unwrap();
+    let w_insn1 = headlenpow::to_wire(b"ret 10", "").unwrap();
     set_raw_checked(h, &k_ctime, &w_ctime1);
     set_raw_checked(h, &k_insn, &w_insn1);
 
@@ -395,7 +331,7 @@ unsafe fn run_backend_suite(dsn: &str, root: &str) {
     // Simulate external relayout via `h2` updating [1,0] and ‥ctime.
     let h2 = connect_c(dsn);
     let w_ctime2 = new_int64(&[2000]).to_wire();
-    let w_insn2 = headlenpow::to_wire(ST_SLACK, REF_INLINE, b"ret 20", "").unwrap();
+    let w_insn2 = headlenpow::to_wire(b"ret 20", "").unwrap();
     set_raw_checked(h2, &k_insn, &w_insn2);
     set_raw_checked(h2, &k_ctime, &w_ctime2);
     kvspaceClose(h2);
@@ -426,8 +362,8 @@ unsafe fn run_backend_suite(dsn: &str, root: &str) {
     let k_vids_target = format!("{root}/vthread/‥vids");
     let k_vids_entry = format!("{k_vids_target}/89");
     let k_vids_link = format!("{root}/lib/numpy·zeros/vids");
-    let w_vids_head = headlenpow::to_wire(ST_SLACK, REF_INLINE, &[], "[]char/utf32·[]char/utf32").unwrap();
-    let w_vids_pc = headlenpow::to_wire(ST_SLACK, REF_INLINE, b"[1,0]", "[5]char/utf8").unwrap();
+    let w_vids_head = headlenpow::to_wire(&[], "[]char/utf32·[]char/utf32").unwrap();
+    let w_vids_pc = headlenpow::to_wire(b"[1,0]", "[5]char/utf8").unwrap();
     let w_vids_ptr = new_ptr("[]char/utf32·[]char/utf32", &k_vids_target).to_wire();
     set_raw_checked(h, &k_vids_target, &w_vids_head);
     set_raw_checked(h, &k_vids_link, &w_vids_ptr);
@@ -463,7 +399,7 @@ unsafe fn run_backend_suite(dsn: &str, root: &str) {
     // `·` member enumeration also follows a bare-target Ptr (e.g. /rf/m_link· -> /rf/m_real).
     let k_m_real = format!("{root}/m_real");
     let k_m_link = format!("{root}/m_link");
-    let w_m_head = headlenpow::to_wire(ST_SHORT, REF_INLINE, &[], "[]char/utf8·int64").unwrap();
+    let w_m_head = headlenpow::to_wire(&[], "[]char/utf8·int64").unwrap();
     let w_m_val = new_int64(&[42]).to_wire();
     let w_m_ptr = new_ptr("[]char/utf8·int64", &k_m_real).to_wire();
     set_raw_checked(h, &k_m_real, &w_m_head);
