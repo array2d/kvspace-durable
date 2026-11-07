@@ -35,19 +35,19 @@ pub trait KVStore {
     /// **越界即失败，不扩容**：原地写的语义是「改已存在的内容」，不是「把值撑大」。
     /// 曾用 `resize(e, 0)` 兜底，于是越界写会静默扩展 wire——读方拿到的
     /// 长度比写方以为的长，而错在写入侧、不在读侧，排查时方向全反。
-    fn set_part(&self, key: &str, off: u32, buf: &[u8]) -> bool {
+    fn set_part(&self, key: &str, off: u32, buf: &[u8]) {
+        /* 越界判据在 `backend.rs::set_part` 唯一入口，这里只负责写。
+         * **不 resize**：越界若走到这里说明入口漏判，宁可什么都不写也不要静默扩容。 */
         let Some(mut v) = self.get(key) else {
-            return false; /* key 不存在：不是「写了但没效果」，是明确失败 */
+            return;
         };
         let s = off as usize;
         let e = s + buf.len();
         if e > v.len() {
-            /* 不扩容、不截断、不静默丢弃：调用方给的区间超出了值本身。 */
-            return false;
+            return;
         }
         v[s..e].copy_from_slice(buf);
         self.set(key, &v);
-        true
     }
     fn flush(&self);
 }

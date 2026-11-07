@@ -526,8 +526,13 @@ impl KVSpace for FsKVSpace {
         let pf = self
             .physical_file(key)
             .ok_or_else(|| format!("set_part: missing key {}", key))?;
-        /* 上界：`off + buf.len() <= 16 + 有效长度`。pwrite 会自己把文件撑大，
-         * 不判界就是「原地写变成扩容」——错在写侧，排查方向会全反。 */
+        /*
+         * **`fs://` 不走 `Backend`**：`conn.rs:33` 直接构造 `FsKVSpace`，
+         * 所以 `backend.rs::set_part` 的判界覆盖不到这里。判据必须在这一层也有一份，
+         * 且与 `backend.rs` 用**同一个量**：`16 + effective_len`。
+         *
+         * pwrite 对越界会自己撑大文件，不判界就是「原地写变成扩容」。
+         */
         {
             let current = fs::read(&pf)
                 .map_err(|e| format!("kvspace-fs: set_part read {:?}: {}", pf, e))?;

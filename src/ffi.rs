@@ -720,41 +720,8 @@ pub extern "C" fn kvspaceSetPart(
             return 1;
         }
     };
-    /*
-     * 上界：`offset + buf_len <= 16 + 有效长度`。
-     *
-     * `offset` 是**整条 wire 的绝对偏移**（含 head），这是 SetPart 的既定约定。
-     * 有效长度必须用 `effective_len`——CAPACITY 布局下 `bodylen` 是容量而不是内容
-     * 长度，拿它判界会让越界写「正好落在容量余量里」而静默通过。
-     *
-     * 越界是硬错，不扩容：原地写的语义是「改已存在的内容」，不是「把值撑大」。
-     */
-    {
-        let wire = hd.kv.get_raw(&target_key);
-        if wire.is_empty() {
-            write_err(err, err_cap, &format!("set_part: cannot read {target_key}"));
-            return 1;
-        }
-        let effective = match crate::headlenpow::effective_len(&wire) {
-            Some(n) => n,
-            None => {
-                write_err(err, err_cap, &format!("set_part: malformed wire at {target_key}"));
-                return 1;
-            }
-        };
-        let upper = crate::headlenpow::PREFIX as u64 + effective;
-        let end = (offset as u64).saturating_add(buf_len as u64);
-        if end > upper {
-            write_err(
-                err,
-                err_cap,
-                &format!(
-                    "set_part: offset {offset} + len {buf_len} exceeds {upper} at {target_key}"
-                ),
-            );
-            return 1;
-        }
-    }
+    /* 判界不在这里：`backend.rs::set_part` 是唯一入口，三个后端共用同一份判据。
+     * 在那之前判一次，等于把「同一个量」写成两处——两处迟早会分叉。 */
     let data: &[u8] = if buf_len == 0 {
         &[]
     } else {

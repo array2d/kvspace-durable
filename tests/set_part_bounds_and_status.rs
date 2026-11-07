@@ -10,6 +10,7 @@
 //!    不校验则 `‥status` 能被写成任意形状，运行时按文本读会拿到垃圾。
 
 use std::ffi::CString;
+use kvspace_durable::{KVPair, KVSpace, XValue};
 
 fn connect(label: &str) -> *mut kvspace_durable::ffi::Handle {
     let dir = std::env::temp_dir().join(format!(
@@ -227,4 +228,173 @@ fn status_shape_rule_only_applies_to_status_key() {
         "普通 key 不受 status 字符族约束"
     );
     unsafe { kvspace_durable::ffi::kvspaceClose(h) };
+}
+
+// ── 判界收进唯一入口后，mem 与 fs 各自越界 ─────────────────────────
+//
+// 判界在 `backend.rs::set_part` 唯一入口，三个后端共用同一份判据。
+// 这两条各走一条不同的后端（mem 走 `store.rs` 默认实现、fs 走 `fs/kvspace.rs`），
+// 证明判据不依赖具体后端。
+
+mod mem_backend {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::rc::Rc;
+
+    use kvspace_durable::{Backend, KVPair, KVSpace, KVStore, XValue};
+
+    #[derive(Default, Clone)]
+    pub struct MemoryStore(Rc<RefCell<HashMap<String, Vec<u8>>>>);
+
+    impl KVStore for MemoryStore {
+        fn get(&self, key: &str) -> Option<Vec<u8>> {
+            self.0.borrow().get(key).cloned()
+        }
+        fn set(&self, key: &str, value: &[u8]) {
+            self.0.borrow_mut().insert(key.to_string(), value.to_vec());
+        }
+        fn del(&self, keys: &[&str]) {
+            let mut v = self.0.borrow_mut();
+            for k in keys {
+                v.remove(*k);
+            }
+        }
+        fn scan_keys(&self, prefix: &str) -> Vec<String> {
+            self.0
+                .borrow()
+                .keys()
+                .filter(|k| k.starts_with(prefix))
+                .cloned()
+                .collect()
+        }
+        fn flush(&self) {}
+    }
+
+    pub fn backend() -> Backend<MemoryStore> {
+        Backend::new(MemoryStore::default())
+    }
+
+    pub fn seed(kv: &mut Backend<MemoryStore>, key: &str, body: &[u8]) {
+        let raw = kvspace_durable::xvalue::xvalue_to_wire("[]char/utf8", body, 0);
+        kv.set(&[KVPair {
+            key: key.into(),
+            val: XValue::None,
+            raw: Some(raw),
+        }])
+        .unwrap();
+    }
+}
+
+#[test]
+fn set_part_out_of_range_fails_on_memory_backend() {
+    let mut kv = mem_backend::backend();
+    mem_backend::seed(&mut kv, "/m", b"abcdef");
+    /* 上界 = 16 + 6 = 22；写 [21,24) 越界。 */
+    assert!(
+        KVSpace::set_part(&mut kv, "/m", 21, b"XYZ").is_err(),
+        "mem 后端越界必须失败"
+    );
+    /* 界内仍可写，且没被上一条波及。 */
+    assert!(
+        KVSpace::set_part(&mut kv, "/m", 17, b"XY").is_ok(),
+        "mem 后端界内必须成功"
+    );
+}
+
+#[test]
+fn set_part_out_of_range_fails_on_fs_backend() {
+    let h = connect("fs-out-of-range");
+    assert!(write_value(h, "/f", b"abcdef", "[]char/utf8"));
+    assert!(commit_previous(h), "先落盘，确保 /f 真的在 store 里");
+    assert_ne!(
+        set_part(h, "/f", 21, b"XYZ"),
+        0,
+        "fs 后端越界必须失败"
+    );
+    unsafe { kvspace_durable::ffi::kvspaceClose(h) };
+}
+
+// ── 跨后端等价对照 ──────────────────────────────────────────────────
+//
+// 「两处判界用同一个量」需要一条**可执行的**判据，而不是注释里的承诺。
+// 这组用同一批 (offset, buf) 在 mem 与 fs 上各跑一遍，要求结论逐条相同：
+// 判界若在某一边换成了 `bodylen`，CAPACITY 那一条会立刻分叉。
+
+/// 三种界相对上界（16 + 6 = 22）的位置：界内、刚好贴边、越 1 字节。
+const PROBES: [(u32, &[u8]); 3] = [(17, b"XY"), (20, b"YZ"), (21, b"XYZ")];
+
+fn mem_verdicts() -> Vec<bool> {
+    let mut out = Vec::new();
+    for (off, buf) in PROBES {
+        let mut kv = mem_backend::backend();
+        mem_backend::seed(&mut kv, "/x", b"abcdef");
+        out.push(KVSpace::set_part(&mut kv, "/x", off, buf).is_ok());
+    }
+    out
+}
+
+fn fs_verdicts(label: &str) -> Vec<bool> {
+    let mut out = Vec::new();
+    for (off, buf) in PROBES {
+        let h = connect(label);
+        assert!(write_value(h, "/x", b"abcdef", "[]char/utf8"));
+        assert!(commit_previous(h), "先落盘，确保 /x 真的在 store 里");
+        out.push(set_part(h, "/x", off, buf) == 0);
+        unsafe { kvspace_durable::ffi::kvspaceClose(h) };
+    }
+    out
+}
+
+#[test]
+fn set_part_bounds_agree_across_backends() {
+    let mem = mem_verdicts();
+    let fs = fs_verdicts("cross-backend");
+    assert_eq!(
+        mem, fs,
+        "mem 与 fs 的判界结论必须逐条相同（两处用同一个量）；mem={mem:?} fs={fs:?}"
+    );
+    /* 同时钉住绝对结论，防止两边一起错：界内真、边界真、越界假。 */
+    assert_eq!(mem, vec![true, true, false], "三种位置的绝对结论");
+}
+
+#[test]
+fn set_part_capacity_bounds_agree_across_backends() {
+    /* CAPACITY 布局：容量 32、有效 6 ⇒ 上界仍是 16+6=22。
+     * 这条是「判界用 effective_len 而非 bodylen」的跨后端对照——
+     * 任一侧换成 bodylen，下面 22 处那条就会从 false 变 true。 */
+    let mem = {
+        let mut kv = mem_backend::backend();
+        let raw = kvspace_durable::headlenpow::to_wire_varlen(32, 6, "[]char/utf8").unwrap();
+        kv.set(&[KVPair {
+            key: "/c".into(),
+            val: XValue::None,
+            raw: Some(raw),
+        }])
+        .unwrap();
+        vec![
+            KVSpace::set_part(&mut kv, "/c", 20, b"YZ").is_ok(),
+            KVSpace::set_part(&mut kv, "/c", 22, b"Z").is_ok(),
+        ]
+    };
+    let fs = {
+        let h = connect("cross-capacity");
+        let k = CString::new("/c").unwrap();
+        let l = CString::new("[]char/utf8").unwrap();
+        let mut body: *mut u8 = std::ptr::null_mut();
+        let mut err = [0i8; 256];
+        let rc = unsafe {
+            kvspace_durable::ffi::kvspaceWriteNewPlace(
+                h, k.as_ptr(), 0, 1, 6, 32, l.as_ptr(),
+                &mut body, err.as_mut_ptr(), err.len() as u32,
+            )
+        };
+        assert_eq!(rc, 0);
+        unsafe { std::ptr::copy_nonoverlapping(b"abcdef".as_ptr(), body, 6) };
+        assert!(commit_previous(h));
+        let v = vec![set_part(h, "/c", 20, b"YZ") == 0, set_part(h, "/c", 22, b"Z") == 0];
+        unsafe { kvspace_durable::ffi::kvspaceClose(h) };
+        v
+    };
+    assert_eq!(mem, fs, "CAPACITY 判界必须跨后端相同；mem={mem:?} fs={fs:?}");
+    assert_eq!(mem, vec![true, false], "容量余量不是内容：22 处必须失败");
 }
