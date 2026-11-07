@@ -9,11 +9,12 @@
 use kvspace_durable::ffi::*;
 use std::ffi::CString;
 
+/// 16 字节 head + 8 字节 int64 body + 空 attr（attrslen=0，无前缀）。
 fn xvalue_i64(n: i64) -> Vec<u8> {
-    let mut v = vec![0u8; 16];
-    v[0..6].copy_from_slice(&8u64.to_le_bytes()[..6]);
-    v[8..16].copy_from_slice(&n.to_le_bytes());
-    v.extend_from_slice(&[2, 0]); // empty attr
+    let mut v = vec![0u8; 16 + 8];
+    v[0..8].copy_from_slice(&8u64.to_le_bytes()); // bodylen @0-7
+    // attrslen @8-11 = 0（已零填）
+    v[16..24].copy_from_slice(&n.to_le_bytes());
     v
 }
 
@@ -36,6 +37,12 @@ unsafe fn set_raw(h: *mut Handle, key: &str, v: &[u8]) {
 
 unsafe fn set(h: *mut Handle, key: &str, n: i64) {
     set_raw(h, key, &xvalue_i64(n));
+}
+
+/// `‥status` 槽：字符族 langtype（规范 04-CABI:33 的 wire 级契约）。
+unsafe fn set_status(h: *mut Handle, key: &str, text: &str) {
+    let v = kvspace_durable::xvalue::xvalue_to_wire("[]char/utf8", text.as_bytes(), 0);
+    set_raw(h, key, &v);
 }
 
 unsafe fn exists(h: *mut Handle, key: &str) -> bool {
@@ -97,7 +104,13 @@ unsafe fn run(dsn: &str, root: &str) {
             0
         );
         for (i, k) in inside.iter().chain(outside.iter()).enumerate() {
-            set(h, k, i as i64);
+            /* `‥status` 是 wire 级契约槽（规范 04-CABI:33）：必须是字符族、内容 ≤16。
+             * 用 int64 播种会被后端正确拒绝——那是判据在起作用，不是夹具该绕开的东西。 */
+            if k.ends_with("\u{2025}status") {
+                set_status(h, k, "ok");
+            } else {
+                set(h, k, i as i64);
+            }
         }
         for k in inside.iter().chain(outside.iter()) {
             assert!(exists(h, k), "{dsn}: seeded {k}");

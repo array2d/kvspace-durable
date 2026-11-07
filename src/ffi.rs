@@ -21,7 +21,7 @@ use std::time::Duration;
 use crate::conn::conn;
 use crate::kvspace::{KVPair, KVSpace};
 use crate::r#const::{DIR_INDEX_SUF, OBJ_SEP, PATH_SEP, RUNTIME_MEMBER_SEP};
-use crate::xvalue::{from_wire, from_wire_head, REF_INLINE, REF_PTR, ST_SHORT, ST_SLACK};
+use crate::xvalue::{from_wire, from_wire_head, REF_INLINE, REF_PTR};
 
 // ── 句柄 ─────────────────────────────────────────────────────────────
 //
@@ -232,6 +232,8 @@ unsafe fn kv_flush<'a>(h: *mut Handle) -> Result<&'a mut dyn KVSpace, String> {
 }
 
 /// 固定头预留：head + attr 区（langtype 尾部）一次写，body 偏移恒 = PREFIX。
+/// 公共 FFI 的写入口：`ref` 转成 langtype 前缀，`storetype` **不分支、不校验、不下传**
+/// （head 已无该字段；签名删减是另一笔，排在语料转绿之后）。
 fn build_xvalue_head(
     r#ref: u8,
     storetype: u8,
@@ -239,16 +241,43 @@ fn build_xvalue_head(
     body_cap: usize,
     langtype: &str,
 ) -> Option<Vec<u8>> {
+    let _ = storetype;
     if body_len > body_cap {
         return None;
     }
-    let (st, ptr) = match (r#ref, storetype) {
-        (0, 0..=3) => (storetype, 0),
-        (1, 1) => (1, 1),
-        (2, 3) => (3, 2),
+    let prefixed = match r#ref {
+        0 => {
+            if langtype.starts_with('*') || langtype.starts_with('@') {
+                /* 已带前缀却声明 inline：两个事实源，拒绝。 */
+                return None;
+            }
+            langtype.to_string()
+        }
+        1 => {
+            if langtype.starts_with('*') || langtype.starts_with('@') {
+                return None;
+            }
+            format!("*{langtype}")
+        }
+        2 => {
+            if langtype.starts_with('*') || langtype.starts_with('@') {
+                return None;
+            }
+            format!("@{langtype}")
+        }
         _ => return None,
     };
-    crate::headlenpow::reserve(st, ptr, body_len, langtype)
+    /*
+     * **容量必须进 wire**：`body_cap > body_len` 走 CAPACITY 布局
+     * （bodylen = 容量、有效长度进 attr tag 2），否则走 LENGTH。
+     * 丢掉 body_cap 等于把「容量」降级成「物理预留」——读方拿不到有效长度，
+     * 与 kvspace-c 的 `NewSlack`/`Reserve` 语义不一致。
+     */
+    if body_cap > body_len {
+        crate::headlenpow::to_wire_varlen(body_cap, body_len as u64, &prefixed)
+    } else {
+        crate::headlenpow::reserve(body_len, &prefixed)
+    }
 }
 
 // ── 内部助手 ─────────────────────────────────────────────────────────
@@ -454,7 +483,7 @@ fn resolve_cached_key(hd: &mut Handle, key: &str, resolve: bool) -> Result<Optio
         let next_target = {
             let bytes = cached_slice(hd, &cur).ok_or(())?;
             let w = crate::headlenpow::from_wire(bytes).ok_or(())?;
-            if w.ptr != REF_PTR {
+            if w.reference != crate::headlenpow::Reference::Pointer {
                 None
             } else {
                 if hop == MAX_PTR_HOPS {
@@ -553,7 +582,8 @@ pub extern "C" fn kvspaceSetValue(
         write_err(err, err_cap, "invalid XValue");
         return 1;
     };
-    let Some(attr) = crate::headlenpow::attr_len(raw, whead.len as usize) else {
+    /* attr 区长度从 head 读（无前缀）；空 attr 合法（=0）。 */
+    let Some(attr) = crate::headlenpow::attr_len(raw) else {
         write_err(err, err_cap, "invalid XValue");
         return 1;
     };
@@ -564,7 +594,7 @@ pub extern "C" fn kvspaceSetValue(
         write_err(err, err_cap, "invalid XValue");
         return 1;
     };
-    if attr < 2 || total > raw.len() {
+    if total > raw.len() {
         write_err(err, err_cap, "invalid XValue");
         return 1;
     }
@@ -690,6 +720,8 @@ pub extern "C" fn kvspaceSetPart(
             return 1;
         }
     };
+    /* 判界不在这里：`backend.rs::set_part` 是唯一入口，三个后端共用同一份判据。
+     * 在那之前判一次，等于把「同一个量」写成两处——两处迟早会分叉。 */
     let data: &[u8] = if buf_len == 0 {
         &[]
     } else {
@@ -793,11 +825,10 @@ pub extern "C" fn kvspaceWriteInPlace(
     let head = from_wire_head(&existing);
     let head_len = head.head_len() as usize;
     let blen = head.body_len.max(0) as usize;
-    let attr = crate::headlenpow::attr_len(&existing, blen).unwrap_or(0) as usize;
+    let attr = crate::headlenpow::attr_len(&existing).unwrap_or(0) as usize;
     if head.headlen == 0
         || head.body_len < 0
         || head.body_len as u32 != body_len
-        || attr < 2
         || head_len.checked_add(blen).and_then(|x| x.checked_add(attr)) != Some(existing.len())
     {
         write_err(err, err_cap, "kvspace: write-in-place body_len mismatch");
@@ -1228,14 +1259,10 @@ fn emit(wire: Option<Vec<u8>>, out: *mut *mut u8, out_len: *mut u32) -> c_int {
     }
 }
 
-/// Scalar constructor: `ST_SHORT`, inline, `body = raw`.
+/// Scalar constructor: inline, `body = raw`.
 fn new_scalar(raw: &[u8], langtype: *const c_char, out: *mut *mut u8, out_len: *mut u32) -> c_int {
     let lt = unsafe { cstr(langtype) };
-    emit(
-        crate::headlenpow::to_wire(ST_SHORT, REF_INLINE, raw, lt),
-        out,
-        out_len,
-    )
+    emit(crate::headlenpow::to_wire(raw, lt), out, out_len)
 }
 
 #[no_mangle]
@@ -1258,8 +1285,14 @@ pub extern "C" fn kvspaceNewPtr(
     if path.is_empty() {
         return 1;
     }
+    /* 指针 body 是目标 key 路径，指针性由 langtype 的 `*` 前缀表达。 */
+    let prefixed = if kindexpr.starts_with('*') {
+        kindexpr.to_string()
+    } else {
+        format!("*{kindexpr}")
+    };
     emit(
-        crate::headlenpow::to_wire(ST_SLACK, REF_PTR, path, kindexpr),
+        crate::headlenpow::to_wire(path, &prefixed),
         out,
         out_len,
     )
@@ -1283,7 +1316,7 @@ pub extern "C" fn kvspaceNewChar(
     };
     let lt = unsafe { cstr(langtype) };
     emit(
-        crate::headlenpow::to_wire(ST_SLACK, REF_INLINE, body, lt),
+        crate::headlenpow::to_wire(body, lt),
         out,
         out_len,
     )

@@ -211,6 +211,8 @@ impl KVStore for RedisStore {
     }
 
     fn set_part(&self, key: &str, off: u32, buf: &[u8]) {
+        /* 判界在 `backend.rs::set_part` 唯一入口。后端只写；
+         * SETRANGE 对越界会自己撑大，但入口已挡住，走到这里必然界内。 */
         let o = off.to_string();
         let _ = self.cmd(&[b"SETRANGE", key.as_bytes(), o.as_bytes(), buf]);
     }

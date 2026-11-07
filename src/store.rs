@@ -31,16 +31,23 @@ pub trait KVStore {
         })
     }
     /// 定位写 buf 到 key 的 [off, off+buf.len())（key 须已存在）。默认整读改写，后端可覆盖为 SETRANGE。
+    ///
+    /// **越界即失败，不扩容**：原地写的语义是「改已存在的内容」，不是「把值撑大」。
+    /// 曾用 `resize(e, 0)` 兜底，于是越界写会静默扩展 wire——读方拿到的
+    /// 长度比写方以为的长，而错在写入侧、不在读侧，排查时方向全反。
     fn set_part(&self, key: &str, off: u32, buf: &[u8]) {
-        if let Some(mut v) = self.get(key) {
-            let s = off as usize;
-            let e = s + buf.len();
-            if e > v.len() {
-                v.resize(e, 0);
-            }
-            v[s..e].copy_from_slice(buf);
-            self.set(key, &v);
+        /* 越界判据在 `backend.rs::set_part` 唯一入口，这里只负责写。
+         * **不 resize**：越界若走到这里说明入口漏判，宁可什么都不写也不要静默扩容。 */
+        let Some(mut v) = self.get(key) else {
+            return;
+        };
+        let s = off as usize;
+        let e = s + buf.len();
+        if e > v.len() {
+            return;
         }
+        v[s..e].copy_from_slice(buf);
+        self.set(key, &v);
     }
     fn flush(&self);
 }

@@ -6,7 +6,7 @@ fn reads_new_wire_directory_value() {
     let root = std::env::temp_dir().join(format!("kvspace-new-dir-fs-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
     let mut kv = conn(&format!("fs://{}", root.display()));
-    let raw = kvspace_durable::headlenpow::to_wire(0, 0, &[], "").unwrap();
+    let raw = kvspace_durable::headlenpow::to_wire(&[], "").unwrap();
     kv.set(&[KVPair {
         key: "/lib/f/".into(),
         val: kvspace_durable::xvalue::from_wire(&raw),
@@ -33,8 +33,7 @@ fn value_and_directory_keys_coexist() {
     kv.mkindex("/node/", 0).unwrap();
     let directory = kv.get_raw("/node/");
     let dh = kvspace_durable::headlenpow::from_wire(&directory).unwrap();
-    assert_eq!(dh.storetype, 0); /* directory marker: storetype 0, empty body, langtype in attr */
-    assert_eq!(dh.ptr, 0);
+    assert_eq!(dh.len, 0, "directory marker: empty body");
     assert_eq!(kv.get_raw("/node"), value);
     for name in ["__dir__", "__self__", "~abc"] {
         kv.set(&[KVPair {

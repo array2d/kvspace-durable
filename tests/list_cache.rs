@@ -7,11 +7,12 @@
 use kvspace_durable::ffi::*;
 use std::ffi::CString;
 
+/// 16 字节 head + 8 字节 int64 body + 空 attr（attrslen=0，无前缀）。
 fn xvalue_i64(n: i64) -> Vec<u8> {
-    let mut v = vec![0u8; 16];
-    v[0..6].copy_from_slice(&8u64.to_le_bytes()[..6]);
-    v[8..16].copy_from_slice(&n.to_le_bytes());
-    v.extend_from_slice(&[2, 0]); // empty attr
+    let mut v = vec![0u8; 16 + 8];
+    v[0..8].copy_from_slice(&8u64.to_le_bytes()); // bodylen @0-7
+    // attrslen @8-11 = 0（已零填）
+    v[16..24].copy_from_slice(&n.to_le_bytes());
     v
 }
 

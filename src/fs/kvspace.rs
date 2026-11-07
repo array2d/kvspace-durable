@@ -526,6 +526,26 @@ impl KVSpace for FsKVSpace {
         let pf = self
             .physical_file(key)
             .ok_or_else(|| format!("set_part: missing key {}", key))?;
+        /*
+         * **`fs://` 不走 `Backend`**：`conn.rs:33` 直接构造 `FsKVSpace`，
+         * 所以 `backend.rs::set_part` 的判界覆盖不到这里。判据必须在这一层也有一份，
+         * 且与 `backend.rs` 用**同一个量**：`16 + effective_len`。
+         *
+         * pwrite 对越界会自己撑大文件，不判界就是「原地写变成扩容」。
+         */
+        {
+            let current = fs::read(&pf)
+                .map_err(|e| format!("kvspace-fs: set_part read {:?}: {}", pf, e))?;
+            let effective = crate::headlenpow::effective_len(&current)
+                .ok_or_else(|| format!("set_part: malformed wire at {key}"))?;
+            let upper = crate::headlenpow::PREFIX as u64 + effective;
+            if (off as u64).saturating_add(buf.len() as u64) > upper {
+                return Err(format!(
+                    "kvspace-fs: set_part out of range at {key} (off {off} + {} > {upper})",
+                    buf.len()
+                ));
+            }
+        }
         let f = fs::OpenOptions::new()
             .write(true)
             .open(&pf)
@@ -547,11 +567,10 @@ impl KVSpace for FsKVSpace {
             let raw = pair.raw.clone().unwrap_or_else(|| pair.val.to_wire());
             let head = crate::headlenpow::from_wire(&raw)
                 .ok_or_else(|| format!("invalid XValue at {key}"))?;
-            let attr = crate::headlenpow::attr_len(&raw, head.len as usize)
+            crate::kvspace_common::validate_status_wire(&key, &raw)?;
+            /* attr 区长度从 head 读（无前缀）；空 attr 是合法的（=0）。 */
+            let attr = crate::headlenpow::attr_len(&raw)
                 .ok_or_else(|| format!("invalid XValue at {key}"))?;
-            if attr < 2 {
-                return Err(format!("invalid XValue at {key}"));
-            }
             let total = (head.len as usize)
                 .checked_add(crate::headlenpow::PREFIX)
                 .and_then(|x| x.checked_add(attr as usize))
@@ -574,7 +593,7 @@ impl KVSpace for FsKVSpace {
             if !ext_target.is_empty() && self.read_leaf(&key).is_none() {
                 let suffix = key.strip_prefix(&parent).unwrap_or("");
                 if self.read_leaf(&format!("{ext_target}{suffix}")).is_some()
-                    && !(head.ptr == crate::xvalue::REF_PTR && is_frame_operand_key(&key))
+                    && !(head.reference == crate::headlenpow::Reference::Pointer && is_frame_operand_key(&key))
                 {
                     return Err(format!("{}: {}", ERR_EXT_WRITE, key));
                 }
@@ -840,8 +859,8 @@ impl KVSpace for FsKVSpace {
         let resolved = self.resolve_path(path);
         self.ensure_dir(&resolved);
         if self.read_leaf(&resolved).is_none() {
-            // Directory marker: ST_SHORT, inline, empty body, langtype "lib" in attr.
-            let value = crate::headlenpow::to_wire(ST_SHORT, REF_INLINE, &[], "lib")
+            // Directory marker: inline, empty body, langtype "lib" in attr.
+            let value = crate::headlenpow::to_wire(&[], "lib")
                 .ok_or_else(|| format!("Mkindex: invalid directory {resolved}"))?;
             self.write_leaf(&resolved, &value);
         }
@@ -863,8 +882,13 @@ impl KVSpace for FsKVSpace {
             return Err(format!("ExtIndex target missing: {ext_path}"));
         }
         let langtype = self.langtype_of(ext_path);
-        // External locator: ST_EXT + REF_EXT + locator body + target langtype in attr.
-        let value = crate::headlenpow::to_wire(ST_EXT, REF_EXT, ext_path.as_bytes(), &langtype)
+        // External locator: langtype 带 `@` 前缀（扩展由类型表达，head 无 ptr）。
+        let prefixed = if langtype.starts_with('@') {
+            langtype.clone()
+        } else {
+            format!("@{langtype}")
+        };
+        let value = crate::headlenpow::to_wire(ext_path.as_bytes(), &prefixed)
             .ok_or_else(|| format!("ExtIndex locator invalid: {ext_path}"))?;
         self.ensure_dir(&resolved);
         self.write_leaf(&resolved, &value);

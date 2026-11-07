@@ -11,8 +11,7 @@ use crate::kvspace_common::{
 use crate::r#const::*;
 use crate::store::KVStore;
 use crate::xvalue::{
-    from_wire, from_wire_head, is_ptr, ptr_target, XValue, REF_EXT, REF_INLINE, REF_PTR, ST_EXT,
-    ST_SHORT,
+    from_wire, from_wire_head, is_ptr, ptr_target, XValue, REF_EXT, REF_INLINE, REF_PTR,
 };
 
 pub struct Backend<S: KVStore> {
@@ -320,19 +319,44 @@ impl<S: KVStore> KVSpace for Backend<S> {
         if crate::r#const::is_reserved(&full) {
             return Err(format!("reserved metadata key: {full}"));
         }
-        if self.store.exists(&full) {
-            self.store.set_part(&full, off, buf);
-            return Ok(());
-        }
-        let ext_t = self.prefix_ext(&p);
-        if !ext_t.is_empty() {
+        let target = if self.store.exists(&full) {
+            full
+        } else {
+            let ext_t = self.prefix_ext(&p);
             let ext_full = join_path(&ext_t, &l);
-            if self.store.exists(&ext_full) {
-                self.store.set_part(&ext_full, off, buf);
-                return Ok(());
+            if !ext_t.is_empty() && self.store.exists(&ext_full) {
+                ext_full
+            } else {
+                return Err(format!("set_part: missing key {}", key));
             }
+        };
+        /*
+         * **判界只在这一处**：trait 与各后端只负责「往已存在的位置写」，不判界。
+         *
+         * 理由：判界用的是「整条 wire 的长度」，那是**值语义**，不是后端结构。
+         * 三个后端各写一遍，迟早出现两个不同的量（`bodylen` vs `effective_len`），
+         * 而它们只在 CAPACITY 布局下才有差别——那正是最不容易被发现的地方。
+         *
+         * 上界 = `16 + effective_len`：`effective_len` 在 CAPACITY 布局下取 attr tag 2
+         * 的 reallen，而不是 `bodylen`（那时 `bodylen` 是**容量**）。拿容量判界会让
+         * 越界写正好落在容量余量里，静默通过。
+         *
+         * 越界是硬错，不扩容：原地写的语义是「改已存在的内容」，不是「把值撑大」。
+         */
+        let wire = self.store.get(&target).ok_or_else(|| {
+            format!("set_part: cannot read {target}")
+        })?;
+        let effective = crate::headlenpow::effective_len(&wire)
+            .ok_or_else(|| format!("set_part: malformed wire at {target}"))?;
+        let upper = crate::headlenpow::PREFIX as u64 + effective;
+        if (off as u64).saturating_add(buf.len() as u64) > upper {
+            return Err(format!(
+                "set_part: out of range at {target} (off {off} + {} > {upper})",
+                buf.len()
+            ));
         }
-        Err(format!("set_part: missing key {}", key))
+        self.store.set_part(&target, off, buf);
+        Ok(())
     }
 
     fn set(&mut self, pairs: &[KVPair]) -> Result<(), String> {
@@ -347,11 +371,13 @@ impl<S: KVStore> KVSpace for Backend<S> {
             let raw = pair.raw.clone().unwrap_or_else(|| pair.val.to_wire());
             let head = crate::headlenpow::from_wire(&raw)
                 .ok_or_else(|| format!("invalid XValue at {key}"))?;
-            let attr = crate::headlenpow::attr_len(&raw, head.len as usize)
+            /* `‥status` 的 wire 级契约（规范 `02-kvspace模型/04-CABI.kv:33-36`）：
+             * langtype base kind 是 char + 有效长度 ≤16，所有后端都必须校验。
+             * 判据集中在 kvspace_common，shm 与 fs 两侧共用一份。 */
+            crate::kvspace_common::validate_status_wire(&key, &raw)?;
+            /* attr 区长度从 head 读（无前缀）；空 attr 是合法的（=0）。 */
+            let attr = crate::headlenpow::attr_len(&raw)
                 .ok_or_else(|| format!("invalid XValue at {key}"))?;
-            if attr < 2 {
-                return Err(format!("invalid XValue at {key}"));
-            }
             let total = (head.len as usize)
                 .checked_add(crate::headlenpow::PREFIX)
                 .and_then(|x| x.checked_add(attr as usize))
@@ -374,7 +400,8 @@ impl<S: KVStore> KVSpace for Backend<S> {
             if !ext_target.is_empty() && self.store.get(&key).is_none() {
                 let suffix = key.strip_prefix(&parent).unwrap_or("");
                 if self.store.get(&format!("{ext_target}{suffix}")).is_some()
-                    && !(head.ptr == REF_PTR && is_frame_operand_key(&key))
+                    && !(head.reference == crate::headlenpow::Reference::Pointer
+                        && is_frame_operand_key(&key))
                 {
                     return Err(format!("{}: {}", ERR_EXT_WRITE, key));
                 }
@@ -614,8 +641,8 @@ impl<S: KVStore> KVSpace for Backend<S> {
         }
         let _ = capacity;
         let resolved = self.resolve_path(path);
-        // Directory marker: ST_SHORT, inline, empty body, langtype "lib" in attr.
-        let value = crate::headlenpow::to_wire(ST_SHORT, REF_INLINE, &[], "lib")
+        // Directory marker: inline, empty body, langtype "lib" in attr.
+        let value = crate::headlenpow::to_wire(&[], "lib")
             .ok_or_else(|| format!("Mkindex: invalid directory {resolved}"))?;
         if self.store.get(&resolved).is_none() {
             self.store.set(&resolved, &value);
@@ -639,8 +666,13 @@ impl<S: KVStore> KVSpace for Backend<S> {
             return Err(format!("ExtIndex target missing: {ext_path}"));
         }
         let langtype = self.langtype_of(ext_path);
-        // External locator: ST_EXT + REF_EXT + locator body + target langtype in attr.
-        let value = crate::headlenpow::to_wire(ST_EXT, REF_EXT, ext_path.as_bytes(), &langtype)
+        // External locator: langtype 带 `@` 前缀（扩展由类型表达，head 无 ptr）。
+        let prefixed = if langtype.starts_with('@') {
+            langtype.clone()
+        } else {
+            format!("@{langtype}")
+        };
+        let value = crate::headlenpow::to_wire(ext_path.as_bytes(), &prefixed)
             .ok_or_else(|| format!("ExtIndex locator invalid: {ext_path}"))?;
         self.store.set(&resolved, &value);
         Ok(())
