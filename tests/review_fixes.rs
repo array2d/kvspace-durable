@@ -255,8 +255,8 @@ unsafe fn run_backend_suite(dsn: &str, root: &str) {
 
     // 7. SetValue head/attr validation（16 字节 head，attrslen 在 head 里、无前缀）。
     let k_bad = CString::new(format!("{root}/bad_attr")).unwrap();
-    /* bodylen=8 @0-7，attrslen=0 @8-11，storetype/ptr/pad 全零，后接 8 字节 body。
-       空 attr 在新布局里**合法**（旧布局要求 [2,0] 前缀）。 */
+    /* bodylen=8 @0-7，attrslen=0 @8-9，reserved/layout/padding 全零，
+       后接 8 字节 body。空 attr 在新布局里**合法**（旧布局要求 [2,0] 前缀）。 */
     let noattr: [u8; 24] = [8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                             42, 0, 0, 0, 0, 0, 0, 0];
     assert_eq!(
@@ -267,7 +267,7 @@ unsafe fn run_backend_suite(dsn: &str, root: &str) {
 
     /* 声明 attrslen=4 但只给 2 字节 attr → 总长不足 → 拒绝。 */
     let mut shortattr = noattr;
-    shortattr[8..12].copy_from_slice(&4u32.to_le_bytes());
+    shortattr[8..10].copy_from_slice(&4u16.to_le_bytes());
     assert_ne!(
         kvspaceSetValue(h, k_bad.as_ptr(), shortattr.as_ptr(), (16 + 8 + 2) as u32, std::ptr::null_mut(), 0),
         0,

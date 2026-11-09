@@ -57,10 +57,11 @@ fn write_new_place_records_capacity_when_cap_exceeds_len() {
     let bodylen = u64::from_le_bytes(wire[0..8].try_into().unwrap());
     assert_eq!(bodylen, 80, "head.bodylen 必须是**容量**，不是有效长度");
     assert_eq!(wire[12], 1, "layout 必须是 CAPACITY(1)");
-    /* padding 三字节必须为零 */
+    /* reserved 两字节与 padding 三字节必须为零 */
+    assert_eq!(&wire[10..12], &[0, 0], "reserved 必须为零");
     assert_eq!(&wire[13..16], &[0, 0, 0], "padding 必须为零");
     /* 总长 = 16 + 容量 + attr */
-    let attrslen = u32::from_le_bytes(wire[8..12].try_into().unwrap()) as usize;
+    let attrslen = u16::from_le_bytes(wire[8..10].try_into().unwrap()) as usize;
     assert_eq!(wire.len(), 16 + 80 + attrslen, "总长必须含容量");
     /* attr 里必须有 tag 2（reallen = 2） */
     let attrs = &wire[16 + 80..];

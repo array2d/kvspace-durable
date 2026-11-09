@@ -24,13 +24,14 @@ fn attr_of(lt: &str) -> Vec<u8> {
 }
 
 /// 拼 16 字节 head + body + attr；head 的 bodylen/attrslen 由调用方给的实际长度决定。
-/// 新 16 字节 head：`[bodylen:u64][attrslen:u32][layout:u8][padding:3]`。
+/// 新 16 字节 head：
+/// `[bodylen:u64][attrslen:u16][reserved:u16][layout:u8][padding:3]`。
 /// `storetype`/`ptr` 已从 wire 删除——形态由 langtype 表达，故前两个参数不再使用。
 fn wire(_storetype: u8, _ptr: u8, body: &[u8], lt: &str) -> Vec<u8> {
     let attr = attr_of(lt);
     let mut v = vec![0u8; 16];
     v[0..8].copy_from_slice(&(body.len() as u64).to_le_bytes());
-    v[8..12].copy_from_slice(&(attr.len() as u32).to_le_bytes());
+    v[8..10].copy_from_slice(&u16::try_from(attr.len()).unwrap().to_le_bytes());
     v[12] = 0; /* layout = LENGTH */
     v.extend_from_slice(body);
     v.extend_from_slice(&attr);
@@ -38,8 +39,8 @@ fn wire(_storetype: u8, _ptr: u8, body: &[u8], lt: &str) -> Vec<u8> {
 }
 
 /// 64KB 级 char/utf8 值：storetype 1 变长、body 全 0（仅用于内存观测）+ 空 attr。
-/// wire = [bodylen:u64 @0-7][attrslen:u32 @8-11][storetype@12][ptr@13][pad@14-15]
-///        [body][attr]，body 偏移恒 16。
+/// wire = [bodylen:u64 @0-7][attrslen:u16 @8-9][reserved:u16 @10-11][layout@12]
+///        [padding@13-15][body][attr]，body 偏移恒 16。
 fn xvalue_pad(n: usize) -> Vec<u8> {
     wire(1, 0, &vec![0u8; n], "")
 }
