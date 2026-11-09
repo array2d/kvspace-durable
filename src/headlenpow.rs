@@ -1,7 +1,8 @@
 //! XValue wire 的 head 层：16 字节固定头 + body + attr 区。
 //!
 //! ```text
-//! wire: [bodylen:u64][attrslen:u32][layout:u8][padding:3][body][attr records]
+//! wire: [bodylen:u64][attrslen:u16][reserved:u16][layout:u8][padding:3]
+//!       [body][attr records]
 //! 总长度 = 16 + bodylen + attrslen
 //! ```
 //!
@@ -18,13 +19,15 @@ pub const PREFIX: usize = 16;
 /// head 字段偏移（唯一定义点；外部一律经 `Head` 访问，不手写偏移）。
 const OFF_BODYLEN: usize = 0;
 const OFF_ATTRSLEN: usize = 8;
+const OFF_RESERVED: usize = 10;
 const OFF_LAYOUT: usize = 12;
 const OFF_PADDING: usize = 13;
 
 const _: () = assert!(
     PREFIX == 16
         && OFF_BODYLEN + 8 == OFF_ATTRSLEN
-        && OFF_ATTRSLEN + 4 == OFF_LAYOUT
+        && OFF_ATTRSLEN + 2 == OFF_RESERVED
+        && OFF_RESERVED + 2 == OFF_LAYOUT
         && OFF_LAYOUT + 1 == OFF_PADDING
         && OFF_PADDING + 3 == PREFIX,
     "head field offsets must tile exactly 16 bytes"
@@ -55,7 +58,12 @@ pub struct Head<'a> {
     pub body: &'a [u8],
 }
 
-/// padding 必须为零：它是 ABI 的一部分，不是「随便填」。
+/// reserved 与 padding 必须为零：它们是 ABI 的一部分，不是「随便填」。
+#[inline]
+fn reserved_is_zero(data: &[u8]) -> bool {
+    data.get(OFF_RESERVED) == Some(&0) && data.get(OFF_RESERVED + 1) == Some(&0)
+}
+
 #[inline]
 fn padding_is_zero(data: &[u8]) -> bool {
     data.get(OFF_PADDING) == Some(&0)
@@ -63,9 +71,9 @@ fn padding_is_zero(data: &[u8]) -> bool {
         && data.get(OFF_PADDING + 2) == Some(&0)
 }
 
-fn read_u32(data: &[u8], at: usize) -> Option<u32> {
-    let b = data.get(at..at + 4)?;
-    Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+fn read_u16(data: &[u8], at: usize) -> Option<u16> {
+    let b = data.get(at..at + 2)?;
+    Some(u16::from_le_bytes([b[0], b[1]]))
 }
 
 fn read_u64(data: &[u8], at: usize) -> Option<u64> {
@@ -75,13 +83,13 @@ fn read_u64(data: &[u8], at: usize) -> Option<u64> {
     ]))
 }
 
-/// 解析 wire。任何一项不成立都返回 `None`：head 不足 16 字节、padding 非零、
-/// `layout` 越界、`16 + bodylen + attrslen` 溢出或超出输入长度。
+/// 解析 wire。任何一项不成立都返回 `None`：head 不足 16 字节、reserved/padding
+/// 非零、`layout` 越界、`16 + bodylen + attrslen` 溢出或超出输入长度。
 pub fn from_wire(data: &[u8]) -> Option<Head<'_>> {
     if data.len() < PREFIX {
         return None;
     }
-    if !padding_is_zero(data) {
+    if !reserved_is_zero(data) || !padding_is_zero(data) {
         return None;
     }
     let layout = *data.get(OFF_LAYOUT)?;
@@ -89,7 +97,7 @@ pub fn from_wire(data: &[u8]) -> Option<Head<'_>> {
         return None;
     }
     let len = read_u64(data, OFF_BODYLEN)?;
-    let attrslen = read_u32(data, OFF_ATTRSLEN)?;
+    let attrslen = read_u16(data, OFF_ATTRSLEN)?;
     let body_start = PREFIX;
     let body_end = body_start.checked_add(usize::try_from(len).ok()?)?;
     let attrs_end = body_end.checked_add(usize::try_from(attrslen).ok()?)?;
@@ -147,7 +155,7 @@ pub fn attr_bytes(langtype: &str) -> Option<Vec<u8>> {
         return Some(Vec::new());
     }
     let l = langtype.len();
-    if l > usize::from(u16::MAX) {
+    if l > usize::from(u16::MAX) - 3 {
         return None;
     }
     let mut v = Vec::with_capacity(3 + l);
@@ -212,13 +220,14 @@ pub fn effective_len(data: &[u8]) -> Option<u64> {
     }
 }
 
-/// attr 区总字节数（从 head 读，不含任何前缀；空 attr = 0）。坏 wire → None。
+/// attr 区总字节数（u16，从 head 读，不含任何前缀；空 attr = 0）。
+/// reserved 非零或 wire 过短 → None。
 #[inline]
-pub fn attr_len(data: &[u8]) -> Option<u32> {
-    if data.len() < PREFIX {
+pub fn attr_len(data: &[u8]) -> Option<u16> {
+    if data.len() < PREFIX || !reserved_is_zero(data) {
         return None;
     }
-    read_u32(data, OFF_ATTRSLEN)
+    read_u16(data, OFF_ATTRSLEN)
 }
 
 /// 从 attr 区取 tag=1（langtype）记录 data；无/坏 attr → None。
@@ -262,13 +271,14 @@ pub fn to_wire_varlen(capacity: usize, reallen: u64, langtype: &str) -> Option<V
     }
     let mut attr = attr_bytes(langtype)?;
     attr.extend_from_slice(&reallen_record(reallen));
-    let attrslen = u32::try_from(attr.len()).ok()?;
+    let attrslen = u16::try_from(attr.len()).ok()?;
     let total = PREFIX.checked_add(capacity)?.checked_add(attr.len())?;
     let mut data = Vec::new();
     data.try_reserve_exact(total).ok()?;
     data.resize(total, 0);
     data[OFF_BODYLEN..OFF_BODYLEN + 8].copy_from_slice(&(capacity as u64).to_le_bytes());
-    data[OFF_ATTRSLEN..OFF_ATTRSLEN + 4].copy_from_slice(&attrslen.to_le_bytes());
+    data[OFF_ATTRSLEN..OFF_ATTRSLEN + 2].copy_from_slice(&attrslen.to_le_bytes());
+    data[OFF_RESERVED..OFF_RESERVED + 2].copy_from_slice(&0u16.to_le_bytes());
     data[OFF_LAYOUT] = LAYOUT_CAPACITY;
     data[PREFIX + capacity..].copy_from_slice(&attr);
     Some(data)
@@ -279,13 +289,14 @@ pub fn to_wire_varlen(capacity: usize, reallen: u64, langtype: &str) -> Option<V
 /// 在代码里可见，而不是依赖初始化副作用。
 pub fn reserve(content: usize, langtype: &str) -> Option<Vec<u8>> {
     let attr = attr_bytes(langtype)?;
-    let attrslen = u32::try_from(attr.len()).ok()?;
+    let attrslen = u16::try_from(attr.len()).ok()?;
     let total = PREFIX.checked_add(content)?.checked_add(attr.len())?;
     let mut data = Vec::new();
     data.try_reserve_exact(total).ok()?;
     data.resize(total, 0);
     data[OFF_BODYLEN..OFF_BODYLEN + 8].copy_from_slice(&(content as u64).to_le_bytes());
-    data[OFF_ATTRSLEN..OFF_ATTRSLEN + 4].copy_from_slice(&attrslen.to_le_bytes());
+    data[OFF_ATTRSLEN..OFF_ATTRSLEN + 2].copy_from_slice(&attrslen.to_le_bytes());
+    data[OFF_RESERVED..OFF_RESERVED + 2].copy_from_slice(&0u16.to_le_bytes());
     data[OFF_LAYOUT] = LAYOUT_LENGTH;
     data[OFF_PADDING] = 0;
     data[OFF_PADDING + 1] = 0;
@@ -300,11 +311,13 @@ mod tests {
 
     #[test]
     fn fixtures() {
-        /* 新布局：bodylen@0-7, attrslen@8-11, layout@12, padding@13-15 */
+        /* 新布局：bodylen@0-7, attrslen@8-9, reserved@10-11, layout@12,
+        padding@13-15 */
         let scalar = to_wire(&42i64.to_le_bytes(), "int64").unwrap();
         assert_eq!(scalar.len(), 32); /* 16 head + 8 body + 8 attr（3 头 + "int64"） */
         assert_eq!(&scalar[0..8], &8u64.to_le_bytes()); /* bodylen @0-7 */
-        assert_eq!(&scalar[8..12], &8u32.to_le_bytes()); /* attrslen @8-11 */
+        assert_eq!(&scalar[8..10], &8u16.to_le_bytes()); /* attrslen @8-9 */
+        assert_eq!(&scalar[10..12], &[0, 0]); /* reserved @10-11 */
         assert_eq!(scalar[12], LAYOUT_LENGTH); /* layout @12 */
         assert_eq!(&scalar[13..16], &[0, 0, 0]); /* padding @13-15 */
         let h = from_wire(&scalar).unwrap();
@@ -343,12 +356,35 @@ mod tests {
         v4[8] = 0xff; /* attrslen 越界 */
         assert!(from_wire(&v4).is_none());
 
+        /* reserved 两个字节都必须为零 */
+        for at in [OFF_RESERVED, OFF_RESERVED + 1] {
+            let mut r = to_wire(b"x", "").unwrap();
+            r[at] = 1;
+            assert!(from_wire(&r).is_none(), "reserved byte {at} must be zero");
+            assert!(
+                attr_len(&r).is_none(),
+                "attr_len rejects reserved byte {at}"
+            );
+        }
+
         /* padding 三个字节都必须为零 */
         for at in [13usize, 14, 15] {
             let mut p = to_wire(b"x", "").unwrap();
             p[at] = 1;
             assert!(from_wire(&p).is_none(), "padding byte {at} must be zero");
         }
+
+        /* attrslen 是 u16：3 字节记录头 + langtype 数据不得超过 UINT16_MAX。 */
+        let fits = "a".repeat(usize::from(u16::MAX) - 3);
+        assert!(
+            attr_bytes(&fits).is_some(),
+            "attr region exactly UINT16_MAX fits"
+        );
+        let over = "a".repeat(usize::from(u16::MAX) - 2);
+        assert!(
+            attr_bytes(&over).is_none(),
+            "attr region > UINT16_MAX rejected"
+        );
     }
 
     #[test]
@@ -356,7 +392,7 @@ mod tests {
         /* 情形 A：旧 wire 的 body 使新视角下 attrslen 巨大 → 总长越界 → 拒绝。 */
         let mut overrun = vec![0u8; 8 + 8 + 10];
         overrun[0] = 8; /* 旧 len=8 */
-        overrun[8] = 0xff; /* 新视角 attrslen 低字节 → 巨大 */
+        overrun[8] = 0xff; /* 新视角 attrslen=255，仍超出 26 字节输入 */
         overrun[24] = 10; /* 旧 attr_len=10 */
         assert!(
             from_wire(&overrun).is_none(),
@@ -402,7 +438,11 @@ mod tests {
         assert_eq!(head.len, 32, "head.bodylen 是**容量**");
         assert_eq!(head.body.len(), 32);
         assert_eq!(reallen_from_wire(&wire), Some(5));
-        assert_eq!(effective_len(&wire), Some(5), "有效长度取 reallen，不取容量");
+        assert_eq!(
+            effective_len(&wire),
+            Some(5),
+            "有效长度取 reallen，不取容量"
+        );
         assert_eq!(langtype_from_wire(&wire).unwrap(), b"char/utf8");
         /* 有效区之外的容量余量不被当成数据。 */
         assert_eq!(&head.body[..5], b"hello");
@@ -430,8 +470,8 @@ mod tests {
         let attrs_at = PREFIX + 1;
         let record = reallen_record(1);
         wrong.extend_from_slice(&record);
-        let attrslen = u32::try_from(record.len()).unwrap();
-        wrong[OFF_ATTRSLEN..OFF_ATTRSLEN + 4].copy_from_slice(&attrslen.to_le_bytes());
+        let attrslen = u16::try_from(record.len()).unwrap();
+        wrong[OFF_ATTRSLEN..OFF_ATTRSLEN + 2].copy_from_slice(&attrslen.to_le_bytes());
         assert!(from_wire(&wrong).is_none(), "非 CAPACITY 带 tag 2 必须拒绝");
         let _ = attrs_at;
 
@@ -440,9 +480,9 @@ mod tests {
         let attrs_start = PREFIX + 8;
         let rec = reallen_record(3);
         dup.extend_from_slice(&rec);
-        let old_attrslen = read_u32(&dup, OFF_ATTRSLEN).unwrap();
-        let new_attrslen = old_attrslen + u32::try_from(rec.len()).unwrap();
-        dup[OFF_ATTRSLEN..OFF_ATTRSLEN + 4].copy_from_slice(&new_attrslen.to_le_bytes());
+        let old_attrslen = read_u16(&dup, OFF_ATTRSLEN).unwrap();
+        let new_attrslen = old_attrslen + u16::try_from(rec.len()).unwrap();
+        dup[OFF_ATTRSLEN..OFF_ATTRSLEN + 2].copy_from_slice(&new_attrslen.to_le_bytes());
         let _ = attrs_start;
         assert!(from_wire(&dup).is_none(), "重复 tag 2 必须拒绝");
 
