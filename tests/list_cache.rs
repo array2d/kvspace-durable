@@ -5,6 +5,7 @@
 //   2. Same-handle mutations (SetValue / Del / DelTree / lazy WriteNewPlace) take effect immediately;
 //   3. Cross-handle writes become visible on repeated `idx` or the next `ListLen`.
 use kvspace_durable::ffi::*;
+use kvspace_durable::storage_abi::*;
 use std::ffi::CString;
 
 /// 16 字节 head + 8 字节 int64 body + 空 attr（attrslen=0，无前缀）。
@@ -95,7 +96,7 @@ fn list_cache_visibility_fs() {
         let d = "/d/";
         let md = CString::new(d).unwrap();
         assert_eq!(
-            kvspaceMkindex(h, md.as_ptr(), 0, std::ptr::null_mut(), 0),
+            kvspaceMkindex(h, md.as_ptr(), std::ptr::null_mut(), 0),
             0
         );
         for k in ["a", "b", "c"] {

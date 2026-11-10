@@ -152,6 +152,7 @@ name = "kvspace-durable"
 version = "0.1.0"
 dependencies = [
  "hmac",
+ "libc",
  "sha2",
  "ureq",
 ]

@@ -19,6 +19,7 @@ pub mod kvspace;
 pub mod kvspace_common;
 pub mod redis;
 pub mod s3;
+pub mod storage_abi;
 pub mod store;
 
 pub use coord::*;

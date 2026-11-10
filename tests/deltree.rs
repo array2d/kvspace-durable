@@ -7,6 +7,7 @@
 //
 // Redis tests skip when 127.0.0.1:6379 is unreachable and isolate under a unique prefix.
 use kvspace_durable::ffi::*;
+use kvspace_durable::storage_abi::*;
 use std::ffi::CString;
 
 /// 16 字节 head + 8 字节 int64 body + 空 attr（attrslen=0，无前缀）。
@@ -100,7 +101,7 @@ unsafe fn run(dsn: &str, root: &str) {
     for form in [d.clone(), format!("{d}/"), format!("{d}\u{b7}")] {
         let mk = CString::new(format!("{d}/")).unwrap();
         assert_eq!(
-            kvspaceMkindex(h, mk.as_ptr(), 0, std::ptr::null_mut(), 0),
+            kvspaceMkindex(h, mk.as_ptr(), std::ptr::null_mut(), 0),
             0
         );
         for (i, k) in inside.iter().chain(outside.iter()).enumerate() {
