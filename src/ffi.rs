@@ -47,7 +47,7 @@ fn is_volatile(key: &str) -> bool {
 }
 
 pub struct Handle {
-    kv: Box<dyn KVSpace>,
+    pub(crate) kv: Box<dyn KVSpace>,
     /// key → 该 key 最近一次读到的完整 XValue（常驻快照，无 eviction）。
     read_cache: HashMap<String, Vec<u8>>,
     /// 控制键：每次读重读后端；双缓冲保住上一视图。
@@ -58,6 +58,8 @@ pub struct Handle {
     pending_key: Option<String>,
     /// Cached child list for `ListLen` followed by sequential `ListAt(i)` traversal.
     list_cache: Option<ListCache>,
+    /// 新 ABI 的 per-index 列举快照与 generation（`kvspaceList`/`kvspaceListlen`）。
+    pub(crate) list_gen: HashMap<String, crate::storage_abi::ListGen>,
 }
 
 /// Per-traversal child list snapshot: refreshed by `ListLen` (`cursor = -1`) and reused by
@@ -75,7 +77,7 @@ impl Handle {
     /// 落盘上一笔惰性写（调用方已把 body 填进 write_buf），并失效该 key 的读缓存。
     /// Catches backend panics (Redis disconnect/timeout, fs I/O error) and converts them into
     /// `Err` so they never unwind across `extern "C"`.
-    fn flush(&mut self) -> Result<(), String> {
+    pub(crate) fn flush(&mut self) -> Result<(), String> {
         if let Some(key) = self.pending_key.take() {
             let xv = std::mem::take(&mut self.write_buf);
             self.list_cache = None;
@@ -136,12 +138,12 @@ impl Handle {
         Ok(&c.names)
     }
 
-    fn cache_invalidate(&mut self, key: &str) {
+    pub(crate) fn cache_invalidate(&mut self, key: &str) {
         self.read_cache.remove(key);
         self.volatile_cache.remove(key);
     }
 
-    fn cache_invalidate_tree(&mut self, prefix: &str) {
+    pub(crate) fn cache_invalidate_tree(&mut self, prefix: &str) {
         self.read_cache.retain(|k, _| !under_prefix(k, prefix));
         self.volatile_cache.retain(|k, _| !under_prefix(k, prefix));
     }
@@ -224,7 +226,7 @@ fn volatile_refresh(hd: &mut Handle, key: &str) -> bool {
 
 /// flush 上一笔惰性写后返回后端引用。任一步失败 → Err（调用方转 err/err 返回 1）。
 /// Used by mutating structure ops (`Del`/`DelTree`/`Cp*`/`Mkindex*`/`RmindexExt`/`Clear`); clears `list_cache`.
-unsafe fn kv_flush<'a>(h: *mut Handle) -> Result<&'a mut dyn KVSpace, String> {
+pub(crate) unsafe fn kv_flush<'a>(h: *mut Handle) -> Result<&'a mut dyn KVSpace, String> {
     let hd = h.as_mut().ok_or("kvspace: null handle")?;
     hd.list_cache = None;
     hd.flush()?;
@@ -278,7 +280,7 @@ fn build_xvalue_head(
 // ── 内部助手 ─────────────────────────────────────────────────────────
 
 #[inline]
-unsafe fn cstr<'a>(p: *const c_char) -> &'a str {
+pub(crate) unsafe fn cstr<'a>(p: *const c_char) -> &'a str {
     if p.is_null() {
         return "";
     }
@@ -299,7 +301,7 @@ fn alloc(v: Vec<u8>, out: *mut *mut u8, out_len: *mut u32) -> c_int {
 }
 
 #[inline]
-fn write_err(err: *mut c_char, err_cap: u32, msg: &str) {
+pub(crate) fn write_err(err: *mut c_char, err_cap: u32, msg: &str) {
     if err.is_null() || err_cap == 0 {
         return;
     }
@@ -312,7 +314,7 @@ fn write_err(err: *mut c_char, err_cap: u32, msg: &str) {
 }
 
 /// 把 panic 转成错误消息：任何 panic 都不得跨 extern "C" 边界（否则 SIGABRT）。
-fn panic_msg(p: Box<dyn std::any::Any + Send>) -> String {
+pub(crate) fn panic_msg(p: Box<dyn std::any::Any + Send>) -> String {
     if let Some(s) = p.downcast_ref::<&str>() {
         s.to_string()
     } else if let Some(s) = p.downcast_ref::<String>() {
@@ -394,6 +396,7 @@ pub extern "C" fn kvspaceConnect(dsn: *const c_char) -> *mut Handle {
             write_buf: Vec::new(),
             pending_key: None,
             list_cache: None,
+            list_gen: HashMap::new(),
         })),
         Err(_) => std::ptr::null_mut(),
     }
@@ -1031,6 +1034,9 @@ pub extern "C" fn kvspaceDelTree(
     code
 }
 
+/// 单键复制。**新存储 ABI 的 `kvspaceCp` 就是这一个符号**：`storage.h` 的签名
+/// `(handle, old_key, new_key, err, err_cap)` 与旧 `kvspace.h` 逐参相同，
+/// 不另写第二份实现（两份同名不同义的副本是二义性的温床）。
 #[no_mangle]
 pub extern "C" fn kvspaceCp(
     h: *mut Handle,
@@ -1048,7 +1054,16 @@ pub extern "C" fn kvspaceCp(
     };
     let src = unsafe { cstr(src) }.to_string();
     let dst = unsafe { cstr(dst) }.to_string();
-    let code = result_to_code(catch_panic(|| kv.cp(&src, &dst)), err, err_cap);
+    /* 新 ABI 的 `kvspaceCp` 就是本符号：源不存在必须 `-ENOENT`，不是一律 1。
+       旧调用方只看 0/非 0，故这条改动不破旧语义。 */
+    let r = catch_panic(|| kv.cp(&src, &dst));
+    let code = match &r {
+        Err(e) if e.contains("source not found") => {
+            write_err(err, err_cap, e);
+            -libc::ENOENT
+        }
+        _ => result_to_code(r, err, err_cap),
+    };
     if let Some(hd) = unsafe { h.as_mut() } {
         hd.cache_invalidate(&dst);
     }
@@ -1101,28 +1116,6 @@ pub extern "C" fn kvspaceCpList(
         hd.cache_invalidate_tree(&dst);
     }
     code
-}
-
-#[no_mangle]
-pub extern "C" fn kvspaceMkindex(
-    h: *mut Handle,
-    path: *const c_char,
-    capacity: u32,
-    err: *mut c_char,
-    err_cap: u32,
-) -> c_int {
-    let kv: &mut dyn KVSpace = match unsafe { kv_flush(h) } {
-        Ok(k) => k,
-        Err(e) => {
-            write_err(err, err_cap, &e);
-            return 1;
-        }
-    };
-    result_to_code(
-        catch_panic(|| kv.mkindex(unsafe { cstr(path) }, capacity)),
-        err,
-        err_cap,
-    )
 }
 
 #[no_mangle]
