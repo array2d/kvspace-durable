@@ -334,12 +334,10 @@ impl<S: KVStore> KVSpace for Backend<S> {
          * **判界只在这一处**：trait 与各后端只负责「往已存在的位置写」，不判界。
          *
          * 理由：判界用的是「整条 wire 的长度」，那是**值语义**，不是后端结构。
-         * 三个后端各写一遍，迟早出现两个不同的量（`bodylen` vs `effective_len`），
-         * 而它们只在 CAPACITY 布局下才有差别——那正是最不容易被发现的地方。
+         * 三个后端各写一遍，迟早出现两个不同的量。
          *
-         * 上界 = `16 + effective_len`：`effective_len` 在 CAPACITY 布局下取 attr tag 2
-         * 的 reallen，而不是 `bodylen`（那时 `bodylen` 是**容量**）。拿容量判界会让
-         * 越界写正好落在容量余量里，静默通过。
+         * 上界 = `16 + effective_len`，而 `effective_len` 恒等于 `bodylen`
+         * （容量是物理分配属性，不进 wire，没有第二个量可混淆）。
          *
          * 越界是硬错，不扩容：原地写的语义是「改已存在的内容」，不是「把值撑大」。
          */

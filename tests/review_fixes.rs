@@ -255,7 +255,7 @@ unsafe fn run_backend_suite(dsn: &str, root: &str) {
 
     // 7. SetValue head/attr validation（16 字节 head，attrslen 在 head 里、无前缀）。
     let k_bad = CString::new(format!("{root}/bad_attr")).unwrap();
-    /* bodylen=8 @0-7，attrslen=0 @8-9，reserved/layout/padding 全零，
+    /* bodylen=8 @0-7，attrslen=0 @8-9，padding@10-15 全零，
        后接 8 字节 body。空 attr 在新布局里**合法**（旧布局要求 [2,0] 前缀）。 */
     let noattr: [u8; 24] = [8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                             42, 0, 0, 0, 0, 0, 0, 0];
@@ -274,14 +274,16 @@ unsafe fn run_backend_suite(dsn: &str, root: &str) {
         "与 head 声明的 attrslen 不符的 wire 必须被拒绝"
     );
 
-    /* padding 非零 → 拒绝（它是 ABI 的一部分）。 */
-    let mut badpad = noattr;
-    badpad[14] = 1;
-    assert_ne!(
-        kvspaceSetValue(h, k_bad.as_ptr(), badpad.as_ptr(), badpad.len() as u32, std::ptr::null_mut(), 0),
-        0,
-        "非零 padding 必须被拒绝"
-    );
+    /* padding 非零 → 拒绝（它是 ABI 的一部分）；10-15 六个字节同等对待。 */
+    for at in 10usize..16 {
+        let mut badpad = noattr;
+        badpad[at] = 1;
+        assert_ne!(
+            kvspaceSetValue(h, k_bad.as_ptr(), badpad.as_ptr(), badpad.len() as u32, std::ptr::null_mut(), 0),
+            0,
+            "非零 padding@{at} 必须被拒绝"
+        );
+    }
 
     /* 尾部多余字节按 16 + bodylen + attrslen 截断。 */
     let mut padded = noattr.to_vec();

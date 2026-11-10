@@ -529,7 +529,7 @@ impl KVSpace for FsKVSpace {
         /*
          * **`fs://` 不走 `Backend`**：`conn.rs:33` 直接构造 `FsKVSpace`，
          * 所以 `backend.rs::set_part` 的判界覆盖不到这里。判据必须在这一层也有一份，
-         * 且与 `backend.rs` 用**同一个量**：`16 + effective_len`。
+         * 且与 `backend.rs` 用**同一个量**：`16 + bodylen`。
          *
          * pwrite 对越界会自己撑大文件，不判界就是「原地写变成扩容」。
          */

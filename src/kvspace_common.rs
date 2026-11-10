@@ -208,8 +208,6 @@ pub fn equal_xvalue(a: &XValue, b: &XValue) -> bool {
 
 /// `‥status` 槽的 wire 级上限（规范 `02-kvspace模型/04-CABI.kv:33`）：有效长度 ≤16。
 pub const STATUS_MAX_LEN: u64 = 16;
-/// 容量形态下 `bodylen` 的下限（同规范：durable 只校验这一条，没有物理 box）。
-pub const STATUS_MIN_CAP: u64 = 80;
 
 /// 该 key 是不是 `‥status` 槽（末段恰为 `‥status`）。
 pub fn is_status_key(key: &str) -> bool {
@@ -229,8 +227,10 @@ pub fn base_kind(langtype: &[u8]) -> String {
 }
 
 /// `‥status` 槽的 wire 级校验（规范 `02-kvspace模型/04-CABI.kv:33-36`，**所有后端都必须做**）：
-/// base kind 是 char 族 + 有效长度 ≤16 + 若 `layout = CAPACITY` 则 `bodylen ≥ 80`。
-/// `content_len` 必须用 `effective_len`——容量形态下 `bodylen` 是容量，不是内容长度。
+/// base kind 是 char 族 + 有效长度 ≤16。
+///
+/// 容量下限（80 字节）**不是 wire 契约**：容量是物理分配属性，不进 wire。
+/// 有物理分配元数据的后端（shm 的 slot view）自己查，durable 无此概念故不查。
 pub fn validate_status_wire(key: &str, raw: &[u8]) -> Result<(), String> {
     if !is_status_key(key) {
         return Ok(());
@@ -248,12 +248,6 @@ pub fn validate_status_wire(key: &str, raw: &[u8]) -> Result<(), String> {
     if !base.starts_with("char/") {
         return Err(format!(
             "status slot langtype must be a character family, got {base:?} at {key}"
-        ));
-    }
-    if head.layout == crate::headlenpow::LAYOUT_CAPACITY && head.len < STATUS_MIN_CAP {
-        return Err(format!(
-            "status slot capacity {} < {STATUS_MIN_CAP} at {key}",
-            head.len
         ));
     }
     Ok(())

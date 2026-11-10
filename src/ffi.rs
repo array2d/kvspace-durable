@@ -268,16 +268,11 @@ fn build_xvalue_head(
         _ => return None,
     };
     /*
-     * **容量必须进 wire**：`body_cap > body_len` 走 CAPACITY 布局
-     * （bodylen = 容量、有效长度进 attr tag 2），否则走 LENGTH。
-     * 丢掉 body_cap 等于把「容量」降级成「物理预留」——读方拿不到有效长度，
-     * 与 kvspace-c 的 `NewSlack`/`Reserve` 语义不一致。
+     * **容量不进 wire**：bodylen 恒为有效长度；容量是物理分配属性，由后端自行分配。
+     * `body_cap` 只做「不小于 body_len」的上游断言，不参与 wire 编码。
      */
-    if body_cap > body_len {
-        crate::headlenpow::to_wire_varlen(body_cap, body_len as u64, &prefixed)
-    } else {
-        crate::headlenpow::reserve(body_len, &prefixed)
-    }
+    let _ = body_cap;
+    crate::headlenpow::to_wire_zeroed(body_len, &prefixed)
 }
 
 // ── 内部助手 ─────────────────────────────────────────────────────────

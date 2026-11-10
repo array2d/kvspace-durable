@@ -9,7 +9,7 @@ pub const REF_PTR: u8 = 1;
 pub const REF_EXT: u8 = 2;
 
 /* 没有 ST_* 常量：新 16 字节 head 里没有 storetype 字段，存储形态全部由
- * langtype 表达（形状段/`*`/`@`/种类）。`layout` 只管「bodylen 是长度还是容量」。 */
+ * langtype 表达（形状段/`*`/`@`/种类）；bodylen 是长度还是容量同样由 langtype 判。 */
 
 pub fn is_map_langtype(kind: &str) -> bool {
     kind.contains(OBJ_SEP)
@@ -444,8 +444,7 @@ fn array_to_header(kind: &str, array_len: i32) -> Vec<i32> {
 /// **没有 storetype/ptr 判定**：存储形态与引用性全部由 langtype 表达——
 /// - ref==1（指针）→ langtype 加 `*` 前缀；ref==2（@ext）→ 加 `@` 前缀；
 /// - 张量/变长/定长 → 看 langtype 里有没有形状段、是不是字符数组；
-/// - layout 不由 kind 决定，由**调用哪个构造**决定：本函数恒产 LENGTH，
-///   定容量变长走 `to_wire_varlen`。
+/// - 本函数恒产 `bodylen = 有效长度`：容量是物理分配属性，不进 wire。
 pub fn to_wire_head(kind: &str, r#ref: i32, dims: &[i32], raw: &[u8]) -> Vec<u8> {
     let base = if kind == KIND_NONE {
         String::new()
@@ -594,8 +593,8 @@ mod tests {
         assert_eq!(dir.len(), 16 + 3 + 3);
         let head = crate::headlenpow::from_wire(&dir).unwrap();
         assert_eq!(
-            (head.layout, head.reference, head.len, head.body.len()),
-            (crate::headlenpow::LAYOUT_LENGTH, crate::headlenpow::Reference::None, 0, 0)
+            (head.reference, head.len, head.body.len()),
+            (crate::headlenpow::Reference::None, 0, 0)
         );
         // @ext：langtype 带 `@` 前缀，body = 定位串（16 + body）。
         let ext = XValue::Ext(ExtHandle {
