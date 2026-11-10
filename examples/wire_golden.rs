@@ -6,11 +6,11 @@
 //!
 //! 只比字节，不解释字节。任何一边"觉得自己是对的"都不算数。
 //!
-//! **本文件按新 16 字节 head 重推**（`[bodylen:u64][attrslen:u32][layout:u8][padding:3]`），
-//! 不拿旧布局改偏移——那会把旧假设（storetype/ptr 两个字段）不知不觉带过来。
+//! **本文件按新 16 字节 head 重推**（`[bodylen:u64][attrslen:u16][padding:6]`），
+//! 不拿旧布局改偏移——那会把旧假设（storetype/ptr/layout 三个字段）不知不觉带过来。
 //! 「指针」「扩展」「张量」都不再是 head 字段，而是 langtype 前缀/形状。
 
-use kvspace_durable::headlenpow::{reserve, to_wire};
+use kvspace_durable::headlenpow::{to_wire, to_wire_zeroed};
 
 fn emit(name: &str, wire: &[u8]) {
     print!("{name} {} ", wire.len());
@@ -21,7 +21,7 @@ fn emit(name: &str, wire: &[u8]) {
 }
 
 fn main() {
-    /* none：空 body + 空 langtype（attr 区零字节）→ layout=LENGTH, padding 全零。 */
+    /* none：空 body + 空 langtype（attr 区零字节）→ padding 全零。 */
     emit("none", &to_wire(&[], "").unwrap());
 
     /* scalar-int64：body = 42i64 LE，langtype "int64"。 */
@@ -48,12 +48,6 @@ fn main() {
     /* ext：body = "s3://b/k"，langtype 带 `@` 前缀，其余部分空 → `@`。 */
     emit("ext", &to_wire(b"s3://b/k", "@").unwrap());
 
-    /* reserve：4 字节零 body、langtype "[]u8"。 */
-    emit("reserve", &reserve(4, "[]u8").unwrap());
-
-    /* varlen：layout=CAPACITY，容量 8、有效 3 → attr 带 tag 2。 */
-    emit(
-        "varlen",
-        &kvspace_durable::headlenpow::to_wire_varlen(8, 3, "[]char/utf8").unwrap(),
-    );
+    /* reserve：4 字节零 body、langtype "[]u8"。容量不进 wire，无 tag 2。 */
+    emit("reserve", &to_wire_zeroed(4, "[]u8").unwrap());
 }

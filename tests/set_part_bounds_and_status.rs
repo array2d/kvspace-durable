@@ -150,9 +150,9 @@ fn set_part_one_byte_past_boundary_fails_and_leaves_value_intact() {
 }
 
 #[test]
-fn set_part_capacity_uses_effective_length_not_capacity() {
+fn set_part_bounds_ignore_body_capacity_entirely() {
     let h = connect("capacity");
-    /* 容量 32、有效 6：上界必须是 16+6=22，不是 16+32=48。 */
+    /* 请求 32 字节容量、6 字节有效长度：容量不进 wire，上界仍是 16+6=22。 */
     let k = CString::new("/cap").unwrap();
     let l = CString::new("[]char/utf8").unwrap();
     let mut body: *mut u8 = std::ptr::null_mut();
@@ -176,12 +176,8 @@ fn set_part_capacity_uses_effective_length_not_capacity() {
 
     /* 22 处界内：成功。 */
     assert_eq!(set_part(h, "/cap", 20, b"YZ"), 0, "有效长度内的写必须成功");
-    /* 24 处已超出有效长度 6（上界 22），必须失败——哪怕它落在容量 32 之内。 */
-    assert_ne!(
-        set_part(h, "/cap", 22, b"Z"),
-        0,
-        "容量余量不是内容，写进去必须失败"
-    );
+    /* 24 处已超出有效长度 6（上界 22），必须失败。 */
+    assert_ne!(set_part(h, "/cap", 22, b"Z"), 0, "有效长度之外必须失败");
     unsafe { kvspace_durable::ffi::kvspaceClose(h) };
 }
 
@@ -317,8 +313,8 @@ fn set_part_out_of_range_fails_on_fs_backend() {
 // ── 跨后端等价对照 ──────────────────────────────────────────────────
 //
 // 「两处判界用同一个量」需要一条**可执行的**判据，而不是注释里的承诺。
-// 这组用同一批 (offset, buf) 在 mem 与 fs 上各跑一遍，要求结论逐条相同：
-// 判界若在某一边换成了 `bodylen`，CAPACITY 那一条会立刻分叉。
+// 这组用同一批 (offset, buf) 在 mem 与 fs 上各跑一遍，要求结论逐条相同。
+// 判界若在某一边算了容量（而非 `bodylen`），带 body_cap 那一条会立刻分叉。
 
 /// 三种界相对上界（16 + 6 = 22）的位置：界内、刚好贴边、越 1 字节。
 const PROBES: [(u32, &[u8]); 3] = [(17, b"XY"), (20, b"YZ"), (21, b"XYZ")];
@@ -358,13 +354,13 @@ fn set_part_bounds_agree_across_backends() {
 }
 
 #[test]
-fn set_part_capacity_bounds_agree_across_backends() {
-    /* CAPACITY 布局：容量 32、有效 6 ⇒ 上界仍是 16+6=22。
-     * 这条是「判界用 effective_len 而非 bodylen」的跨后端对照——
-     * 任一侧换成 bodylen，下面 22 处那条就会从 false 变 true。 */
+fn set_part_bounds_with_body_cap_agree_across_backends() {
+    /* 请求容量 32、有效 6：容量不进 wire，两侧上界都必须是 16+6=22。
+     * 这条钉的是一条**已删除的歧义**：曾经容量会改 bodylen，两侧加起来
+     * 就是「同一份值有两个长度量」。 */
     let mem = {
         let mut kv = mem_backend::backend();
-        let raw = kvspace_durable::headlenpow::to_wire_varlen(32, 6, "[]char/utf8").unwrap();
+        let raw = kvspace_durable::headlenpow::to_wire_zeroed(6, "[]char/utf8").unwrap();
         kv.set(&[KVPair {
             key: "/c".into(),
             val: XValue::None,
@@ -395,6 +391,6 @@ fn set_part_capacity_bounds_agree_across_backends() {
         unsafe { kvspace_durable::ffi::kvspaceClose(h) };
         v
     };
-    assert_eq!(mem, fs, "CAPACITY 判界必须跨后端相同；mem={mem:?} fs={fs:?}");
-    assert_eq!(mem, vec![true, false], "容量余量不是内容：22 处必须失败");
+    assert_eq!(mem, fs, "判界必须跨后端相同；mem={mem:?} fs={fs:?}");
+    assert_eq!(mem, vec![true, false], "bodylen 只有 6：22 处必须失败");
 }

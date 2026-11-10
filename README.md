@@ -39,13 +39,15 @@ The same ABI is implemented by `kvspace-c` (`shm://`), so a consumer (e.g. the k
 The wire format is byte-identical across this backend, `kvspace-c`, and the `kvspace` frontend (`kvspace/xvalue_head.h`), and a value is always one key:
 
 ```
-[len:u48 LE @0-5][storetype:u8 @6][ptr:u8 @7][body: len bytes @8][attr]
-attr   = [attr_len:u16 LE (includes itself)][record...]   empty attr = [2,0]
-record = [tag:u8][len:u16 LE][data]                       tag 1 = langtype, 2+ reserved
+[bodylen:u64 LE @0][attrslen:u16 LE @8][padding:6 @10-15]
+[body: bodylen bytes @16][attr: attrslen bytes]
+attr   = record...                                  (no length prefix; attrslen is in the head)
+record = [tag:u8][len:u16 LE][data]                 tag 1 = langtype, 2+ reserved
 ```
 
-- `storetype` 0 short fixed values, `None`, maps, structs and directory markers; 1 variable length (strings, code slots, pointer paths); 2 tensors (the langtype carries the dimensions); 3 external locators (`@ext`).
-- `ptr` 0 inline, 1 pointer (body = target key, langtype = target kindexpr), 2 `@ext` (body = locator).
+- `padding` must be zero; non-zero is rejected.
+- The head carries **no semantics**: the langtype (in the attr region) says what the value is — `*T` pointer, `@T` extension, `[d0,d1,…]T` tensor.
+- `bodylen` is **always the effective byte count**. Capacity is a physical-allocation attribute and does not appear in the wire; a backend that needs it keeps it in its own allocation metadata.
 - An empty langtype means `None` for inline values. Map members and directory children are enumerated from physical key prefixes.
 
 ## Tutorial

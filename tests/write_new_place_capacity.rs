@@ -1,8 +1,8 @@
-//! `kvspaceWriteNewPlace(cap > len)` 必须产 CAPACITY 布局：
-//! `bodylen = 容量`、`layout = 1`、attr tag 2 记 `reallen = len`、总长含容量。
+//! `kvspaceWriteNewPlace` 的 `body_cap` **不进 wire**：
+//! `bodylen` 恒为有效长度，attr 里不出现 tag 2，容量属于后端的物理分配。
 //!
-//! 这条钉的是「容量必须进 wire」。丢掉它等于把容量降级成物理预留——
-//! 读方拿不到有效长度，与 kvspace-c 的 `NewSlack`/`Reserve` 语义分叉。
+//! 这条钉的是「容量不是 wire 事实」：曾经容量会改 `bodylen` 并写 tag 2 `reallen`，
+//! 于是同一份值有两个长度量。tag 2 已删除，`bodylen` 是唯一长度来源。
 
 use std::ffi::CString;
 
@@ -15,10 +15,10 @@ fn connect(label: &str) -> *mut kvspace_durable::ffi::Handle {
     h
 }
 
-#[test]
-fn write_new_place_records_capacity_when_cap_exceeds_len() {
-    let handle = connect("write_new_place_capacity");
-    let key = CString::new("/cap").unwrap();
+/// 写一个 `body_len` 字节、`body_cap` 容量的值，读回整条 wire。
+fn write_and_read(label: &str, body_len: u32, body_cap: u64) -> Vec<u8> {
+    let handle = connect(label);
+    let key = CString::new("/k").unwrap();
     let langtype = CString::new("[]char/utf8").unwrap();
     let mut body: *mut u8 = std::ptr::null_mut();
     let mut err = [0i8; 256];
@@ -29,8 +29,8 @@ fn write_new_place_records_capacity_when_cap_exceeds_len() {
             key.as_ptr(),
             0, /* ref = inline */
             1, /* storetype：按裁决不分支，值无关 */
-            2,  /* body_len */
-            80, /* body_cap > body_len ⇒ CAPACITY */
+            body_len,
+            body_cap,
             langtype.as_ptr(),
             &mut body,
             err.as_mut_ptr(),
@@ -38,84 +38,104 @@ fn write_new_place_records_capacity_when_cap_exceeds_len() {
         )
     };
     assert_eq!(rc, 0, "write must succeed");
+    if body_len > 0 {
+        let fill = vec![b'a'; body_len as usize];
+        unsafe { std::ptr::copy_nonoverlapping(fill.as_ptr(), body, body_len as usize) };
+    }
 
-    /* 读回整条 wire：bodylen = 容量 80，layout = 1，attrslen 含 tag 2。 */
-    let mut out: *mut u8 = std::ptr::null_mut();
-    let mut out_len: u32 = 0;
+    /* WriteNewPlace 是惰性写：再写一笔把上一笔 flush 下去，才能读到。 */
+    let probe = CString::new("/__commit_probe").unwrap();
+    let int64 = CString::new("int64").unwrap();
+    let mut probe_body: *mut u8 = std::ptr::null_mut();
     let rc = unsafe {
-        kvspace_durable::ffi::kvspaceGet(
+        kvspace_durable::ffi::kvspaceWriteNewPlace(
             handle,
-            key.as_ptr(),
+            probe.as_ptr(),
+            0,
             1,
-            &mut out,
-            &mut out_len,
+            8,
+            8,
+            int64.as_ptr(),
+            &mut probe_body,
+            err.as_mut_ptr(),
+            err.len() as u32,
         )
     };
-    assert_eq!(rc, 0, "read must succeed");
-    let wire = unsafe { std::slice::from_raw_parts(out, out_len as usize) };
+    assert_eq!(rc, 0, "commit probe must succeed");
+    unsafe { std::ptr::copy_nonoverlapping(42i64.to_le_bytes().as_ptr(), probe_body, 8) };
 
-    let bodylen = u64::from_le_bytes(wire[0..8].try_into().unwrap());
-    assert_eq!(bodylen, 80, "head.bodylen 必须是**容量**，不是有效长度");
-    assert_eq!(wire[12], 1, "layout 必须是 CAPACITY(1)");
-    /* reserved 两字节与 padding 三字节必须为零 */
-    assert_eq!(&wire[10..12], &[0, 0], "reserved 必须为零");
-    assert_eq!(&wire[13..16], &[0, 0, 0], "padding 必须为零");
-    /* 总长 = 16 + 容量 + attr */
-    let attrslen = u16::from_le_bytes(wire[8..10].try_into().unwrap()) as usize;
-    assert_eq!(wire.len(), 16 + 80 + attrslen, "总长必须含容量");
-    /* attr 里必须有 tag 2（reallen = 2） */
-    let attrs = &wire[16 + 80..];
-    let mut found = false;
+    let mut out: *mut u8 = std::ptr::null_mut();
+    let mut out_len: u32 = 0;
+    let rc = unsafe { kvspace_durable::ffi::kvspaceGet(handle, key.as_ptr(), 1, &mut out, &mut out_len) };
+    assert_eq!(rc, 0, "re-read must succeed");
+    let wire = unsafe { std::slice::from_raw_parts(out, out_len as usize) }.to_vec();
+    unsafe { kvspace_durable::ffi::kvspaceClose(handle) };
+    wire
+}
+
+/// 遍历 attr 记录，返回遇到的 tag 列表（任何 tag 2 都是回归）。
+fn attr_tags(wire: &[u8]) -> Vec<u8> {
+    let bodylen = u64::from_le_bytes(wire[0..8].try_into().unwrap()) as usize;
+    let attrslen = usize::from(u16::from_le_bytes(wire[8..10].try_into().unwrap()));
+    let attrs = &wire[16 + bodylen..16 + bodylen + attrslen];
+    let mut tags = Vec::new();
     let mut rest = attrs;
     while let [tag, l0, l1, tail @ ..] = rest {
-        let rlen = usize::from(u16::from_le_bytes([*l0, *l1]));
-        let rec = &tail[..rlen];
-        if *tag == 2 {
-            assert_eq!(rlen, 8, "tag 2 的 data 恒 8 字节");
-            let reallen = u64::from_le_bytes(rec.try_into().unwrap());
-            assert_eq!(reallen, 2, "tag 2 记的是有效长度");
-            found = true;
-        }
-        rest = &tail[rlen..];
+        tags.push(*tag);
+        rest = &tail[usize::from(u16::from_le_bytes([*l0, *l1]))..];
     }
-    assert!(found, "CAPACITY 布局必须带 attr tag 2");
-
-    unsafe { kvspace_durable::ffi::kvspaceClose(handle) };
+    tags
 }
 
 #[test]
-fn write_new_place_uses_length_layout_when_cap_equals_len() {
-    let handle = connect("write_new_place_length");
-    let key = CString::new("/len").unwrap();
+fn body_cap_does_not_enter_wire() {
+    /* 请求容量 80、有效长度 2：wire 里的 bodylen 必须是 2，不是 80。 */
+    let wire = write_and_read("cap-ignored", 2, 80);
+    let bodylen = u64::from_le_bytes(wire[0..8].try_into().unwrap());
+    assert_eq!(bodylen, 2, "bodylen 是有效长度，容量不进 wire");
+    let attrslen = usize::from(u16::from_le_bytes(wire[8..10].try_into().unwrap()));
+    assert_eq!(wire.len(), 16 + 2 + attrslen, "总长 = 16 + 有效长度 + attr");
+    assert_eq!(&wire[16..18], b"aa", "body 就是那 2 字节内容");
+    assert!(
+        !attr_tags(&wire).contains(&2),
+        "attr 里不得出现 tag 2（reallen 已删除）：tags={:?}",
+        attr_tags(&wire)
+    );
+}
+
+#[test]
+fn body_cap_equal_to_len_also_omits_tag_two() {
+    let wire = write_and_read("cap-equal", 2, 2);
+    let bodylen = u64::from_le_bytes(wire[0..8].try_into().unwrap());
+    assert_eq!(bodylen, 2, "bodylen 是有效长度");
+    assert!(
+        !attr_tags(&wire).contains(&2),
+        "attr 里不得出现 tag 2：tags={:?}",
+        attr_tags(&wire)
+    );
+}
+
+#[test]
+fn body_cap_smaller_than_len_is_rejected() {
+    let handle = connect("cap-too-small");
+    let key = CString::new("/k").unwrap();
     let langtype = CString::new("[]char/utf8").unwrap();
     let mut body: *mut u8 = std::ptr::null_mut();
     let mut err = [0i8; 256];
-
     let rc = unsafe {
         kvspace_durable::ffi::kvspaceWriteNewPlace(
             handle,
             key.as_ptr(),
             0,
             1,
+            8,
             2,
-            2, /* cap == len ⇒ LENGTH */
             langtype.as_ptr(),
             &mut body,
             err.as_mut_ptr(),
             err.len() as u32,
         )
     };
-    assert_eq!(rc, 0);
-
-    let mut out: *mut u8 = std::ptr::null_mut();
-    let mut out_len: u32 = 0;
-    unsafe {
-        kvspace_durable::ffi::kvspaceGet(handle, key.as_ptr(), 1, &mut out, &mut out_len)
-    };
-    let wire = unsafe { std::slice::from_raw_parts(out, out_len as usize) };
-    let bodylen = u64::from_le_bytes(wire[0..8].try_into().unwrap());
-    assert_eq!(bodylen, 2, "cap == len 时 bodylen 是有效长度");
-    assert_eq!(wire[12], 0, "layout 必须是 LENGTH(0)");
-
+    assert_ne!(rc, 0, "cap < len 是几何错，必须拒绝");
     unsafe { kvspace_durable::ffi::kvspaceClose(handle) };
 }
